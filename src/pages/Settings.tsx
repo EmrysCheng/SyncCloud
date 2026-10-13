@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
-import type { AppInfo, CloudAccount, GlobalSettings } from "../types";
+import type { AppInfo, CloudAccount, CloudAccountStatus, FolderSummary, GlobalSettings, LogFileInfo } from "../types";
 
 const DEFAULT_SETTINGS: GlobalSettings = {
   concurrency: 3,
@@ -14,7 +14,17 @@ const DEFAULT_SETTINGS: GlobalSettings = {
   baiduSecretKey: "",
   aliyunAppId: "",
   aliyunAppSecret: "",
+  logLevel: "info",
+  logToFile: true,
 };
+
+const LOG_LEVELS: Array<{ value: string; label: string }> = [
+  { value: "error", label: "错误（error）" },
+  { value: "warn", label: "警告（warn）" },
+  { value: "info", label: "信息（info，推荐）" },
+  { value: "debug", label: "调试（debug）" },
+  { value: "trace", label: "跟踪（trace，最详细）" },
+];
 
 export default function Settings() {
   const [info, setInfo] = useState<AppInfo | null>(null);
@@ -47,6 +57,13 @@ export default function Settings() {
 
   function patch(p: Partial<GlobalSettings>) {
     setGs((prev) => ({ ...prev, ...p }));
+  }
+
+  /** 打补丁并立即持久化（日志等级/开关等需要即时生效的设置） */
+  function patchAndPersist(p: Partial<GlobalSettings>) {
+    const next = { ...gs, ...p };
+    setGs(next);
+    api.saveSettings(deviceName, next).catch(() => {});
   }
 
   function persist(next?: GlobalSettings) {
@@ -272,6 +289,8 @@ export default function Settings() {
 
       <CloudAccountsSection />
 
+      <LogSection logLevel={gs.logLevel} logToFile={gs.logToFile} onChange={patchAndPersist} />
+
       <section className="settings-section">
         <h2>关于</h2>
         <p className="muted">
@@ -285,10 +304,13 @@ export default function Settings() {
 
 function CloudAccountsSection() {
   const [accounts, setAccounts] = useState<CloudAccount[]>([]);
+  const [folders, setFolders] = useState<FolderSummary[]>([]);
   const [loading, setLoading] = useState(true);
+  const [statusMap, setStatusMap] = useState<Record<string, CloudAccountStatus | "checking">>({});
 
   useEffect(() => {
     loadAccounts();
+    api.listFolders().then(setFolders).catch(() => {});
   }, []);
 
   function loadAccounts() {
@@ -297,6 +319,25 @@ function CloudAccountsSection() {
       .then(setAccounts)
       .catch(() => {})
       .finally(() => setLoading(false));
+  }
+
+  async function probeAccount(id: string) {
+    setStatusMap((prev) => ({ ...prev, [id]: "checking" }));
+    try {
+      const status = await api.cloudAccountStatus(id);
+      setStatusMap((prev) => ({ ...prev, [id]: status }));
+    } catch (e) {
+      setStatusMap((prev) => ({
+        ...prev,
+        [id]: {
+          accountId: id,
+          authorized: false,
+          ok: false,
+          detail: String(e),
+          checkedAt: new Date().toISOString(),
+        },
+      }));
+    }
   }
 
   async function handleDelete(id: string, name: string) {
@@ -311,12 +352,16 @@ function CloudAccountsSection() {
     }
   }
 
+  function boundFolderCount(accId: string): number {
+    return folders.filter((f) => f.backend.authId === accId).length;
+  }
+
   return (
     <section className="settings-section">
       <h2>已授权网盘账户</h2>
       <p className="muted">
         SyncCloud 支持按同步文件夹分别绑定不同的百度网盘或阿里云盘账户。
-        授权步骤已移至「添加同步文件夹」向导中，无需在此处统一配置。
+        可随时检测授权的实时可用性；令牌保存在 Windows 凭据管理器中。
       </p>
 
       {loading ? (
@@ -327,37 +372,188 @@ function CloudAccountsSection() {
         </div>
       ) : (
         <div className="accounts-list" style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-          {accounts.map((acc) => (
-            <div
-              key={acc.id}
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                padding: "10px 14px",
-                borderRadius: "6px",
-                border: "1px solid var(--border-color)",
-                background: "var(--bg-secondary, rgba(255, 255, 255, 0.03))",
-              }}
-            >
-              <div>
-                <span style={{ fontWeight: 600, marginRight: "8px" }}>{acc.name}</span>
-                <span className="auth-badge auth-ok" style={{ fontSize: "12px", marginRight: "8px" }}>
-                  {acc.provider === "baidu" ? "百度网盘" : "阿里云盘"}
-                </span>
-                <span className="muted" style={{ fontSize: "12px" }}>
-                  授权时间: {new Date(acc.createdAt).toLocaleString()}
-                </span>
-              </div>
-              <button
-                className="btn btn-danger"
-                style={{ fontSize: "12px", padding: "4px 8px" }}
-                onClick={() => handleDelete(acc.id, acc.name)}
+          {accounts.map((acc) => {
+            const status = statusMap[acc.id];
+            const bound = boundFolderCount(acc.id);
+            return (
+              <div
+                key={acc.id}
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  padding: "10px 14px",
+                  borderRadius: "6px",
+                  border: "1px solid var(--border-color)",
+                  background: "var(--bg-secondary, rgba(255, 255, 255, 0.03))",
+                }}
               >
-                解除授权
-              </button>
-            </div>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                    <span style={{ fontWeight: 600 }}>{acc.name}</span>
+                    <span className="auth-badge auth-ok" style={{ fontSize: "12px" }}>
+                      {acc.provider === "baidu" ? "百度网盘" : "阿里云盘"}
+                    </span>
+                    {bound > 0 && (
+                      <span className="auth-badge" style={{ fontSize: "11px", opacity: 0.8 }}>
+                        绑定 {bound} 个同步任务
+                      </span>
+                    )}
+                    {status === "checking" && (
+                      <span className="auth-badge" style={{ fontSize: "11px" }}>检测中…</span>
+                    )}
+                    {status && status !== "checking" && (
+                      <span className={`auth-badge ${status.ok ? "auth-ok" : "auth-bad"}`} style={{ fontSize: "11px" }}>
+                        {status.ok ? "✓ 连接正常" : "✗ 连接异常"}
+                      </span>
+                    )}
+                  </div>
+                  <div className="muted" style={{ fontSize: "12px", marginTop: "4px" }}>
+                    授权时间: {new Date(acc.createdAt).toLocaleString()}
+                    {status && status !== "checking" && (
+                      <> · 上次检测: {new Date(status.checkedAt).toLocaleTimeString("zh-CN", { hour12: false })}</>
+                    )}
+                  </div>
+                  {status && status !== "checking" && !status.ok && (
+                    <div style={{ fontSize: "12px", color: "var(--color-danger, #e5484d)", marginTop: "2px" }}>
+                      {status.detail}
+                    </div>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: "6px", flexShrink: 0 }}>
+                  <button
+                    className="btn"
+                    style={{ fontSize: "12px", padding: "4px 8px" }}
+                    disabled={status === "checking"}
+                    onClick={() => probeAccount(acc.id)}
+                  >
+                    检测连接
+                  </button>
+                  <button
+                    className="btn btn-danger"
+                    style={{ fontSize: "12px", padding: "4px 8px" }}
+                    onClick={() => handleDelete(acc.id, acc.name)}
+                  >
+                    解除授权
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function LogSection({
+  logLevel,
+  logToFile,
+  onChange,
+}: {
+  logLevel: string;
+  logToFile: boolean;
+  onChange: (patch: Partial<GlobalSettings>) => void;
+}) {
+  const [files, setFiles] = useState<LogFileInfo[]>([]);
+  const [viewing, setViewing] = useState<string | null>(null);
+  const [lines, setLines] = useState<string[]>([]);
+  const [loadingTail, setLoadingTail] = useState(false);
+
+  function refreshFiles() {
+    api.listLogFiles().then(setFiles).catch(() => {});
+  }
+
+  useEffect(() => {
+    refreshFiles();
+  }, []);
+
+  async function openViewer(name: string) {
+    setViewing(name);
+    setLoadingTail(true);
+    try {
+      const tail = await api.readLogTail(name, 300);
+      setLines(tail);
+    } catch (e) {
+      setLines([`读取日志失败: ${e}`]);
+    } finally {
+      setLoadingTail(false);
+    }
+  }
+
+  function formatSize(size: number): string {
+    if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
+    if (size >= 1024) return `${(size / 1024).toFixed(1)} KB`;
+    return `${size} B`;
+  }
+
+  return (
+    <section className="settings-section">
+      <h2>日志与诊断</h2>
+      <div className="grid-3">
+        <label className="field">
+          <span>日志等级</span>
+          <select value={logLevel} onChange={(e) => onChange({ logLevel: e.target.value })}>
+            {LOG_LEVELS.map((l) => (
+              <option key={l.value} value={l.value}>
+                {l.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <label className="field checkbox">
+        <input
+          type="checkbox"
+          checked={logToFile}
+          onChange={(e) => onChange({ logToFile: e.target.checked })}
+        />
+        <span>输出文件日志（保存至数据目录 logs/，单文件超 5MB 自动轮转，保留 14 天）</span>
+      </label>
+      <p className="hint-line">
+        等级与开关保存后立即生效，无需重启。日志记录所有同步轮次、传输明细、重试与错误，
+        是远程排障的第一手材料。
+      </p>
+
+      <div className="row" style={{ marginTop: "10px", gap: "10px", alignItems: "center" }}>
+        <button className="btn" onClick={() => api.openLogDir().catch(() => {})}>
+          打开日志目录
+        </button>
+        <button className="btn" onClick={refreshFiles}>
+          刷新列表
+        </button>
+        {viewing && (
+          <button className="btn" onClick={() => openViewer(viewing)} disabled={loadingTail}>
+            {loadingTail ? "读取中…" : "刷新内容"}
+          </button>
+        )}
+      </div>
+
+      {files.length > 0 && (
+        <div style={{ marginTop: "12px", display: "flex", flexDirection: "column", gap: "6px" }}>
+          {files.map((f) => (
+            <button
+              key={f.name}
+              className={`log-file-row ${viewing === f.name ? "active" : ""}`}
+              onClick={() => openViewer(f.name)}
+            >
+              <span className="log-file-name">📄 {f.name}</span>
+              <span className="muted" style={{ fontSize: "12px" }}>
+                {formatSize(f.size)} · {f.modified}
+              </span>
+            </button>
           ))}
+        </div>
+      )}
+
+      {viewing && (
+        <div className="log-viewer">
+          <div className="log-viewer-head">
+            <span>{viewing} · 最近 300 行</span>
+          </div>
+          <pre className="log-viewer-body">
+            {loadingTail ? "读取中…" : lines.length ? lines.join("\n") : "（空）"}
+          </pre>
         </div>
       )}
     </section>

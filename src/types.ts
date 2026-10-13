@@ -85,6 +85,8 @@ export interface GlobalSettings {
   baiduSecretKey: string;
   aliyunAppId: string;
   aliyunAppSecret: string;
+  logLevel: string;
+  logToFile: boolean;
 }
 
 export interface AppInfo {
@@ -102,6 +104,7 @@ export type SyncEvent = (
   | { type: "planned"; folderId: string; stats: PlanStats }
   | { type: "file_done"; folderId: string; path: string; action: string }
   | { type: "file_failed"; folderId: string; path: string; error: string; retryInSecs: number }
+  | { type: "file_pending"; folderId: string; path: string; reason: string }
   | { type: "conflict_created"; folderId: string; path: string; copy: string }
   | { type: "cycle_done"; folderId: string; folder: string; report: CycleReport }
   | { type: "error"; folderId: string; folder: string; message: string }
@@ -154,6 +157,20 @@ export interface CloudAccount {
   appKey?: string;
   secretKey?: string;
   createdAt: string;
+}
+
+export interface CloudAccountStatus {
+  accountId: string;
+  authorized: boolean;
+  ok: boolean;
+  detail: string;
+  checkedAt: string;
+}
+
+export interface LogFileInfo {
+  name: string;
+  size: number;
+  modified: string;
 }
 
 export interface FileMeta {

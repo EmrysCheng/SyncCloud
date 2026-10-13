@@ -5,10 +5,12 @@ import type {
   BaiduLoginInfo,
   BackendConfig,
   CloudAccount,
+  CloudAccountStatus,
   ConflictRecord,
   FolderConfig,
   FolderSummary,
   GlobalSettings,
+  LogFileInfo,
   SyncEvent,
   SyncPlan,
 } from "./types";
@@ -73,4 +75,10 @@ export const api = {
     invoke<SyncPlan>("analyze_folder", { folderId }),
   openRecycleBin: (folderId?: string) =>
     invoke<void>("open_recycle_bin", { folderId }),
+  cloudAccountStatus: (accountId: string) =>
+    invoke<CloudAccountStatus>("cloud_account_status", { accountId }),
+  listLogFiles: () => invoke<LogFileInfo[]>("list_log_files"),
+  readLogTail: (file: string, lines: number) =>
+    invoke<string[]>("read_log_tail", { file, lines }),
+  openLogDir: () => invoke<void>("open_log_dir"),
 };
