@@ -25,6 +25,12 @@
   - 实时文件监控（2 秒防抖）+ 周期兜底对比
   - 失败指数退避重试（应对 Windows 文件占用）
   - 下载走临时文件 + 原子替换
+- **文件占用无感知同步（Syncthing / Resilio 同款思路）**
+  - 共享读：文件正被 Office / 编辑器 / 杀毒占用时照常读取、哈希与上传
+  - POSIX 语义替换：目标文件被其他程序打开时仍可原地替换下载内容
+  - 待替换队列：极端独占锁定时新版本先安全停放，占用释放后下轮自动应用
+    （最终一致，不报错、不丢数据；7 天未应用自动清理）
+  - 健壮删除：被占用文件挂起 delete-on-close，句柄关闭即删除
 - **多机冲突处理（Dropbox 方式）**
   - 同一文件被多台设备同时修改时：远端版本保留原名，
     本机修改自动另存为 `报告 (冲突副本 - 设备名 2026-10-12 1430).docx`
@@ -42,7 +48,9 @@
 - **开机自启动**：Windows 注册表自启集成，支持界面与托盘随时联动开关
 - **远端多机锁**：`.synccloud/locks` + TTL，防止两台设备同时写 manifest 交叉覆盖
 - **客户端加密（零知识，开发中）**：Argon2id 派生 + XChaCha20-Poly1305 流式 AEAD
-- **凭据安全**：云盘 OAuth 令牌存 Windows 凭据管理器（keyring）
+- **凭据安全**：云盘 OAuth 令牌存 Windows 凭据管理器（keyring）；解除授权时真实删除凭据条目
+- **授权账户健康管理**：设置页可对每个网盘账户一键「检测连接」（令牌存在性 + 实时远端探活），异常时给出原因；显示账户绑定的同步任务数
+- **文件日志系统**：全量运行日志写入数据目录 `logs/`（单文件超 5MB 自动轮转、保留 14 天），等级 trace~error 设置页热切换；内置日志查看器直接查看最近 300 行，无需翻文件
 
 ## 项目结构
 
@@ -77,7 +85,8 @@ npm run build:app    # 生产构建：编译前端 + 编译 Tauri 核心 + 打�
 
 ```bash
 cd src-tauri
-cargo test           # 单元 + 端到端（双设备冲突模拟 / 崩溃恢复日志 / 增量快路径）
+cargo test           # 单元 + 端到端（内存 Mock 存储上传流 / 占用文件待替换队列 /
+                     # 双设备冲突模拟 / 崩溃恢复日志 / 增量快路径 / POSIX 替换与共享读）
 ```
 
 ### GNU 工具链备选方案（本仓库已适配）
@@ -93,6 +102,17 @@ cargo test           # 单元 + 端到端（双设备冲突模拟 / 崩溃恢复
 ```bash
 export PATH=~/.cargo/mingw64/bin:~/.cargo/bin:$PATH
 cargo test
+```
+
+若链接报 `could not find native static library WebView2LoaderStatic`（GNU ld
+找不到 MSVC 命名的静态库），把 webview2-com-sys 构建输出里的
+`WebView2LoaderStatic.lib` 复制为同目录 `libWebView2LoaderStatic.a` 即可
+（GNU ld 可直接链接 COFF 归档）：
+
+```bash
+for d in target/*/build/webview2-com-sys-*/out/x64; do
+  [ -f "$d/WebView2LoaderStatic.lib" ] && cp -n "$d/WebView2LoaderStatic.lib" "$d/libWebView2LoaderStatic.a"
+done
 ```
 
 `src-tauri/build.rs` 已内置 GNU 目标的 common-controls v6 manifest 嵌入

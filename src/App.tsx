@@ -134,7 +134,10 @@ function EventTicker({ events }: { events: SyncEvent[] }) {
       text = `计划：↑${last.stats.uploads} ↓${last.stats.downloads} 冲突 ${last.stats.conflicts}`;
       break;
     case "file_done":
-      text = `${last.action === "upload" ? "已上传" : last.action === "download" ? "已下载" : last.action} ${last.path}`;
+      text = `${last.action === "upload" ? "已上传" : last.action === "download" ? "已下载" : last.action === "pending_replace" ? "占用释放，已应用待替换文件" : last.action} ${last.path}`;
+      break;
+    case "file_pending":
+      text = `⏳ ${last.path} 被占用，已入待替换队列`;
       break;
     case "conflict_created":
       text = `冲突副本：${last.copy}`;

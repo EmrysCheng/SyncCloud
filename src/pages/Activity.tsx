@@ -11,6 +11,7 @@ export default function Activity({
 }) {
   const [selectedFolder, setSelectedFolder] = useState<string>("all");
   const [selectedAction, setSelectedAction] = useState<string>("all");
+  const [keyword, setKeyword] = useState("");
 
   // 文件夹 ID -> 文件夹映射
   const folderMap = useMemo(() => {
@@ -32,6 +33,7 @@ export default function Activity({
       path?: string;
       action?: string;
       error?: string;
+      reason?: string;
       copy?: string;
       timestamp?: number;
     }> = [];
@@ -66,6 +68,17 @@ export default function Activity({
           error: e.error,
           timestamp: e.timestamp,
         });
+      } else if (e.type === "file_pending") {
+        list.push({
+          id: `${i}-${e.path}`,
+          folderId: fid,
+          folderName,
+          folderLocalPath,
+          type: "file_pending",
+          path: e.path,
+          reason: e.reason,
+          timestamp: e.timestamp,
+        });
       } else if (e.type === "conflict_created") {
         list.push({
           id: `${i}-${e.path}`,
@@ -84,6 +97,7 @@ export default function Activity({
 
   // 按条件过滤
   const filtered = useMemo(() => {
+    const kw = keyword.trim().toLowerCase();
     return activityList.filter((item) => {
       if (selectedFolder !== "all" && item.folderId !== selectedFolder) {
         return false;
@@ -94,10 +108,14 @@ export default function Activity({
         if (selectedAction === "delete" && !item.action?.includes("delete")) return false;
         if (selectedAction === "conflict" && item.type !== "conflict_created") return false;
         if (selectedAction === "failed" && item.type !== "file_failed") return false;
+        if (selectedAction === "pending" && item.type !== "file_pending" && item.action !== "pending_replace") return false;
+      }
+      if (kw && !(item.path ?? "").toLowerCase().includes(kw) && !item.folderName.toLowerCase().includes(kw)) {
+        return false;
       }
       return true;
     });
-  }, [activityList, selectedFolder, selectedAction]);
+  }, [activityList, selectedFolder, selectedAction, keyword]);
 
   function locateFile(localRoot: string, relPath: string) {
     if (!localRoot) return;
@@ -125,6 +143,9 @@ export default function Activity({
     if (item.type === "file_failed") {
       return <span className="act-badge badge-err">✗ 失败</span>;
     }
+    if (item.type === "file_pending") {
+      return <span className="act-badge badge-warn">⏳ 待替换</span>;
+    }
     if (item.type === "conflict_created") {
       return <span className="act-badge badge-warn">⚠ 冲突副本</span>;
     }
@@ -133,6 +154,8 @@ export default function Activity({
         return <span className="act-badge badge-up">↑ 上传</span>;
       case "download":
         return <span className="act-badge badge-down">↓ 下载</span>;
+      case "pending_replace":
+        return <span className="act-badge badge-up">⏳ 已应用</span>;
       case "delete_local":
       case "delete_remote":
         return <span className="act-badge badge-del">🗑 删除</span>;
@@ -181,8 +204,19 @@ export default function Activity({
             <option value="download">↓ 下载</option>
             <option value="delete">🗑 删除</option>
             <option value="conflict">⚠ 冲突</option>
+            <option value="pending">⏳ 待替换</option>
             <option value="failed">✗ 失败</option>
           </select>
+        </div>
+
+        <div className="filter-group filter-grow">
+          <input
+            className="input input-sm"
+            type="search"
+            placeholder="搜索文件路径或任务名…"
+            value={keyword}
+            onChange={(e) => setKeyword(e.target.value)}
+          />
         </div>
 
         <div className="filter-summary">共 {filtered.length} 条记录</div>
@@ -209,6 +243,7 @@ export default function Activity({
                     {item.path}
                   </div>
                   {item.error && <div className="act-error">原因: {item.error}</div>}
+                  {item.reason && <div className="act-copy">⏳ {item.reason}</div>}
                   {item.copy && <div className="act-copy">副本路径: {item.copy}</div>}
                 </div>
                 <div className="act-col-meta">
