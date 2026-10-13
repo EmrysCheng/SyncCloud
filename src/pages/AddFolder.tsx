@@ -14,15 +14,59 @@ const BACKENDS: { kind: BackendKind; icon: string; title: string; desc: string }
   { kind: "aliyun", icon: "🅐", title: "阿里云盘", desc: "官方 App 扫码免密登录，支持不同文件夹绑定不同账户" },
 ];
 
-function QrCanvas({ url }: { url: string }) {
-  const ref = useRef<HTMLCanvasElement>(null);
+function QrViewer({ url }: { url: string }) {
+  const isDirectImage =
+    url.startsWith("data:image/") ||
+    url.includes("/oauth/qrcode/") ||
+    url.includes("/device/qrcode/") ||
+    /\.(png|jpe?g|webp|gif)(\?.*)?$/i.test(url);
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
   useEffect(() => {
-    if (ref.current && url) {
-      QRCode.toCanvas(ref.current, url, { width: 180, margin: 1 }).catch(() => {});
+    if (!isDirectImage && canvasRef.current && url) {
+      QRCode.toCanvas(canvasRef.current, url, {
+        width: 190,
+        margin: 1,
+        color: { dark: "#0f172a", light: "#ffffff" },
+      }).catch(() => {});
     }
-  }, [url]);
+  }, [url, isDirectImage]);
+
   if (!url) return null;
-  return <canvas ref={ref} className="qr-canvas" />;
+
+  return (
+    <div style={{ display: "inline-block", marginTop: "6px" }}>
+      {isDirectImage ? (
+        <img
+          src={url}
+          alt="授权二维码"
+          style={{
+            width: 180,
+            height: 180,
+            display: "block",
+            borderRadius: "8px",
+            border: "1px solid var(--border)",
+            background: "#ffffff",
+            padding: "6px",
+            boxShadow: "0 2px 6px rgba(0,0,0,0.06)",
+          }}
+        />
+      ) : (
+        <canvas
+          ref={canvasRef}
+          style={{
+            display: "block",
+            borderRadius: "8px",
+            border: "1px solid var(--border)",
+            background: "#ffffff",
+            padding: "6px",
+            boxShadow: "0 2px 6px rgba(0,0,0,0.06)",
+          }}
+        />
+      )}
+    </div>
+  );
 }
 
 export default function AddFolder({ onDone }: { onDone: () => void }) {
@@ -571,9 +615,11 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
                           </div>
                         </div>
                         {baiduInfo.qrcodeUrl && (
-                          <div style={{ marginTop: "8px" }}>
-                            <QrCanvas url={baiduInfo.qrcodeUrl} />
-                            <div className="hint">或使用百度网盘 App 扫码确认</div>
+                          <div style={{ marginTop: "10px" }}>
+                            <QrViewer url={baiduInfo.qrcodeUrl} />
+                            <div className="hint" style={{ marginTop: "4px" }}>
+                              📱 请使用百度网盘手机 App 首页 [扫一扫] 扫描上方二维码并确认授权
+                            </div>
                           </div>
                         )}
                       </div>
@@ -639,8 +685,10 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
 
                     {aliyunInfo && (
                       <div style={{ marginTop: "12px" }}>
-                        <QrCanvas url={aliyunInfo.qrUrl} />
-                        <div className="hint">请使用阿里云盘 App 扫描上方二维码并确认登录</div>
+                        <QrViewer url={aliyunInfo.qrUrl} />
+                        <div className="hint" style={{ marginTop: "4px" }}>
+                          📱 请使用阿里云盘手机 App 首页右上角 [扫一扫] 扫描上方二维码并确认授权
+                        </div>
                       </div>
                     )}
                   </div>

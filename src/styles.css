@@ -983,11 +983,13 @@ h2 {
   animation: fadeIn 0.15s ease;
 }
 
+.modal,
 .modal-card {
   background: var(--panel);
+  background-color: #ffffff;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
   width: 90%;
   max-width: 580px;
   max-height: 85vh;
@@ -1359,15 +1361,17 @@ h2 {
 
 /* ---------- 差异分析与执行预览 (GoodSync/EchoSync 风格) ---------- */
 .modal-wide {
-  width: 90vw;
-  max-width: 860px;
+  width: 92vw !important;
+  max-width: 880px !important;
+  max-height: 88vh !important;
+  background: #ffffff !important;
 }
 
 .plan-stats-grid {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 10px;
-  margin-bottom: 18px;
+  margin-bottom: 16px;
 }
 
 .plan-stat-card {
@@ -1434,18 +1438,24 @@ h2 {
 .plan-table-container {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  overflow: hidden;
+  background: #ffffff;
+  max-height: 400px;
+  overflow-y: auto;
 }
 
 .plan-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+  table-layout: fixed;
 }
 
 .plan-table th {
+  position: sticky;
+  top: 0;
   background: var(--bg-soft);
-  padding: 8px 12px;
+  z-index: 2;
+  padding: 10px 12px;
   font-weight: 600;
   text-align: left;
   border-bottom: 1px solid var(--border);
@@ -1454,7 +1464,7 @@ h2 {
 }
 
 .plan-table td {
-  padding: 8px 12px;
+  padding: 9px 12px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -1466,7 +1476,15 @@ h2 {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
   color: var(--text);
-  word-break: break-all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 /* 颜色徽章扩展 */

@@ -109,9 +109,8 @@ export default function PlanPreviewModal({
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div
-        className="modal modal-wide"
+        className="modal-card modal-wide"
         onClick={(e) => e.stopPropagation()}
-        style={{ maxWidth: 880 }}
       >
         <div className="modal-header">
           <div>
