@@ -13,6 +13,7 @@ async fn main() {
     let backend = &cfg["folders"][0]["backend"];
     let remote_dir = backend["remoteDir"].as_str().unwrap_or("/apps/synccloud");
     let store = BaiduStore::new(
+        backend["authId"].as_str().unwrap_or("").into(),
         backend["appKey"].as_str().unwrap().into(),
         backend["secretKey"].as_str().unwrap().into(),
         remote_dir.into(),

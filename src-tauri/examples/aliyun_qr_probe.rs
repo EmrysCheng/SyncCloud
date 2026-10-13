@@ -9,7 +9,7 @@ async fn main() {
             println!("浏览器兜底: {link}");
             println!("sid: {sid}");
             println!("\n== poll 一次 ==");
-            match synccloud_lib::storage::aliyun::poll_qr_login(&sid).await {
+            match synccloud_lib::storage::aliyun::poll_qr_login(&sid, None).await {
                 Ok(false) => println!("OK: 等待扫码（WaitLogin）"),
                 Ok(true) => println!("OK: 已登录（不应发生——没人扫码）"),
                 Err(e) => println!("ERR: {e:#}"),

@@ -19,7 +19,8 @@ async fn main() {
     let remote_dir = backend["remoteDir"].as_str().unwrap_or("/apps/synccloud").to_string();
     println!("remote_dir = {remote_dir}, app_key = {}***", &app_key[..4.min(app_key.len())]);
 
-    let store = BaiduStore::new(app_key, secret, remote_dir);
+    let auth_id = backend["authId"].as_str().unwrap_or("").to_string();
+    let store = BaiduStore::new(auth_id, app_key, secret, remote_dir);
 
     println!("\n== 1. test() ==");
     match store.test().await {

@@ -7,7 +7,9 @@ edition = "2021"
 
 [lib]
 name = "synccloud_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 桌面应用只需要 rlib（bin 通过它链接）。staticlib/cdylib 是 Tauri 移动端
+# 需要的产物，在 GNU 工具链下还会以 -nodefaultlibs 链接 MSVC 静态库而失败。
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

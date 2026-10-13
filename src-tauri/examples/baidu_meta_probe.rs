@@ -17,7 +17,8 @@ async fn main() {
     let remote_dir = backend["remoteDir"].as_str().unwrap_or("/apps/synccloud").to_string();
     println!("remote_dir = {remote_dir}");
 
-    let store = BaiduStore::new(app_key, secret, remote_dir);
+    let auth_id = backend["authId"].as_str().unwrap_or("").to_string();
+    let store = BaiduStore::new(auth_id, app_key, secret, remote_dir);
 
     print!("[新位置]（同步目录外元数据区）");
     match store.read_manifest().await {

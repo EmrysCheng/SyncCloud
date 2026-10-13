@@ -11,6 +11,7 @@ async fn main() {
     let cfg: serde_json::Value = serde_json::from_str(&cfg_raw).unwrap();
     let backend = &cfg["folders"][0]["backend"];
     let store = BaiduStore::new(
+        backend["authId"].as_str().unwrap_or("").into(),
         backend["appKey"].as_str().unwrap().into(),
         backend["secretKey"].as_str().unwrap().into(),
         backend["remoteDir"].as_str().unwrap_or("/apps/synccloud").into(),
