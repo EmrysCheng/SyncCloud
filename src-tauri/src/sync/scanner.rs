@@ -15,6 +15,7 @@ pub const BUILTIN_IGNORES: &[&str] = &[
     ".synccloud*/**",
     ".synccloud*",
     "*.synccloud-part",
+    "*.sc-stage-*",
     ".git",
     ".git/**",
     "node_modules",
@@ -145,8 +146,8 @@ impl<'a> Scanner<'a> {
                 .unwrap_or_else(|| {
                     stats.hashed += 1;
                     let h = hash_file(entry.path()).unwrap_or_else(|e| {
-                        tracing::warn!(path = %entry.path().display(), error = %e, "哈希计算失败（可能被锁定），使用占位哈希");
-                        format!("unreadable-{}", mtime_ms)
+                        tracing::warn!(path = %entry.path().display(), error = %e, "哈希计算失败（独占锁定，极罕见），使用占位哈希待下轮重试");
+                        format!("unreadable-{}-{}", meta.len(), mtime_ms)
                     });
                     if let Some(db) = self.db {
                         db.put_hash_cache(&rel, meta.len(), mtime_ms, &h);
@@ -169,8 +170,10 @@ impl<'a> Scanner<'a> {
 }
 
 /// 计算文件 xxh3-128 哈希（hex）。流式读取，1MiB 缓冲。
+/// 以共享模式打开：文件被其他程序占用（编辑器/杀毒）时也能读取，
+/// 同步不再被“文件被另一进程使用”阻塞。
 pub fn hash_file(path: &Path) -> std::io::Result<String> {
-    let f = std::fs::File::open(path)?;
+    let f = crate::sync::fslock::open_read_shared(path)?;
     let mut reader = BufReader::with_capacity(1024 * 1024, f);
     let mut hasher = XxHash128::default();
     let mut buf = vec![0u8; 1024 * 1024];

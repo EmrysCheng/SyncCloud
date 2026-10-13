@@ -31,6 +31,8 @@ pub enum SyncEvent {
     Planned { folder_id: Uuid, stats: plan::PlanStats },
     FileDone { folder_id: Uuid, path: String, action: String },
     FileFailed { folder_id: Uuid, path: String, error: String, retry_in_secs: u64 },
+    /// 文件被独占锁定：新版本已停放到待替换队列，占用释放后自动应用
+    FilePending { folder_id: Uuid, path: String, reason: String },
     ConflictCreated { folder_id: Uuid, path: String, copy: String },
     CycleDone { folder_id: Uuid, folder: String, report: CycleReport },
     Error { folder_id: Uuid, folder: String, message: String },
@@ -121,6 +123,10 @@ impl SyncEngine {
         if local_synccloud.exists() {
             let _ = tokio::fs::remove_dir_all(&local_synccloud).await;
         }
+
+        // 0.5 应用待替换队列：上一轮被独占锁定而未落盘的新版本，现在再试一次。
+        //     成功后文件即为最新内容，随后的扫描与对比自然收敛。
+        self.apply_pending_replaces().await;
 
         // 1. 本地扫描（哈希缓存命中时只做 stat）+ 基线
         let scanned = (|| -> anyhow::Result<(crate::sync::types::FileTree, crate::sync::scanner::ScanStats, crate::sync::types::FileTree)> {
@@ -216,6 +222,55 @@ impl SyncEngine {
             }
         }
         report
+    }
+
+    /// 应用待替换队列（文件占用兜底）。超过 7 天仍未成功的记录连同临时文件清理。
+    async fn apply_pending_replaces(&mut self) {
+        let pending = match self.db.pending_list() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let root = self.root();
+        let fid = self.folder.id;
+        let mut applied = 0usize;
+        for p in &pending {
+            // 停放文件已丢失（用户清理数据目录等）：直接丢弃记录
+            if !Path::new(&p.tmp_path).exists() {
+                self.db.pending_remove(p.id);
+                continue;
+            }
+            // 7 天仍无法替换：放弃（远端仍有权威版本，下轮会重新规划）
+            if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&p.created_at) {
+                if chrono::Local::now().signed_duration_since(created) > chrono::Duration::days(7) {
+                    let _ = tokio::fs::remove_file(&p.tmp_path).await;
+                    self.db.pending_remove(p.id);
+                    tracing::warn!(path = %p.path, "待替换文件超过 7 天未应用，已清理");
+                    continue;
+                }
+            }
+            let target = abs_path(&root, &p.path);
+            match crate::sync::fslock::replace_file(Path::new(&p.tmp_path), &target).await {
+                Ok(()) => {
+                    self.db.pending_remove(p.id);
+                    applied += 1;
+                    tracing::info!(folder = %self.folder.name, path = %p.path, "占用已释放，待替换文件已应用");
+                    self.events.emit(SyncEvent::FileDone {
+                        folder_id: fid,
+                        path: p.path.clone(),
+                        action: "pending_replace".into(),
+                    });
+                }
+                Err(e) => {
+                    tracing::debug!(path = %p.path, error = %e, "目标仍被占用，待替换继续等待");
+                }
+            }
+        }
+        if applied > 0 {
+            tracing::info!(folder = %self.folder.name, n = applied, "本轮应用了待替换文件");
+        }
     }
 
     /// 持锁后的同步主体。
@@ -458,7 +513,7 @@ impl SyncEngine {
                     let bak_name = format!("{file_name}.{ts}.deleted");
                     let _ = tokio::fs::copy(&target, recycle_dir.join(bak_name)).await;
                 }
-                match tokio::fs::remove_file(&target).await {
+                match crate::sync::fslock::remove_file_robust(&target).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
@@ -527,6 +582,8 @@ impl SyncEngine {
     }
 
     /// 下载远端文件并落盘（临时文件置于应用数据目录，绝不污染同步文件夹）。
+    /// 目标被其他程序占用时：优先 POSIX 语义替换（绝大多数应用可原地替换）；
+    /// 仍失败则把已下载内容停放到待替换队列，占用释放后自动应用（无感知）。
     #[allow(clippy::items_after_statements)]
     async fn download_to(
         &self,
@@ -539,6 +596,36 @@ impl SyncEngine {
             return Ok(());
         }
         let target = abs_path(root, path);
+
+        // 快路径：待替换队列里已有同内容版本（此前被锁定停放），直接再试一次，
+        // 免去重复下载。
+        if let Some(p) = self.db.pending_get(path) {
+            if p.size == expected.size
+                && (p.hash == expected.hash || expected.hash.is_empty())
+                && Path::new(&p.tmp_path).exists()
+            {
+                match crate::sync::fslock::replace_file(Path::new(&p.tmp_path), &target).await {
+                    Ok(()) => {
+                        self.db.pending_remove(p.id);
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        // 仍被占用：记录保留，直接返回（内容已安全停放）
+                        self.events.emit(SyncEvent::FilePending {
+                            folder_id: self.folder.id,
+                            path: path.to_string(),
+                            reason: "目标文件被占用，新版本已在待替换队列等待".into(),
+                        });
+                        return Ok(());
+                    }
+                }
+            } else {
+                // 远端又有了更新版本：清掉过期停放，重新下载
+                let _ = tokio::fs::remove_file(&p.tmp_path).await;
+                self.db.pending_remove(p.id);
+            }
+        }
+
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -574,18 +661,34 @@ impl SyncEngine {
             let _ = tokio::fs::copy(&target, recycle_dir.join(bak_name)).await;
         }
 
-        // Windows：目标存在时 rename 会失败 → 先删后改名（崩溃窗口由下轮同步自愈）
-        match tokio::fs::remove_file(&target).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
+        // 落盘：普通 rename → POSIX 语义替换（目标被共享打开也能换）→ 跨卷 staging 副本。
+        // 锁定类错误（目标被独占打开）→ 停放进待替换队列，占用释放后自动应用；
+        // 其余错误如实上抛，交给引擎动作重试。
+        if let Err(e) = crate::sync::fslock::replace_file(&tmp, &target).await {
+            if !crate::sync::fslock::is_lock_error(&e) {
                 let _ = tokio::fs::remove_file(&tmp).await;
-                return Err(anyhow::anyhow!("目标文件被占用，无法替换 {}: {e}", target.display()));
+                return Err(e.into());
             }
-        }
-        if let Err(_) = tokio::fs::rename(&tmp, &target).await {
-            tokio::fs::copy(&tmp, &target).await?;
-            let _ = tokio::fs::remove_file(&tmp).await;
+            let pending_dir = crate::config::folder_data_dir(&self.folder.id).join("pending");
+            tokio::fs::create_dir_all(&pending_dir).await?;
+            let parked = pending_dir.join(format!("{}.part", uuid::Uuid::new_v4()));
+            if tokio::fs::rename(&tmp, &parked).await.is_err() {
+                tokio::fs::copy(&tmp, &parked).await?;
+                let _ = tokio::fs::remove_file(&tmp).await;
+            }
+            // 同路径旧停放（理论上不存在，上面的快路径已清理）防御性删除，避免孤儿文件
+            if let Some(old) = self.db.pending_get(path) {
+                if old.tmp_path != parked.to_string_lossy() {
+                    let _ = tokio::fs::remove_file(&old.tmp_path).await;
+                }
+            }
+            self.db.pending_add(path, &parked.to_string_lossy(), expected.size, &expected.hash);
+            tracing::warn!(folder = %self.folder.name, path = path, error = %e, "目标被独占锁定，新版本已入待替换队列");
+            self.events.emit(SyncEvent::FilePending {
+                folder_id: self.folder.id,
+                path: path.to_string(),
+                reason: "目标文件被占用，新版本将在占用释放后自动应用".into(),
+            });
         }
         Ok(())
     }
@@ -677,5 +780,288 @@ fn action_kind(a: &Action) -> String {
         Action::Conflict { .. } => "conflict".into(),
         Action::RemoteWinsOverDelete { .. } => "remote_wins".into(),
         Action::LocalWinsOverDelete { .. } => "local_wins".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BackendConfig;
+    use crate::storage::{manifest_stamp_of, RawIo, RemoteEntry, RemoteStore};
+    use crate::sync::state::StateDb;
+    use crate::sync::types::{FileMeta, Manifest};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// 内存 Mock 存储：用户文件 + 元数据区两个命名空间，
+    /// 覆盖 RemoteStore / RawIo 全部接口，供引擎端到端测试。
+    struct MemStore {
+        files: Mutex<HashMap<String, Vec<u8>>>,
+        meta: Mutex<HashMap<String, String>>,
+    }
+
+    impl MemStore {
+        fn new() -> Self {
+            Self {
+                files: Mutex::new(HashMap::new()),
+                meta: Mutex::new(HashMap::new()),
+            }
+        }
+        fn seed_file(&self, path: &str, content: &[u8]) -> FileMeta {
+            let hash = {
+                let tmp = std::env::temp_dir().join(format!(
+                    "synccloud-mem-{}.seed",
+                    uuid::Uuid::new_v4()
+                ));
+                std::fs::write(&tmp, content).unwrap();
+                let h = crate::sync::scanner::hash_file(&tmp).unwrap();
+                let _ = std::fs::remove_file(&tmp);
+                h
+            };
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), content.to_vec());
+            FileMeta {
+                size: content.len() as u64,
+                mtime_ms: chrono::Utc::now().timestamp_millis(),
+                hash,
+            }
+        }
+        fn write_manifest_with(&self, files: Vec<(String, FileMeta)>) {
+            let mut m = Manifest::new("test-remote");
+            for (p, meta) in files {
+                m.files.insert(p, meta);
+            }
+            self.meta
+                .lock()
+                .unwrap()
+                .insert("manifest.json".into(), serde_json::to_string(&m).unwrap());
+        }
+    }
+
+    #[async_trait]
+    impl RemoteStore for MemStore {
+        fn kind(&self) -> &'static str {
+            "mem"
+        }
+        fn raw_io(&self) -> &dyn RawIo {
+            self
+        }
+        async fn test(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn read_manifest(&self) -> anyhow::Result<Option<Manifest>> {
+            let raw = self.meta.lock().unwrap().get("manifest.json").cloned();
+            Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
+        }
+        async fn write_manifest(&self, manifest: &Manifest) -> anyhow::Result<()> {
+            self.meta
+                .lock()
+                .unwrap()
+                .insert("manifest.json".into(), serde_json::to_string(manifest)?);
+            Ok(())
+        }
+        async fn put_file(&self, path: &str, src: &Path) -> anyhow::Result<()> {
+            let data = std::fs::read(src)?;
+            self.files.lock().unwrap().insert(path.to_string(), data);
+            Ok(())
+        }
+        async fn get_file(&self, path: &str, dest: &Path) -> anyhow::Result<()> {
+            let data = self
+                .files
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("远端文件不存在: {path}"))?;
+            std::fs::write(dest, data)?;
+            Ok(())
+        }
+        async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
+            self.files.lock().unwrap().remove(path);
+            Ok(())
+        }
+        async fn list_objects(&self) -> anyhow::Result<Vec<RemoteEntry>> {
+            Ok(self
+                .files
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| RemoteEntry { key: k.clone(), size: v.len() as u64 })
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl RawIo for MemStore {
+        async fn put_text(&self, key: &str, content: &str) -> anyhow::Result<()> {
+            self.meta.lock().unwrap().insert(key.to_string(), content.to_string());
+            Ok(())
+        }
+        async fn read_text(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.meta.lock().unwrap().get(key).cloned())
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.meta.lock().unwrap().remove(key);
+            Ok(())
+        }
+        async fn list_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(self
+                .meta
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+    }
+
+    fn test_folder(local: &Path) -> crate::config::FolderConfig {
+        crate::config::FolderConfig {
+            id: Uuid::new_v4(),
+            name: "e2e".into(),
+            local_path: local.to_string_lossy().to_string(),
+            backend: BackendConfig::WebDav {
+                url: "http://mem".into(),
+                username: String::new(),
+                password: String::new(),
+                root_path: String::new(),
+            },
+            direction: crate::sync::types::Direction::Bidirectional,
+            conflict_policy: crate::sync::types::ConflictPolicy::BothCopies,
+            ignore_rules: vec![],
+            sync_mode: crate::sync::types::SyncMode::Manual,
+            interval_secs: 3600,
+            encryption: Default::default(),
+            enabled: true,
+        }
+    }
+
+    /// 端到端：本地文件被独占锁定时，下载走「待替换队列」，
+    /// 占用释放后的下一轮自动应用 —— 同步最终一致、无报错。
+    #[tokio::test]
+    async fn locked_file_syncs_via_pending_queue() {
+        // 两个 e2e 测试并行运行：共享同一数据目录根（set_app_data_dir_in_memory
+        // 是进程级全局），内部按各自 UUID 隔离，互不干扰。
+        let data_root = std::env::temp_dir().join("synccloud-e2e-shared");
+        let local = data_root.join("local-pending");
+        let _ = std::fs::remove_dir_all(&local);
+        std::fs::create_dir_all(&local).unwrap();
+        crate::config::set_app_data_dir_in_memory(data_root.clone());
+
+        std::fs::write(local.join("doc.txt"), b"v1-local").unwrap();
+
+        let folder = test_folder(&local);
+        let db = StateDb::open(&crate::config::folder_data_dir(&folder.id).join("state.db")).unwrap();
+        let (sink, _rx) = EventSink::new();
+        let mut engine = SyncEngine {
+            folder: folder.clone(),
+            device_id: "device-a".into(),
+            device_name: "DeviceA".into(),
+            settings: Default::default(),
+            db,
+            events: sink,
+        };
+
+        // 预置基线 = 本地 v1（三方对比：本地与基线一致，远端有新版）
+        {
+            let meta = std::fs::metadata(local.join("doc.txt")).unwrap();
+            let mut tree = crate::sync::types::FileTree::new();
+            tree.insert(
+                "doc.txt".into(),
+                FileMeta {
+                    size: meta.len(),
+                    mtime_ms: meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0),
+                    hash: crate::sync::scanner::hash_file(&local.join("doc.txt")).unwrap(),
+                },
+            );
+            engine.db.replace_baseline(&tree).unwrap();
+        }
+
+        // 远端有 v2
+        let store = MemStore::new();
+        let remote_meta = store.seed_file("doc.txt", b"v2-remote");
+        store.write_manifest_with(vec![("doc.txt".into(), remote_meta)]);
+
+        // 以「不允许共享删除」的方式持有本地文件句柄 → 替换必然失败
+        #[cfg(target_os = "windows")]
+        let guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1 | 0x2) // READ | WRITE，不含 DELETE
+                .open(local.join("doc.txt"))
+                .unwrap()
+        };
+
+        // 第一轮：下载被阻塞，转入待替换队列（不报错、不失败）
+        let report = engine.run_cycle(&store).await;
+        assert_eq!(report.failed, 0, "被占用文件不应计为失败");
+        assert_eq!(
+            std::fs::read(local.join("doc.txt")).unwrap(),
+            b"v1-local",
+            "占用期间本地内容不变"
+        );
+        let pending = engine.db.pending_list().unwrap();
+        assert_eq!(pending.len(), 1, "应有一条待替换记录");
+        assert_eq!(pending[0].path, "doc.txt");
+        assert!(Path::new(&pending[0].tmp_path).exists(), "停放文件应存在");
+
+        // 释放占用
+        #[cfg(target_os = "windows")]
+        drop(guard);
+
+        // 第二轮：待替换自动应用，本地与远端一致
+        let report2 = engine.run_cycle(&store).await;
+        assert_eq!(report2.failed, 0);
+        assert_eq!(
+            std::fs::read(local.join("doc.txt")).unwrap(),
+            b"v2-remote",
+            "占用释放后新版本应已应用"
+        );
+        assert!(engine.db.pending_list().unwrap().is_empty(), "待替换队列应清空");
+
+    }
+
+    /// 端到端：上传路径 —— 远端文件不存在而本地存在（且基线为空）时正常上传。
+    #[tokio::test]
+    async fn upload_flow_with_memory_store() {
+        let data_root = std::env::temp_dir().join("synccloud-e2e-shared");
+        let local = data_root.join("local-upload");
+        let _ = std::fs::remove_dir_all(&local);
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("a.txt"), b"hello").unwrap();
+        crate::config::set_app_data_dir_in_memory(data_root.clone());
+
+        let folder = test_folder(&local);
+        let db = StateDb::open(&crate::config::folder_data_dir(&folder.id).join("state.db")).unwrap();
+        let (sink, _rx) = EventSink::new();
+        let mut engine = SyncEngine {
+            folder,
+            device_id: "device-a".into(),
+            device_name: "DeviceA".into(),
+            settings: Default::default(),
+            db,
+            events: sink,
+        };
+
+        let store = MemStore::new();
+        store.write_manifest_with(vec![]);
+
+        let report = engine.run_cycle(&store).await;
+        assert_eq!(report.uploaded, 1, "应上传 1 个文件");
+        assert_eq!(store.files.lock().unwrap().get("a.txt").unwrap(), b"hello");
+        // manifest 已包含上传的文件
+        let m = store.read_manifest().await.unwrap().unwrap();
+        assert!(m.files.contains_key("a.txt"));
+        assert!(manifest_stamp_of(&m).starts_with("v"));
     }
 }

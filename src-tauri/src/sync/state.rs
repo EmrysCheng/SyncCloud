@@ -33,6 +33,19 @@ pub struct ConflictRecord {
     pub resolution: Option<String>,
 }
 
+/// 待替换记录：目标文件被独占锁定时，已下载的新版本先停放在应用数据目录，
+/// 占用释放后（下轮同步开始时）自动替换 —— 同步无感知、最终一致。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingReplace {
+    pub id: i64,
+    pub path: String,
+    pub tmp_path: String,
+    pub size: u64,
+    pub hash: String,
+    pub created_at: String,
+}
+
 impl StateDb {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -70,6 +83,14 @@ impl StateDb {
                 path TEXT NOT NULL,
                 op   TEXT NOT NULL,
                 meta TEXT
+            );
+            CREATE TABLE IF NOT EXISTS pending_replace (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                path       TEXT NOT NULL UNIQUE,
+                tmp_path   TEXT NOT NULL,
+                size       INTEGER NOT NULL,
+                hash       TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
         ")?;
         Ok(Self { conn: std::sync::Mutex::new(conn) })
@@ -267,6 +288,70 @@ impl StateDb {
             params![id, resolution],
         )?;
         Ok(())
+    }
+
+    // ---- 待替换队列（文件占用兜底） ----
+
+    pub fn pending_add(&self, path: &str, tmp_path: &str, size: u64, hash: &str) {
+        let _ = self.conn.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO pending_replace (path, tmp_path, size, hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                path,
+                tmp_path,
+                size as i64,
+                hash,
+                chrono::Local::now().to_rfc3339()
+            ],
+        );
+    }
+
+    pub fn pending_list(&self) -> anyhow::Result<Vec<PendingReplace>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, tmp_path, size, hash, created_at FROM pending_replace ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingReplace {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                tmp_path: row.get(2)?,
+                size: row.get::<_, i64>(3)?.max(0) as u64,
+                hash: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn pending_remove(&self, id: i64) {
+        let _ = self
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM pending_replace WHERE id = ?1", params![id]);
+    }
+
+    /// 按路径查待替换记录（下载前先尝试应用，可省一次重复下载）。
+    pub fn pending_get(&self, path: &str) -> Option<PendingReplace> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, path, tmp_path, size, hash, created_at FROM pending_replace WHERE path = ?1",
+                params![path],
+                |row| {
+                    Ok(PendingReplace {
+                        id: row.get(0)?,
+                        path: row.get(1)?,
+                        tmp_path: row.get(2)?,
+                        size: row.get::<_, i64>(3)?.max(0) as u64,
+                        hash: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
+            .ok()
     }
 
     // ---- 键值 ----

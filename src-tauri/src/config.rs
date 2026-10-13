@@ -42,6 +42,16 @@ pub struct GlobalSettings {
     pub aliyun_app_id: String,
     #[serde(default)]
     pub aliyun_app_secret: String,
+    /// 日志等级：trace / debug / info / warn / error
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    /// 是否输出文件日志（数据目录 logs/，轮转保留）
+    #[serde(default = "default_true")]
+    pub log_to_file: bool,
+}
+
+fn default_log_level() -> String {
+    "info".into()
 }
 
 impl Default for GlobalSettings {
@@ -57,6 +67,8 @@ impl Default for GlobalSettings {
             baidu_secret_key: String::new(),
             aliyun_app_id: String::new(),
             aliyun_app_secret: String::new(),
+            log_level: default_log_level(),
+            log_to_file: true,
         }
     }
 }
@@ -288,6 +300,15 @@ pub fn app_data_dir() -> PathBuf {
         *guard = Some(resolved.clone());
     }
     resolved
+}
+
+/// 测试专用：仅设置进程内数据目录（不持久化 storage_location.txt，
+/// 避免测试污染真实应用的数据目录重定向）。
+#[doc(hidden)]
+pub fn set_app_data_dir_in_memory(dir: PathBuf) {
+    if let Ok(mut guard) = CURRENT_DATA_DIR.write() {
+        *guard = Some(dir);
+    }
 }
 
 /// 设置并迁移应用数据目录。

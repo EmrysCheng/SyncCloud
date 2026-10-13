@@ -923,7 +923,8 @@ impl AliyunStore {
                 .await;
         }
 
-        let data = tokio::fs::read(src).await?;
+        // 共享模式读取：文件被占用时也能上传
+        let data = crate::sync::fslock::read_shared(src).await?;
         let size = data.len();
         let parts = if size == 0 { 1 } else { (size + CHUNK - 1) / CHUNK };
         let part_numbers: Vec<u64> = (1..=parts as u64).collect();

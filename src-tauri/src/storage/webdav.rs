@@ -383,7 +383,8 @@ impl RemoteStore for WebDavStore {
                 self.mkcol_all(&parent_str).await?;
             }
         }
-        let file = tokio::fs::File::open(src).await
+        // 共享模式打开：文件被编辑器/杀毒等占用时仍可读取上传
+        let file = crate::sync::fslock::open_read_shared_async(src).await
             .map_err(|e| anyhow::anyhow!("打开本地文件失败 {}: {e}", src.display()))?;
         let len = file.metadata().await?.len();
         let stream = tokio_util::io::ReaderStream::new(file);

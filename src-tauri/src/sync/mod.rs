@@ -1,6 +1,7 @@
 pub mod types;
 pub mod state;
 pub mod scanner;
+pub mod fslock;
 pub mod watcher;
 pub mod plan;
 pub mod conflict;

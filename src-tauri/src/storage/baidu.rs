@@ -628,7 +628,8 @@ impl BaiduStore {
     /// 上传到绝对云端路径（precreate → 分片 → 合并；可越出同步目录）。
     async fn put_file_abs(&self, abs: &str, src: &Path) -> anyhow::Result<()> {
         self.invalidate_list_cache().await;
-        let data = tokio::fs::read(src).await?;
+        // 共享模式读取：文件被占用时也能上传
+        let data = crate::sync::fslock::read_shared(src).await?;
         let size = data.len();
         // 分块 md5（4MB 一块）
         const BLOCK: usize = 4 * 1024 * 1024;

@@ -188,11 +188,16 @@ impl RemoteStore for S3Store {
 
     async fn put_file(&self, path: &str, src: &Path) -> anyhow::Result<()> {
         let key = self.key(path);
+        // 共享模式打开：文件被编辑器/杀毒等占用时仍可读取上传
+        let file = crate::sync::fslock::open_read_shared_async(src).await
+            .map_err(|e| anyhow::anyhow!("打开本地文件失败 {}: {e}", src.display()))?;
+        let len = file.metadata().await?.len();
         let stream = ByteStream::read_from()
-            .path(src)
+            .file(file)
+            .length(aws_smithy_types::byte_stream::Length::Exact(len))
             .build()
             .await
-            .map_err(|e| anyhow::anyhow!("打开本地文件失败 {}: {e}", src.display()))?;
+            .map_err(|e| anyhow::anyhow!("构造上传流失败 {}: {e}", src.display()))?;
         self.client
             .put_object()
             .bucket(&self.bucket)
