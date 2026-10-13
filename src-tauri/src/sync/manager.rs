@@ -222,6 +222,27 @@ impl FolderManager {
         Ok(())
     }
 
+    pub async fn analyze(
+        &self,
+        folder: &FolderConfig,
+        settings: &GlobalSettings,
+    ) -> anyhow::Result<crate::sync::plan::SyncPlan> {
+        let data_dir = folder_data_dir(&folder.id);
+        let store = build_store_with_cache(folder, &data_dir).await?;
+        let db = StateDb::open(&data_dir.join("state.db"))?;
+        let device_info = device_info();
+        let (sink, _rx) = EventSink::new();
+        let mut engine = SyncEngine {
+            folder: folder.clone(),
+            device_id: device_info.0,
+            device_name: device_info.1,
+            settings: settings.clone(),
+            db,
+            events: sink,
+        };
+        engine.analyze(store.as_ref()).await
+    }
+
     pub async fn stop_folder(&self, id: &Uuid) {
         let mut folders = self.folders.lock().await;
         folders.remove(id); // drop cmd_tx → 任务循环退出

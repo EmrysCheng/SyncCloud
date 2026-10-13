@@ -19,6 +19,18 @@ export default function FolderSettingsModal({
   const [ignoreRulesText, setIgnoreRulesText] = useState((folder.ignoreRules || []).join("\n"));
   const [saving, setSaving] = useState(false);
 
+  function appendPreset(rules: string[]) {
+    const existing = ignoreRulesText
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const set = new Set(existing);
+    const toAdd = rules.filter((r) => !set.has(r));
+    if (toAdd.length === 0) return;
+    const next = [...existing, ...toAdd].join("\n");
+    setIgnoreRulesText(next);
+  }
+
   async function handleSave() {
     setSaving(true);
     try {
@@ -153,7 +165,54 @@ export default function FolderSettingsModal({
           )}
 
           <div className="field">
-            <label>自定义排除规则（每行一条 Glob 匹配，已默认忽略 .git/node_modules/临时文件等）</label>
+            <div className="flex-row-between" style={{ marginBottom: 6 }}>
+              <label style={{ margin: 0 }}>自定义排除规则（支持 Glob 通配符）</label>
+              <div className="preset-buttons">
+                <span className="preset-label">快捷预设：</span>
+                <button
+                  type="button"
+                  className="btn-preset"
+                  onClick={() =>
+                    appendPreset(["~$*", "*.tmp", "*.bak", "*.swp", "*.part"])
+                  }
+                  title="添加 Office 临时保存、文本备份与临时下载文件"
+                >
+                  + 临时/备份
+                </button>
+                <button
+                  type="button"
+                  className="btn-preset"
+                  onClick={() =>
+                    appendPreset([
+                      "node_modules/**",
+                      "target/**",
+                      "dist/**",
+                      "build/**",
+                      "*.log",
+                      ".venv/**",
+                    ])
+                  }
+                  title="添加常见的开发依赖与构建产物目录"
+                >
+                  + 开发/构建
+                </button>
+                <button
+                  type="button"
+                  className="btn-preset"
+                  onClick={() =>
+                    appendPreset([
+                      "Thumbs.db",
+                      "desktop.ini",
+                      ".DS_Store",
+                      "*.crdownload",
+                    ])
+                  }
+                  title="添加系统缩略图、桌面配置和浏览器缓存"
+                >
+                  + 系统缓存
+                </button>
+              </div>
+            </div>
             <textarea
               className="input code-area"
               rows={4}
@@ -164,13 +223,23 @@ export default function FolderSettingsModal({
           </div>
         </div>
 
-        <div className="modal-footer">
-          <button className="btn" onClick={onClose}>
-            取消
+        <div className="modal-footer flex-row-between">
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost"
+            onClick={() => api.openRecycleBin(folder.id)}
+            title="查看此同步任务被删除或被覆盖文件的安全副本"
+          >
+            🗑 查看防误删回收站
           </button>
-          <button className="btn btn-primary" disabled={saving} onClick={handleSave}>
-            {saving ? "保存中…" : "保存并应用"}
-          </button>
+          <div className="modal-actions">
+            <button className="btn" onClick={onClose}>
+              取消
+            </button>
+            <button className="btn btn-primary" disabled={saving} onClick={handleSave}>
+              {saving ? "保存中…" : "保存并应用"}
+            </button>
+          </div>
         </div>
       </div>
     </div>

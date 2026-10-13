@@ -1356,3 +1356,165 @@ h2 {
   color: var(--primary);
   font-weight: 500;
 }
+
+/* ---------- 差异分析与执行预览 (GoodSync/EchoSync 风格) ---------- */
+.modal-wide {
+  width: 90vw;
+  max-width: 860px;
+}
+
+.plan-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.plan-stat-card {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 2px;
+}
+
+.p-num {
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.p-lbl {
+  font-size: 12px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.p-sub {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.plan-filter-bar {
+  display: flex;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.filter-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.tab-btn {
+  padding: 6px 12px;
+  border: none;
+  background: none;
+  border-bottom: 2px solid transparent;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tab-btn:hover {
+  color: var(--text);
+}
+
+.tab-btn.active {
+  color: var(--primary);
+  border-bottom-color: var(--primary);
+  font-weight: 600;
+}
+
+.plan-table-container {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.plan-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.plan-table th {
+  background: var(--bg-soft);
+  padding: 8px 12px;
+  font-weight: 600;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.plan-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.plan-table tr:last-child td {
+  border-bottom: none;
+}
+
+.plan-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+}
+
+/* 颜色徽章扩展 */
+.badge-blue {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+.badge-green {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.badge-orange {
+  background: #ffedd5;
+  color: #c2410c;
+}
+
+.badge-red {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+/* ---------- 忽略规则常用快捷预设 (Syncthing/DSynchronize 风格) ---------- */
+.preset-buttons {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.preset-label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.btn-preset {
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--text);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-preset:hover {
+  background: var(--panel);
+  border-color: var(--primary);
+  color: var(--primary);
+}

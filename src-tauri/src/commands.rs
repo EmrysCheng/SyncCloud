@@ -493,6 +493,43 @@ pub async fn sync_all_folders(state: State<'_, AppState>) -> Result<(), String> 
     Ok(())
 }
 
+/// 分析并预览指定文件夹的同步差异计划（对标 GoodSync / EchoSync）。
+#[tauri::command]
+pub async fn analyze_folder(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<crate::sync::plan::SyncPlan, String> {
+    let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
+    let cfg = state.config.lock().await;
+    let folder = cfg
+        .folders
+        .iter()
+        .find(|f| f.id == id)
+        .cloned()
+        .ok_or_else(|| "未找到该文件夹".to_string())?;
+    let settings = cfg.settings.clone();
+    drop(cfg);
+
+    state
+        .manager
+        .analyze(&folder, &settings)
+        .await
+        .map_err(err)
+}
+
+/// 打开防误删保护回收站目录（对标 Syncthing / GoodSync）。
+#[tauri::command]
+pub async fn open_recycle_bin(folder_id: Option<String>) -> Result<(), String> {
+    let dir = if let Some(fid_str) = folder_id {
+        let id: Uuid = fid_str.parse().map_err(|_| "ID 非法".to_string())?;
+        config::folder_data_dir(&id).join("recycle_bin")
+    } else {
+        config::app_data_dir().join("recycle_bin")
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    open_path_in_explorer(dir.to_string_lossy().to_string(), false).await
+}
+
 /// 暂停所有文件夹的同步
 #[tauri::command]
 pub async fn pause_all_folders(state: State<'_, AppState>) -> Result<(), String> {

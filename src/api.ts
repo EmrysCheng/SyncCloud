@@ -10,6 +10,7 @@ import type {
   FolderSummary,
   GlobalSettings,
   SyncEvent,
+  SyncPlan,
 } from "./types";
 
 export const api = {
@@ -68,4 +69,8 @@ export const api = {
   syncAllFolders: () => invoke<void>("sync_all_folders"),
   pauseAllFolders: () => invoke<void>("pause_all_folders"),
   resumeAllFolders: () => invoke<void>("resume_all_folders"),
+  analyzeFolder: (folderId: string) =>
+    invoke<SyncPlan>("analyze_folder", { folderId }),
+  openRecycleBin: (folderId?: string) =>
+    invoke<void>("open_recycle_bin", { folderId }),
 };

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import type { BackendConfig, FolderSummary, SyncEvent } from "../types";
+import type { BackendConfig, FolderSummary, SyncEvent, SyncPlan } from "../types";
 import FolderSettingsModal from "../components/FolderSettingsModal";
+import PlanPreviewModal from "../components/PlanPreviewModal";
 
 const BACKEND_LABEL: Record<string, string> = {
   s3: "S3 兼容",
@@ -55,6 +56,11 @@ export default function Folders({
   const [folders, setFolders] = useState<FolderSummary[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [analyzingId, setAnalyzingId] = useState<string | null>(null);
+  const [previewTarget, setPreviewTarget] = useState<{
+    folder: FolderSummary;
+    plan: SyncPlan;
+  } | null>(null);
   const [healthMap, setHealthMap] = useState<
     Record<string, { status: "checking" | "ok" | "err"; msg?: string }>
   >({});
@@ -91,6 +97,18 @@ export default function Folders({
       setHealthMap((prev) => ({ ...prev, [folderId]: { status: "ok", msg: res } }));
     } catch (e) {
       setHealthMap((prev) => ({ ...prev, [folderId]: { status: "err", msg: String(e) } }));
+    }
+  }
+
+  async function handleAnalyze(folder: FolderSummary) {
+    setAnalyzingId(folder.id);
+    try {
+      const plan = await api.analyzeFolder(folder.id);
+      setPreviewTarget({ folder, plan });
+    } catch (e) {
+      alert(`差异分析失败: ${e}`);
+    } finally {
+      setAnalyzingId(null);
     }
   }
 
@@ -133,7 +151,7 @@ export default function Folders({
       <div className="page-header">
         <div>
           <h1>同步文件夹</h1>
-          <div className="header-sub">多存储统一对齐 · 实时监控与传输控制</div>
+          <div className="header-sub">多存储统一对齐 · 差异预演分析与安全同步</div>
         </div>
         <div className="header-actions">
           <button className="btn btn-sm" onClick={handleSyncAll}>
@@ -186,8 +204,10 @@ export default function Folders({
             health={healthMap[f.id]}
             expanded={expanded === f.id}
             busy={busy === f.id}
+            analyzing={analyzingId === f.id}
             onToggle={() => setExpanded(expanded === f.id ? null : f.id)}
             onSync={() => act(() => api.syncNow(f.id), f.id)}
+            onAnalyze={() => handleAnalyze(f)}
             onPause={() => act(() => api.pauseFolder(f.id), f.id)}
             onResume={() => act(() => api.resumeFolder(f.id), f.id)}
             onTestHealth={() => testHealth(f.id, f.backend)}
@@ -202,6 +222,17 @@ export default function Folders({
           />
         ))}
       </div>
+
+      {previewTarget && (
+        <PlanPreviewModal
+          folder={previewTarget.folder}
+          plan={previewTarget.plan}
+          onClose={() => setPreviewTarget(null)}
+          onExecuteSync={() =>
+            act(() => api.syncNow(previewTarget.folder.id), previewTarget.folder.id)
+          }
+        />
+      )}
     </div>
   );
 }
@@ -266,8 +297,10 @@ function FolderCard({
   health,
   expanded,
   busy,
+  analyzing,
   onToggle,
   onSync,
+  onAnalyze,
   onPause,
   onResume,
   onRemove,
@@ -279,8 +312,10 @@ function FolderCard({
   health?: { status: "checking" | "ok" | "err"; msg?: string };
   expanded: boolean;
   busy: boolean;
+  analyzing: boolean;
   onToggle: () => void;
   onSync: () => void;
+  onAnalyze: () => void;
   onPause: () => void;
   onResume: () => void;
   onRemove: () => void;
@@ -379,7 +414,15 @@ function FolderCard({
       </div>
 
       <div className="folder-actions">
-        <button className="btn btn-sm" disabled={busy} onClick={onSync}>
+        <button
+          className="btn btn-sm btn-ghost"
+          disabled={busy || analyzing}
+          title="仅扫描并对比本地与云端差异，预演将发生的文件变动，不实际上传或删除"
+          onClick={onAnalyze}
+        >
+          {analyzing ? "🔍 分析中…" : "🔍 分析差异"}
+        </button>
+        <button className="btn btn-sm" disabled={busy || analyzing} onClick={onSync}>
           ⟳ 立即同步
         </button>
         {st?.state === "paused" ? (
@@ -397,6 +440,13 @@ function FolderCard({
           onClick={() => api.openInExplorer(f.localPath, false)}
         >
           📁 打开目录
+        </button>
+        <button
+          className="btn btn-sm btn-ghost"
+          title="查看被同步删除或被覆盖文件的历史安全备份"
+          onClick={() => api.openRecycleBin(f.id)}
+        >
+          🗑 回收站
         </button>
         <button
           className="btn btn-sm btn-ghost"

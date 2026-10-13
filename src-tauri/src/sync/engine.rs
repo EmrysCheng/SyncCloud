@@ -69,6 +69,44 @@ impl SyncEngine {
         PathBuf::from(&self.folder.local_path)
     }
 
+    /// 仅执行扫描与三方对比计算，不执行任何写入、上传、下载或删除（对标 GoodSync / EchoSync 差异分析）。
+    pub async fn analyze(&mut self, store: &dyn RemoteStore) -> anyhow::Result<SyncPlan> {
+        let scanner = Scanner::new(&self.folder.ignore_rules, Some(&self.db))?;
+        let (local, _) = scanner.scan(&self.root())?;
+        let baseline = self.db.load_baseline()?;
+
+        let mut remote = store.read_manifest().await?;
+        if remote.is_none() {
+            if let Some(legacy) = store.read_legacy_manifest().await? {
+                remote = Some(legacy);
+            }
+        }
+
+        let journal = self.db.journal_load().unwrap_or_default();
+        if !journal.is_empty() {
+            let m = remote.get_or_insert_with(|| Manifest::new(&self.device_name));
+            for op in &journal {
+                match op {
+                    JournalOp::Put(p, meta) => {
+                        m.files.insert(p.clone(), meta.clone());
+                    }
+                    JournalOp::Remove(p) => {
+                        m.files.remove(p);
+                    }
+                }
+            }
+        }
+
+        let plan = plan::compare(
+            &local,
+            remote.as_ref(),
+            &baseline,
+            self.folder.direction,
+            self.folder.conflict_policy,
+        );
+        Ok(plan)
+    }
+
     /// 执行一轮完整同步。本地与远端均无实质变化时走增量快路径，
     /// 不获取远端锁、不下载 manifest、不做三方对比（坚果云式增量体验）。
     pub async fn run_cycle(&mut self, store: &dyn RemoteStore) -> CycleReport {
@@ -410,6 +448,16 @@ impl SyncEngine {
             }
             Action::DeleteLocal { path } => {
                 let target = abs_path(&root, path);
+                if target.exists() {
+                    // 安全防误删保护（GoodSync / Syncthing 同款）：
+                    // 本地删除时先归档到应用外部回收站，保留防误删备份
+                    let recycle_dir = crate::config::folder_data_dir(&self.folder.id).join("recycle_bin");
+                    let _ = tokio::fs::create_dir_all(&recycle_dir).await;
+                    let file_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                    let bak_name = format!("{file_name}.{ts}.deleted");
+                    let _ = tokio::fs::copy(&target, recycle_dir.join(bak_name)).await;
+                }
                 match tokio::fs::remove_file(&target).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -516,6 +564,16 @@ impl SyncEngine {
                 anyhow::bail!("下载校验失败（哈希不一致：期望 {}，实得 {got_hash}）", expected.hash);
             }
         }
+        // 安全防误删保护：如果目标文件已存在，先安全备份至回收站再替换
+        if target.exists() {
+            let recycle_dir = crate::config::folder_data_dir(&self.folder.id).join("recycle_bin");
+            let _ = tokio::fs::create_dir_all(&recycle_dir).await;
+            let file_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let bak_name = format!("{file_name}.{ts}.overwritten");
+            let _ = tokio::fs::copy(&target, recycle_dir.join(bak_name)).await;
+        }
+
         // Windows：目标存在时 rename 会失败 → 先删后改名（崩溃窗口由下轮同步自愈）
         match tokio::fs::remove_file(&target).await {
             Ok(()) => {}

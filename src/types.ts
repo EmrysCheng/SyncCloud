@@ -155,3 +155,45 @@ export interface CloudAccount {
   secretKey?: string;
   createdAt: string;
 }
+
+export interface FileMeta {
+  hash: string;
+  size: number;
+  mtimeMs: number;
+}
+
+export type PlanActionKind =
+  | "upload"
+  | "download"
+  | "delete_remote"
+  | "delete_local"
+  | "conflict"
+  | "identical"
+  | "remote_wins_over_delete"
+  | "local_wins_over_delete";
+
+export interface PlanAction {
+  kind: PlanActionKind;
+  path: string;
+  meta?: FileMeta;
+  local?: FileMeta;
+  remote?: FileMeta;
+}
+
+export interface PlanStats {
+  uploads: number;
+  downloads: number;
+  deleteLocal: number;
+  deleteRemote: number;
+  conflicts: number;
+  identical: number;
+  unchanged: number;
+  bytesUp: number;
+  bytesDown: number;
+}
+
+export interface SyncPlan {
+  actions: PlanAction[];
+  stats: PlanStats;
+}
+

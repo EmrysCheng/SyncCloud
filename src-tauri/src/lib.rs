@@ -228,6 +228,8 @@ pub fn run() {
             commands::sync_all_folders,
             commands::pause_all_folders,
             commands::resume_all_folders,
+            commands::analyze_folder,
+            commands::open_recycle_bin,
         ])
         .run(tauri::generate_context!())
         .expect("SyncCloud 启动失败");
