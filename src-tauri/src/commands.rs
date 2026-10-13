@@ -6,6 +6,7 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::config::{self, app_data_dir, AppConfig, BackendConfig, FolderConfig, GlobalSettings};
+use crate::storage::RemoteStore;
 use crate::sync::engine::SyncEvent;
 use crate::sync::manager::{FolderManager, FolderStatus};
 use crate::sync::state::ConflictRecord;
@@ -52,6 +53,8 @@ pub async fn save_settings(
     cfg.save(&app_data_dir()).map_err(err)?;
     // 关窗到托盘的开关在窗口事件（同步上下文）里读取，用原子变量即时生效
     crate::CLOSE_TO_TRAY.store(cfg.settings.close_to_tray, std::sync::atomic::Ordering::Relaxed);
+    // 日志等级与文件开关热生效（无需重启）
+    crate::logging::apply_settings(&cfg.settings.log_level, cfg.settings.log_to_file);
     Ok(())
 }
 
@@ -370,12 +373,16 @@ pub async fn list_cloud_accounts(provider: Option<String>) -> Result<Vec<crate::
 pub async fn delete_cloud_account(id: String) -> Result<(), String> {
     let mut list = crate::config::load_cloud_accounts(&app_data_dir());
     if let Some(acc) = list.iter().find(|a| a.id == id).cloned() {
-        if acc.provider == "baidu" {
-            let key = format!("baidu:account:{}", acc.id);
-            let _ = crate::credential::save_secret(&key, "");
-        } else if acc.provider == "aliyun" {
-            let key = format!("aliyun:account:{}", acc.id);
-            let _ = crate::credential::save_secret(&key, "");
+        // 真正删除系统凭据管理器中的令牌（旧版写空串会残留条目）
+        let key = match acc.provider.as_str() {
+            "baidu" => Some(format!("baidu:account:{}", acc.id)),
+            "aliyun" => Some(format!("aliyun:account:{}", acc.id)),
+            _ => None,
+        };
+        if let Some(k) = key {
+            if let Err(e) = crate::credential::delete_secret(&k) {
+                tracing::warn!(error = %e, account = %acc.id, "清理凭据条目失败");
+            }
         }
     }
     list.retain(|a| a.id != id);
@@ -538,6 +545,93 @@ pub async fn pause_all_folders(state: State<'_, AppState>) -> Result<(), String>
     }
     Ok(())
 }
+
+// ---- 授权账户状态探测 ----
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudAccountStatus {
+    pub account_id: String,
+    /// token 是否仍存于系统凭据管理器
+    pub authorized: bool,
+    /// 实际连通性探测是否成功
+    pub ok: bool,
+    /// 成功时的摘要（如账户空间）或失败的错误信息
+    pub detail: String,
+    pub checked_at: String,
+}
+
+/// 探测授权账户的实时可用性：令牌存在性 + 一次轻量远端调用。
+#[tauri::command]
+pub async fn cloud_account_status(account_id: String) -> Result<CloudAccountStatus, String> {
+    let acc = crate::config::load_cloud_accounts(&app_data_dir())
+        .into_iter()
+        .find(|a| a.id == account_id)
+        .ok_or_else(|| "账户不存在".to_string())?;
+    let checked_at = chrono::Local::now().to_rfc3339();
+
+    let (authorized, probe) = match acc.provider.as_str() {
+        "baidu" => {
+            let app_key = acc.app_key.clone().unwrap_or_default();
+            let secret_key = acc.secret_key.clone().unwrap_or_default();
+            let authorized = crate::storage::baidu::BaiduStore::authorized(&acc.id, &app_key);
+            if !authorized {
+                (false, Err(anyhow::anyhow!("授权令牌缺失，请重新扫码授权")))
+            } else {
+                let store = crate::storage::baidu::BaiduStore::new(
+                    acc.id.clone(),
+                    app_key,
+                    secret_key,
+                    "/apps/synccloud".into(),
+                );
+                (true, store.test().await)
+            }
+        }
+        "aliyun" => {
+            let authorized = crate::storage::aliyun::AliyunStore::authorized(&acc.id);
+            if !authorized {
+                (false, Err(anyhow::anyhow!("授权令牌缺失，请重新扫码授权")))
+            } else {
+                let store = crate::storage::aliyun::AliyunStore::new(acc.id.clone(), "/apps/synccloud".into());
+                (true, store.test().await)
+            }
+        }
+        other => (false, Err(anyhow::anyhow!("未知的账户类型 {other}"))),
+    };
+
+    let (ok, detail) = match probe {
+        Ok(()) => (true, "连接正常，读写权限有效".into()),
+        Err(e) => (false, format!("{e:#}")),
+    };
+    Ok(CloudAccountStatus {
+        account_id: acc.id,
+        authorized,
+        ok,
+        detail,
+        checked_at,
+    })
+}
+
+// ---- 日志管理 ----
+
+#[tauri::command]
+pub async fn list_log_files() -> Result<Vec<crate::logging::LogFileInfo>, String> {
+    Ok(crate::logging::list_log_files())
+}
+
+#[tauri::command]
+pub async fn read_log_tail(file: String, lines: usize) -> Result<Vec<String>, String> {
+    crate::logging::read_log_tail(&file, lines.clamp(10, 2000)).map_err(err)
+}
+
+/// 在资源管理器中打开日志目录
+#[tauri::command]
+pub async fn open_log_dir() -> Result<(), String> {
+    let dir = crate::logging::log_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
+    open_path_in_explorer(dir.to_string_lossy().to_string(), false).await
+}
+
 
 /// 恢复所有文件夹的同步
 #[tauri::command]

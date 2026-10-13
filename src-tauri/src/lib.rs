@@ -3,6 +3,7 @@
 pub mod config;
 pub mod credential;
 pub mod crypto;
+pub mod logging;
 pub mod storage;
 pub mod sync;
 pub mod commands;
@@ -53,11 +54,8 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // 文件日志（数据目录 logs/，轮转保留）+ 控制台输出，等级取自全局设置
+    crate::logging::init_logging();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -230,6 +228,10 @@ pub fn run() {
             commands::resume_all_folders,
             commands::analyze_folder,
             commands::open_recycle_bin,
+            commands::cloud_account_status,
+            commands::list_log_files,
+            commands::read_log_tail,
+            commands::open_log_dir,
         ])
         .run(tauri::generate_context!())
         .expect("SyncCloud 启动失败");
