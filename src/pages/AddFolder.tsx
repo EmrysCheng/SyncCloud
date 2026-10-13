@@ -184,20 +184,27 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
           ? "请使用百度网盘 App 扫描下方二维码，或在浏览器打开验证页输入用户码"
           : `请在浏览器打开 ${info.verificationUrl} 并输入用户码 ${info.userCode}`
       );
-      pollBaidu(info, baiduAppKey.trim(), baiduSecretKey.trim());
+      const fixedAuthId = crypto.randomUUID();
+      pollBaidu(info, baiduAppKey.trim(), baiduSecretKey.trim(), fixedAuthId);
     } catch (e) {
       setBaiduAuthorizing(false);
       setBaiduStatus(`发起失败: ${e}`);
     }
   }
 
-  async function pollBaidu(info: BaiduLoginInfo, ak: string, sk: string, attempt = 0, errs = 0) {
+  async function pollBaidu(
+    info: BaiduLoginInfo,
+    ak: string,
+    sk: string,
+    authId: string,
+    attempt = 0,
+    errs = 0
+  ) {
     if (attempt > 90) {
       setBaiduAuthorizing(false);
       return setBaiduStatus("等待授权超时，请重新发起");
     }
     try {
-      const authId = crypto.randomUUID();
       const accName = newAccountName.trim() || `百度账号 ${cloudAccounts.length + 1}`;
       const account = await api.baiduLoginPoll(ak, sk, info.deviceCode, authId, accName);
       if (account) {
@@ -209,14 +216,14 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
         setCloudAccounts(nextList);
         applyAccount(account);
       } else {
-        setTimeout(() => pollBaidu(info, ak, sk, attempt + 1), (info.interval || 5) * 1000);
+        setTimeout(() => pollBaidu(info, ak, sk, authId, attempt + 1), (info.interval || 5) * 1000);
       }
     } catch (e) {
       if (errs >= 3) {
         setBaiduAuthorizing(false);
         setBaiduStatus(String(e));
       } else {
-        setTimeout(() => pollBaidu(info, ak, sk, attempt + 1, errs + 1), 5000);
+        setTimeout(() => pollBaidu(info, ak, sk, authId, attempt + 1, errs + 1), 5000);
       }
     }
   }
@@ -231,21 +238,27 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
       if (gen !== aliyunPollGen.current) return;
       setAliyunInfo(info);
       setAliyunStatus("请使用阿里云盘 App 扫描下方二维码并确认登录");
-      pollAliyun(info.sid, gen);
+      const fixedAuthId = crypto.randomUUID();
+      pollAliyun(info.sid, gen, fixedAuthId);
     } catch (e) {
       setAliyunAuthorizing(false);
       setAliyunStatus(`生成二维码失败: ${e}`);
     }
   }
 
-  async function pollAliyun(sid: string, gen: number, attempt = 0, errs = 0) {
+  async function pollAliyun(
+    sid: string,
+    gen: number,
+    authId: string,
+    attempt = 0,
+    errs = 0
+  ) {
     if (gen !== aliyunPollGen.current) return;
     if (attempt > 100) {
       setAliyunAuthorizing(false);
       return setAliyunStatus("等待扫码超时，请重新生成二维码");
     }
     try {
-      const authId = crypto.randomUUID();
       const accName = newAccountName.trim() || `阿里云盘账号 ${cloudAccounts.length + 1}`;
       const account = await api.aliyunQrPoll(sid, authId, accName);
       if (gen !== aliyunPollGen.current) return;
@@ -257,7 +270,7 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
         setCloudAccounts(nextList);
         applyAccount(account);
       } else {
-        setTimeout(() => pollAliyun(sid, gen, attempt + 1), 3000);
+        setTimeout(() => pollAliyun(sid, gen, authId, attempt + 1), 3000);
       }
     } catch (e) {
       if (gen !== aliyunPollGen.current) return;
@@ -269,7 +282,7 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
         setAliyunAuthorizing(false);
         setAliyunStatus(msg);
       } else {
-        setTimeout(() => pollAliyun(sid, gen, attempt + 1, errs + 1), 4000);
+        setTimeout(() => pollAliyun(sid, gen, authId, attempt + 1, errs + 1), 4000);
       }
     }
   }

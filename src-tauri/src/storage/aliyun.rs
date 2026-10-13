@@ -204,6 +204,8 @@ pub async fn poll_qr_login(handle: &str, auth_id: Option<&str>) -> anyhow::Resul
 }
 
 /// 用授权码换 token（authorization_code）。
+/// 社区中转服务在 authorization_code 响应中通常仅包含 {"refresh_token": "..."}，
+/// 此时自动发起一次 refresh_token 请求换取完整的 access_token 与有效期。
 async fn exchange_by_code(code: &str, base: &str) -> anyhow::Result<TokenState> {
     let http = oauth_client();
     let resp = http
@@ -214,7 +216,36 @@ async fn exchange_by_code(code: &str, base: &str) -> anyhow::Result<TokenState> 
         }))
         .send()
         .await?;
-    token_from(resp, base).await
+    let (status, body) = read_body(resp).await?;
+    check_http_ok("阿里云盘授权码兑换", status, &body)?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let access = str_field(&v, "access_token").filter(|s| !s.is_empty());
+    let refresh = str_field(&v, "refresh_token").filter(|s| !s.is_empty());
+
+    match (access, refresh) {
+        (Some(access_token), Some(refresh_token)) => {
+            let expires_in = int_field(&v, "expires_in", 7200);
+            Ok(TokenState {
+                access_token,
+                refresh_token,
+                expires_at: now_ts() + expires_in.max(0) - 120,
+                oauth_base: base.to_string(),
+            })
+        }
+        (None, Some(refresh_token)) => {
+            tracing::info!("阿里云盘授权成功，正在通过 refresh_token 获取 access_token...");
+            let refresh_resp = http
+                .post(format!("{base}/oauth/access_token"))
+                .json(&serde_json::json!({
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                }))
+                .send()
+                .await?;
+            token_from(refresh_resp, base).await
+        }
+        _ => anyhow::bail!("阿里云盘令牌响应缺少必要字段: {}", truncate(&body, 200)),
+    }
 }
 
 /// 从 access_token 响应解析 TokenState（null 容错）。
