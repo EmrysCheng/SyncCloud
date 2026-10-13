@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import type { FolderSummary, SyncEvent } from "../types";
+import type { BackendConfig, FolderSummary, SyncEvent } from "../types";
 import FolderSettingsModal from "../components/FolderSettingsModal";
 
 const BACKEND_LABEL: Record<string, string> = {
@@ -55,6 +55,9 @@ export default function Folders({
   const [folders, setFolders] = useState<FolderSummary[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [healthMap, setHealthMap] = useState<
+    Record<string, { status: "checking" | "ok" | "err"; msg?: string }>
+  >({});
 
   const refresh = () => api.listFolders().then(setFolders).catch(() => {});
 
@@ -78,6 +81,16 @@ export default function Folders({
     } finally {
       if (id) setBusy(null);
       refresh();
+    }
+  }
+
+  async function testHealth(folderId: string, backend: BackendConfig) {
+    setHealthMap((prev) => ({ ...prev, [folderId]: { status: "checking" } }));
+    try {
+      const res = await api.testBackend(backend);
+      setHealthMap((prev) => ({ ...prev, [folderId]: { status: "ok", msg: res } }));
+    } catch (e) {
+      setHealthMap((prev) => ({ ...prev, [folderId]: { status: "err", msg: String(e) } }));
     }
   }
 
@@ -170,12 +183,14 @@ export default function Folders({
             key={f.id}
             folder={f}
             events={events}
+            health={healthMap[f.id]}
             expanded={expanded === f.id}
             busy={busy === f.id}
             onToggle={() => setExpanded(expanded === f.id ? null : f.id)}
             onSync={() => act(() => api.syncNow(f.id), f.id)}
             onPause={() => act(() => api.pauseFolder(f.id), f.id)}
             onResume={() => act(() => api.resumeFolder(f.id), f.id)}
+            onTestHealth={() => testHealth(f.id, f.backend)}
             onRefreshed={refresh}
             onRemove={() => {
               if (
@@ -248,6 +263,7 @@ function useCycleProgress(folderId: string, events: SyncEvent[], syncing: boolea
 function FolderCard({
   folder: f,
   events,
+  health,
   expanded,
   busy,
   onToggle,
@@ -256,9 +272,11 @@ function FolderCard({
   onResume,
   onRemove,
   onRefreshed,
+  onTestHealth,
 }: {
   folder: FolderSummary;
   events: SyncEvent[];
+  health?: { status: "checking" | "ok" | "err"; msg?: string };
   expanded: boolean;
   busy: boolean;
   onToggle: () => void;
@@ -267,6 +285,7 @@ function FolderCard({
   onResume: () => void;
   onRemove: () => void;
   onRefreshed: () => void;
+  onTestHealth: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const st = f.status;
@@ -298,6 +317,18 @@ function FolderCard({
         </div>
         <div className="folder-meta">
           <span className="badge">{BACKEND_LABEL[f.backend.type] ?? f.backend.type}</span>
+          {health && (
+            <span
+              className={`badge ${health.status === "ok" ? "badge-ok" : health.status === "err" ? "badge-err" : ""}`}
+              title={health.msg}
+            >
+              {health.status === "checking"
+                ? "探测中…"
+                : health.status === "ok"
+                ? "● 云端在线"
+                : "● 离线/失效"}
+            </span>
+          )}
           <span className="badge badge-plain">{DIRECTION_LABEL[f.direction]}</span>
           <span
             className="path clickable-path"
@@ -320,9 +351,13 @@ function FolderCard({
                 style={{ width: `${(progress.done / progress.total) * 100}%` }}
               />
             </div>
-            <span className="progress-text">
-              {progress.done}/{progress.total} 个文件
-            </span>
+            <div className="progress-info">
+              <span className="progress-text">
+                {progress.done}/{progress.total} 个文件 (
+                {Math.round((progress.done / progress.total) * 100)}%)
+              </span>
+              <span className="progress-speed">⟳ 正在同步传输…</span>
+            </div>
           </div>
         )}
         {r && (
@@ -362,6 +397,13 @@ function FolderCard({
           onClick={() => api.openInExplorer(f.localPath, false)}
         >
           📁 打开目录
+        </button>
+        <button
+          className="btn btn-sm btn-ghost"
+          title="检测此存储后端的网络与授权连通性"
+          onClick={onTestHealth}
+        >
+          ⚡ 探测云端
         </button>
         <button className="btn btn-sm" onClick={() => setEditing(true)}>
           ⚙ 设置

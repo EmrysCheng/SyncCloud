@@ -193,7 +193,44 @@ pub async fn resolve_conflict(
 ) -> Result<(), String> {
     let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
     let db = crate::sync::state::StateDb::open(&config::folder_data_dir(&id).join("state.db")).map_err(err)?;
-    db.resolve_conflict(conflict_id, &resolution).map_err(err)?;
+    
+    if let Ok(Some(record)) = db.get_conflict(conflict_id) {
+        let cfg = state.config.lock().await;
+        let folder = cfg.folders.iter().find(|f| f.id == id).cloned();
+        drop(cfg);
+
+        if let Some(folder) = folder {
+            let root = std::path::PathBuf::from(&folder.local_path);
+            let orig_path = root.join(&record.path);
+            let copy_path = record.conflict_copy.as_ref().map(|c| root.join(c));
+
+            match resolution.as_str() {
+                "keep_local" => {
+                    if let Some(cp) = copy_path {
+                        let _ = std::fs::remove_file(cp);
+                    }
+                    db.resolve_conflict(conflict_id, "保留本地原版（已清理冲突副本）").map_err(err)?;
+                }
+                "keep_copy" => {
+                    if let Some(cp) = copy_path {
+                        if cp.exists() {
+                            let _ = std::fs::copy(&cp, &orig_path);
+                            let _ = std::fs::remove_file(&cp);
+                        }
+                    }
+                    db.resolve_conflict(conflict_id, "保留冲突副本（已覆盖原版）").map_err(err)?;
+                }
+                _ => {
+                    db.resolve_conflict(conflict_id, "保留双方版本").map_err(err)?;
+                }
+            }
+        } else {
+            db.resolve_conflict(conflict_id, &resolution).map_err(err)?;
+        }
+    } else {
+        db.resolve_conflict(conflict_id, &resolution).map_err(err)?;
+    }
+
     // 标记后触发一轮同步（清理或重新上传按需进行）
     let _ = state.manager.sync_now(&id).await;
     Ok(())

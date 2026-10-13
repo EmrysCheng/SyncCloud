@@ -237,6 +237,30 @@ impl StateDb {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn get_conflict(&self, id: i64) -> anyhow::Result<Option<ConflictRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, local_hash, remote_hash, conflict_copy, created_at, resolved, resolution FROM conflicts WHERE id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(ConflictRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                local_hash: row.get(2)?,
+                remote_hash: row.get(3)?,
+                conflict_copy: row.get(4)?,
+                created_at: row.get(5)?,
+                resolved: row.get::<_, i64>(6)? != 0,
+                resolution: row.get(7)?,
+            })
+        })?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn resolve_conflict(&self, id: i64, resolution: &str) -> anyhow::Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE conflicts SET resolved = 1, resolution = ?2 WHERE id = ?1",
