@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+/.pnp
+.pnp.js
+
+# Production & Packaging Outputs
+dist/
+dist-app/
+
+# Rust / Cargo
+target/
+src-tauri/target/
+launcher/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Build Intermediate Objects & Binaries
+*.o
+*.obj
+*.lib
+*.a
+*.pdb
+*.exe
+*.dll
+
+# Logs & Temporary Files
+*.log
+*.tmp
+*.temp
+app-run.log
+
+# IDE, Editor & Tool artifacts
+.vscode/
+.idea/
+.zcode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
