@@ -462,24 +462,26 @@ pub async fn open_path_in_explorer(path: String, select: bool) -> Result<(), Str
         use std::process::Command;
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        if select {
-            let canonical = p.canonicalize().unwrap_or(p);
-            let s = canonical.to_string_lossy().replace("\\\\?\\", "");
+        let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
+        let s = canonical.to_string_lossy().replace("\\\\?\\", "");
+        let res = if select {
             Command::new("explorer")
                 .args(["/select,", &s])
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
-                .map_err(|e| format!("打开资源管理器失败: {e}"))?;
         } else {
-            let canonical = p.canonicalize().unwrap_or(p);
-            let s = canonical.to_string_lossy().replace("\\\\?\\", "");
             Command::new("explorer")
                 .arg(&s)
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
-                .map_err(|e| format!("打开资源管理器失败: {e}"))?;
+        };
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "explorer 调用失败，尝试 opener");
+                tauri_plugin_opener::open_path(path, None::<&str>).map_err(|e2| e2.to_string())
+            }
         }
-        Ok(())
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -491,6 +493,7 @@ pub async fn open_path_in_explorer(path: String, select: bool) -> Result<(), Str
 #[tauri::command]
 pub async fn open_data_dir() -> Result<(), String> {
     let dir = app_data_dir();
+    let _ = std::fs::create_dir_all(&dir);
     let s = dir.to_string_lossy().to_string();
     open_path_in_explorer(s, false).await
 }

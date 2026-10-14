@@ -168,7 +168,11 @@ pub fn run() {
                         });
                     }
                     "tray-data-dir" => {
-                        let _ = commands::open_data_dir();
+                        tauri::async_runtime::spawn(async {
+                            if let Err(e) = commands::open_data_dir().await {
+                                tracing::error!(error = %e, "托盘打开数据目录失败");
+                            }
+                        });
                     }
                     "tray-autostart" => {
                         let current = crate::autostart::is_autostart_enabled();

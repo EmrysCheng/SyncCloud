@@ -187,6 +187,14 @@ export default function Settings() {
             <div>
               <span className="muted">数据目录：</span>
               <code>{info.dataDir}</code>
+              <button
+                type="button"
+                className="btn btn-sm btn-link"
+                style={{ marginLeft: "8px", padding: "0 6px", fontSize: "12px", textDecoration: "underline", background: "transparent", border: "none", cursor: "pointer", color: "var(--primary)" }}
+                onClick={() => api.openDataDir()}
+              >
+                在资源管理器中打开 ↗
+              </button>
               {info.dataDir !== info.defaultDataDir ? (
                 <span className="auth-badge auth-ok" style={{ marginLeft: "8px", fontSize: "11px" }}>自定义路径</span>
               ) : (
@@ -197,6 +205,9 @@ export default function Settings() {
         )}
 
         <div className="row" style={{ marginTop: "12px", gap: "10px" }}>
+          <button className="btn" onClick={() => api.openDataDir()}>
+            打开数据目录
+          </button>
           <button className="btn" onClick={pickNewDataDir}>
             更改数据目录…
           </button>
