@@ -166,18 +166,48 @@ pub async fn poll_qr_login(handle: &str, auth_id: Option<&str>) -> anyhow::Resul
         // 兼容旧调用方直接传 sid：默认按中转会话处理
         _ => (MODE_RELAY, handle),
     };
-    let base = match mode {
+    let token_base = match mode {
         MODE_DIRECT => OPEN_OAUTH.to_string(),
         _ => oauth_host(),
     };
     let http = oauth_client();
-    let resp = http
-        .get(format!("{base}/oauth/qrcode/{sid}/status"))
-        .send()
-        .await?;
-    let (status, body) = read_body(resp).await?;
-    check_http_ok("阿里云盘扫码状态", status, &body)?;
-    let v: serde_json::Value = serde_json::from_str(&body)?;
+
+    // 状态查询必须直接请求阿里云盘官方扫码接口（openapi.alipan.com 或 open.aliyundrive.com）
+    // 社区中转服务不转发该轮询路由，直接请求中转服务会返回 HTTP 404
+    let status_urls = [
+        format!("https://openapi.alipan.com/oauth/qrcode/{sid}/status"),
+        format!("https://open.aliyundrive.com/oauth/qrcode/{sid}/status"),
+    ];
+
+    let mut last_err = None;
+    let mut resp_data = None;
+
+    for url in &status_urls {
+        match http.get(url).send().await {
+            Ok(resp) => {
+                match read_body(resp).await {
+                    Ok((status, body)) => {
+                        if status.is_success() {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                                resp_data = Some(v);
+                                break;
+                            }
+                        } else {
+                            last_err = Some(format!("HTTP {status}: {body}"));
+                        }
+                    }
+                    Err(e) => last_err = Some(e.to_string()),
+                }
+            }
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+
+    let v = match resp_data {
+        Some(v) => v,
+        None => anyhow::bail!("阿里云盘扫码状态查询失败: {}", last_err.unwrap_or_else(|| "无法连接官方扫码状态服务".into())),
+    };
+
     // null 容错：等待阶段 authCode 为 null，LoginSuccess 后才是字符串
     let st = str_field(&v, "status").unwrap_or_default();
     match st.as_str() {
@@ -189,7 +219,7 @@ pub async fn poll_qr_login(handle: &str, auth_id: Option<&str>) -> anyhow::Resul
                     "扫码已确认但接口未返回授权码（authCode 为空），请重新生成二维码再试"
                 ),
             };
-            let t = exchange_by_code(&code, &base).await?;
+            let t = exchange_by_code(&code, &token_base).await?;
             let key = auth_id
                 .filter(|s| !s.trim().is_empty())
                 .map(|id| format!("aliyun:account:{}", id.trim()))

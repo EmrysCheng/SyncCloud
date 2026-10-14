@@ -108,6 +108,12 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
     if (backendKind === "baidu" || backendKind === "aliyun") {
       loadAccounts(backendKind);
     }
+    if (backendKind === "baidu") {
+      api.getSettings().then((s) => {
+        if (s.baiduAppKey && !baiduAppKey) setBaiduAppKey(s.baiduAppKey);
+        if (s.baiduSecretKey && !baiduSecretKey) setBaiduSecretKey(s.baiduSecretKey);
+      }).catch(() => {});
+    }
   }, [backendKind]);
 
   function loadAccounts(kind: "baidu" | "aliyun") {
@@ -215,6 +221,13 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
         const nextList = [...cloudAccounts.filter((a) => a.id !== account.id), account];
         setCloudAccounts(nextList);
         applyAccount(account);
+
+        // 记忆保存 AppKey / SecretKey 到全局设置，避免以后再次重复寻找输入
+        api.getSettings().then((s) => {
+          api.getAppInfo().then((info) => {
+            api.saveSettings(info.deviceName, { ...s, baiduAppKey: ak, baiduSecretKey: sk }).catch(() => {});
+          });
+        }).catch(() => {});
       } else {
         setTimeout(() => pollBaidu(info, ak, sk, authId, attempt + 1), (info.interval || 5) * 1000);
       }
@@ -572,7 +585,27 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
                 </label>
 
                 {selectedAccountId === "__new__" && (
-                  <div className="box-panel" style={{ border: "1px dashed var(--border-color)", padding: "12px", borderRadius: "8px", marginBottom: "16px" }}>
+                  <div className="box-panel" style={{ border: "1px dashed var(--border-color)", padding: "14px", borderRadius: "8px", marginBottom: "16px" }}>
+                    {/* 获取 AppKey 指引卡片与官网入口 */}
+                    <div style={{ background: "rgba(59, 130, 246, 0.05)", border: "1px solid rgba(59, 130, 246, 0.2)", borderRadius: "6px", padding: "10px 12px", marginBottom: "12px", fontSize: "12px", lineHeight: "1.6" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px", flexWrap: "wrap", gap: "6px" }}>
+                        <strong style={{ color: "var(--primary)" }}>📖 如何获取百度网盘 AppKey 与 SecretKey？</strong>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          style={{ padding: "2px 8px", fontSize: "11px", borderColor: "var(--primary)", color: "var(--primary)", background: "transparent" }}
+                          onClick={() => api.openExternal("https://pan.baidu.com/union/console/applist")}
+                        >
+                          🔗 打开百度网盘开放平台控制台 ↗
+                        </button>
+                      </div>
+                      <div className="muted" style={{ fontSize: "12px" }}>
+                        1. 点击上方按钮打开并登录「<strong>百度网盘开放平台控制台</strong>」；<br />
+                        2. 点击「创建应用」➔ 应用类型选择「<strong>软件</strong>」或「<strong>桌面应用</strong>」➔ 勾选基础网盘文件权限；<br />
+                        3. 创建成功后进入应用详情，复制 <strong>AppKey</strong> 与 <strong>SecretKey</strong> 填入下方，点击发起授权并用百度网盘手机 App 扫码即可。
+                      </div>
+                    </div>
+
                     <div className="hint" style={{ marginBottom: "8px" }}>
                       授权新百度账户：输入开放平台应用 AppKey/SecretKey 发起设备码授权
                     </div>
