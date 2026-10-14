@@ -6,6 +6,7 @@ pub mod watcher;
 pub mod plan;
 pub mod conflict;
 pub mod recycle;
+pub mod history;
 pub mod transfer;
 pub mod engine;
 pub mod manager;

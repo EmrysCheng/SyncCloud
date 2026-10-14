@@ -153,6 +153,13 @@ fn main() {
     cmd.current_dir(&app_dir);
     cmd.args(&args);
 
+    // 记录便携版启动器自身所在目录（即用户放置 synccloud.exe 的程序目录）
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(p) = cur.parent() {
+            cmd.env("SYNCCLOUD_PROGRAM_DIR", p);
+        }
+    }
+
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;

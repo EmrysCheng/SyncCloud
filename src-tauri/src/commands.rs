@@ -53,8 +53,12 @@ pub async fn save_settings(
     cfg.save(&app_data_dir()).map_err(err)?;
     // 关窗到托盘的开关在窗口事件（同步上下文）里读取，用原子变量即时生效
     crate::CLOSE_TO_TRAY.store(cfg.settings.close_to_tray, std::sync::atomic::Ordering::Relaxed);
-    // 日志等级与文件开关热生效（无需重启）
-    crate::logging::apply_settings(&cfg.settings.log_level, cfg.settings.log_to_file);
+    // 日志等级、文件开关与自定义目录热生效（无需重启）
+    crate::logging::apply_settings(
+        &cfg.settings.log_level,
+        cfg.settings.log_to_file,
+        cfg.settings.custom_log_dir.as_deref(),
+    );
     Ok(())
 }
 
@@ -615,6 +619,12 @@ pub async fn read_log_tail(file: String, lines: usize) -> Result<Vec<String>, St
     crate::logging::read_log_tail(&file, lines.clamp(10, 2000)).map_err(err)
 }
 
+/// 获取当前生效的日志输出目录完整路径
+#[tauri::command]
+pub async fn get_current_log_dir() -> Result<String, String> {
+    Ok(crate::logging::log_dir().to_string_lossy().to_string())
+}
+
 /// 在资源管理器中打开日志目录
 #[tauri::command]
 pub async fn open_log_dir() -> Result<(), String> {
@@ -697,6 +707,37 @@ pub async fn open_recycle_bin_dir(folder_id: String) -> Result<(), String> {
     let dir = crate::sync::recycle::recycle_dir(&id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建回收站目录失败: {e}"))?;
     open_path_in_explorer(dir.to_string_lossy().to_string(), false).await
+}
+
+// ---- 传输历史管理（支持自定义保留周期与自动清理） ----
+
+#[tauri::command]
+pub async fn get_activity_history(
+    folder_id: Option<String>,
+    action: Option<String>,
+    keyword: Option<String>,
+    limit: usize,
+) -> Result<Vec<crate::sync::history::ActivityItem>, String> {
+    Ok(crate::sync::history::query_history(
+        folder_id.as_deref(),
+        action.as_deref(),
+        keyword.as_deref(),
+        limit,
+    ))
+}
+
+#[tauri::command]
+pub async fn clean_expired_activity(state: State<'_, AppState>) -> Result<usize, String> {
+    let days = {
+        let guard = state.config.lock().await;
+        guard.settings.activity_retention_days
+    };
+    Ok(crate::sync::history::clean_expired_history(days))
+}
+
+#[tauri::command]
+pub async fn clear_activity_history(folder_id: Option<String>) -> Result<usize, String> {
+    Ok(crate::sync::history::clear_all_history(folder_id.as_deref()))
 }
 
 // ---- 内部工具 ----

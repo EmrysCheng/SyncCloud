@@ -54,6 +54,16 @@ pub struct GlobalSettings {
     /// 误删保护触发数量阈值（默认 50 项）
     #[serde(default = "default_deletion_guard_threshold")]
     pub deletion_guard_threshold: u32,
+    /// 自定义日志文件输出目录（None 或空则默认存放于程序所在目录下的 logs/）
+    #[serde(default)]
+    pub custom_log_dir: Option<String>,
+    /// 传输历史保留周期（天数，默认 7 天，0 表示永久保留）
+    #[serde(default = "default_activity_retention_days")]
+    pub activity_retention_days: u32,
+}
+
+fn default_activity_retention_days() -> u32 {
+    7
 }
 
 fn default_deletion_guard_threshold() -> u32 {
@@ -81,6 +91,8 @@ impl Default for GlobalSettings {
             log_to_file: true,
             deletion_guard: true,
             deletion_guard_threshold: 50,
+            custom_log_dir: None,
+            activity_retention_days: 7,
         }
     }
 }

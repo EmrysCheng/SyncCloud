@@ -18,6 +18,8 @@ const DEFAULT_SETTINGS: GlobalSettings = {
   logToFile: true,
   deletionGuard: true,
   deletionGuardThreshold: 50,
+  customLogDir: null,
+  activityRetentionDays: 7,
 };
 
 const LOG_LEVELS: Array<{ value: string; label: string }> = [
@@ -307,6 +309,42 @@ export default function Settings() {
             </div>
           )}
         </div>
+        <div style={{ marginTop: "14px", padding: "12px", background: "#f8fafc", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px" }}>
+            <div>
+              <span style={{ fontWeight: 600, fontSize: "14px" }}>📋 传输历史保留周期与自动清理</span>
+              <div className="hint" style={{ marginTop: "2px" }}>
+                应用启动及运行时将自动清理超出保留天数的过期传输历史，防止本地数据库过度膨胀。
+              </div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <select
+                className="input input-sm"
+                value={gs.activityRetentionDays ?? 7}
+                onChange={(e) => patchAndPersist({ activityRetentionDays: Number(e.target.value) })}
+              >
+                <option value={3}>保留最近 3 天</option>
+                <option value={7}>保留最近 7 天 (推荐)</option>
+                <option value={14}>保留最近 14 天</option>
+                <option value={30}>保留最近 30 天</option>
+                <option value={0}>永久保留 (不自动清理)</option>
+              </select>
+              <button
+                className="btn btn-sm"
+                onClick={async () => {
+                  try {
+                    const count = await api.cleanExpiredActivity();
+                    alert(`已自动清理 ${count} 条超出保留周期的历史数据。`);
+                  } catch (e) {
+                    alert(`清理失败: ${e}`);
+                  }
+                }}
+              >
+                立即清理过期数据
+              </button>
+            </div>
+          </div>
+        </div>
         <p className="hint-line">
           无变化时会自动走增量快路径（不取远端锁、不下载清单、零传输）；
           并发数决定同时上传/下载的文件数。
@@ -318,7 +356,12 @@ export default function Settings() {
 
       <CloudAccountsSection />
 
-      <LogSection logLevel={gs.logLevel} logToFile={gs.logToFile} onChange={patchAndPersist} />
+      <LogSection
+        logLevel={gs.logLevel}
+        logToFile={gs.logToFile}
+        customLogDir={gs.customLogDir}
+        onChange={patchAndPersist}
+      />
 
       <section className="settings-section">
         <h2>关于</h2>
@@ -478,24 +521,28 @@ function CloudAccountsSection() {
 function LogSection({
   logLevel,
   logToFile,
+  customLogDir,
   onChange,
 }: {
   logLevel: string;
   logToFile: boolean;
+  customLogDir?: string | null;
   onChange: (patch: Partial<GlobalSettings>) => void;
 }) {
   const [files, setFiles] = useState<LogFileInfo[]>([]);
   const [viewing, setViewing] = useState<string | null>(null);
   const [lines, setLines] = useState<string[]>([]);
   const [loadingTail, setLoadingTail] = useState(false);
+  const [currentDir, setCurrentDir] = useState<string>("");
 
   function refreshFiles() {
     api.listLogFiles().then(setFiles).catch(() => {});
+    api.getCurrentLogDir().then(setCurrentDir).catch(() => {});
   }
 
   useEffect(() => {
     refreshFiles();
-  }, []);
+  }, [customLogDir]);
 
   async function openViewer(name: string) {
     setViewing(name);
@@ -507,6 +554,21 @@ function LogSection({
       setLines([`读取日志失败: ${e}`]);
     } finally {
       setLoadingTail(false);
+    }
+  }
+
+  async function chooseCustomDir() {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "选择日志输出目录",
+      });
+      if (typeof selected === "string" && selected.trim()) {
+        onChange({ customLogDir: selected.trim() });
+      }
+    } catch (e) {
+      alert(`选择目录失败: ${e}`);
     }
   }
 
@@ -537,19 +599,50 @@ function LogSection({
           checked={logToFile}
           onChange={(e) => onChange({ logToFile: e.target.checked })}
         />
-        <span>输出文件日志（保存至数据目录 logs/，单文件超 5MB 自动轮转，保留 14 天）</span>
+        <span>输出文件日志（默认创建到程序所在目录 logs/，不放到数据目录中，单文件超 5MB 自动轮转）</span>
       </label>
+
+      <div style={{ marginTop: "12px", padding: "12px 14px", background: "var(--bg-secondary, rgba(255, 255, 255, 0.03))", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
+        <div style={{ fontSize: "13px", fontWeight: 600, marginBottom: "8px" }}>
+          📁 日志存储目录
+        </div>
+        <div style={{ fontSize: "13px", marginBottom: "10px", wordBreak: "break-all" }}>
+          <span className="muted">当前生效路径：</span>
+          <code style={{ background: "rgba(0,0,0,0.06)", padding: "2px 6px", borderRadius: "4px" }}>
+            {currentDir || "检测中…"}
+          </code>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+          <button className="btn btn-sm" onClick={chooseCustomDir}>
+            📂 自定义日志目录…
+          </button>
+          {customLogDir && (
+            <button
+              className="btn btn-sm btn-ghost"
+              onClick={() => onChange({ customLogDir: null })}
+              title="清除自定义目录，恢复为默认的程序所在目录"
+            >
+              ⟲ 恢复为默认程序目录
+            </button>
+          )}
+          <button className="btn btn-sm" onClick={() => api.openLogDir().catch(() => {})}>
+            在资源管理器中打开
+          </button>
+        </div>
+        {customLogDir && (
+          <div className="hint" style={{ marginTop: "8px" }}>
+            已设置自定义日志目录：<code>{customLogDir}</code>
+          </div>
+        )}
+      </div>
+
       <p className="hint-line">
-        等级与开关保存后立即生效，无需重启。日志记录所有同步轮次、传输明细、重试与错误，
-        是远程排障的第一手材料。
+        等级、文件输出开关及存储目录保存后立即生效，无需重启。日志记录所有同步轮次、传输明细、重试与错误。
       </p>
 
       <div className="row" style={{ marginTop: "10px", gap: "10px", alignItems: "center" }}>
-        <button className="btn" onClick={() => api.openLogDir().catch(() => {})}>
-          打开日志目录
-        </button>
         <button className="btn" onClick={refreshFiles}>
-          刷新列表
+          刷新日志文件列表
         </button>
         {viewing && (
           <button className="btn" onClick={() => openViewer(viewing)} disabled={loadingTail}>

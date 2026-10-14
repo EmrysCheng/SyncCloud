@@ -89,6 +89,22 @@ export interface GlobalSettings {
   logToFile: boolean;
   deletionGuard: boolean;
   deletionGuardThreshold: number;
+  customLogDir?: string | null;
+  activityRetentionDays?: number;
+}
+
+export interface ActivityItem {
+  id: number;
+  folderId: string;
+  folderName: string;
+  folderLocalPath: string;
+  eventType: string;
+  path?: string;
+  action?: string;
+  error?: string;
+  reason?: string;
+  copy?: string;
+  timestamp: number;
 }
 
 export interface AppInfo {

@@ -2,12 +2,25 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import type { ConflictRecord, FolderSummary } from "../types";
 
+function getFileIcon(path: string): string {
+  const ext = path.split(".").pop()?.toLowerCase() || "";
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"].includes(ext)) return "🖼️";
+  if (["doc", "docx", "wps", "txt", "md", "pdf"].includes(ext)) return "📄";
+  if (["xls", "xlsx", "csv"].includes(ext)) return "📊";
+  if (["ppt", "pptx"].includes(ext)) return "📽️";
+  if (["zip", "rar", "7z", "tar", "gz"].includes(ext)) return "📦";
+  if (["js", "ts", "tsx", "jsx", "rs", "py", "java", "c", "cpp", "go", "json", "html", "css"].includes(ext)) return "💻";
+  return "📁";
+}
+
 export default function Conflicts() {
   const [folders, setFolders] = useState<FolderSummary[]>([]);
   const [folderId, setFolderId] = useState<string>("");
   const [records, setRecords] = useState<ConflictRecord[]>([]);
   const [showResolved, setShowResolved] = useState(false);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [batchResolving, setBatchResolving] = useState(false);
+  const [keyword, setKeyword] = useState("");
 
   useEffect(() => {
     api.listFolders().then((fs) => {
@@ -45,6 +58,26 @@ export default function Conflicts() {
     }
   }
 
+  async function handleBatchResolve(resolution: "keep_local" | "keep_both") {
+    const unresolved = records.filter((r) => !r.resolved);
+    if (unresolved.length === 0) return;
+    const actionText = resolution === "keep_local" ? "全部保留本地原版（清理副本）" : "全部保留两者（独立同步）";
+    if (!window.confirm(`确定要对当前 ${unresolved.length} 个未解决冲突执行「${actionText}」吗？`)) {
+      return;
+    }
+    setBatchResolving(true);
+    try {
+      for (const r of unresolved) {
+        await api.resolveConflict(folderId, r.id, resolution);
+      }
+      refreshConflicts();
+    } catch (e) {
+      alert(`批量处理失败: ${e}`);
+    } finally {
+      setBatchResolving(false);
+    }
+  }
+
   function locateFile(relPath?: string | null) {
     if (!activeFolder || !relPath) return;
     const cleanRoot = activeFolder.localPath.replace(/[/\\]+$/, "");
@@ -55,18 +88,32 @@ export default function Conflicts() {
     });
   }
 
-  const unresolvedCount = records.filter((r) => !r.resolved).length;
+  const filteredRecords = useMemo(() => {
+    const kw = keyword.trim().toLowerCase();
+    if (!kw) return records;
+    return records.filter(
+      (r) =>
+        r.path.toLowerCase().includes(kw) ||
+        (r.conflictCopy && r.conflictCopy.toLowerCase().includes(kw))
+    );
+  }, [records, keyword]);
+
+  const unresolvedList = useMemo(() => records.filter((r) => !r.resolved), [records]);
+  const resolvedList = useMemo(() => records.filter((r) => r.resolved), [records]);
 
   if (folders.length === 0) {
     return (
       <div className="page">
         <div className="page-header">
-          <h1>冲突中心</h1>
+          <div>
+            <h1>冲突中心</h1>
+            <div className="header-sub">多设备并发修改检测与无损安全决策</div>
+          </div>
         </div>
-        <div className="empty-state">
-          <div className="empty-icon">⚠️</div>
+        <div className="conflict-empty-guard">
+          <div className="guard-shield-icon">🛡️</div>
           <h2>暂无同步任务</h2>
-          <p>请先添加同步文件夹。多设备同时修改相同文件时，将在此处提供一键安全解决。</p>
+          <p>请先在「同步文件夹」中添加需要同步的目录。当不同电脑发生同时编辑时，SyncCloud 将在此提供一键决策。</p>
         </div>
       </div>
     );
@@ -74,16 +121,29 @@ export default function Conflicts() {
 
   return (
     <div className="page">
+      {/* 顶部标题与控制胶囊 */}
       <div className="page-header">
         <div>
-          <h1>冲突中心</h1>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <h1>冲突中心</h1>
+            {unresolvedList.length > 0 ? (
+              <span className="conflict-chip-alert">
+                ⚡ {unresolvedList.length} 项待决断
+              </span>
+            ) : (
+              <span className="conflict-chip-safe">
+                ✓ 零冲突对齐
+              </span>
+            )}
+          </div>
           <div className="header-sub">
-            多设备同时修改冲突检测 · 一键无损解决与文件定位
+            多设备并发保护 · 自动另存为隔离副本 · 100% 绝不丢数据
           </div>
         </div>
-        <div className="header-actions">
+
+        <div className="header-actions" style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
           <select
-            className="input input-sm"
+            className="input input-sm conflict-folder-select"
             value={folderId}
             onChange={(e) => setFolderId(e.target.value)}
           >
@@ -93,80 +153,177 @@ export default function Conflicts() {
               </option>
             ))}
           </select>
-          <label className="checkbox-inline">
+          <label className="checkbox-pill">
             <input
               type="checkbox"
               checked={showResolved}
               onChange={(e) => setShowResolved(e.target.checked)}
             />
-            包含已解决
+            <span>包含已解决 ({resolvedList.length})</span>
           </label>
         </div>
       </div>
 
-      <div className="conflict-banner">
-        <div className="banner-icon">ℹ️</div>
-        <div>
-          <strong>冲突保护机制：</strong>
-          当多台设备同时修改同一文件时，SyncCloud 会自动保留远端原名，并将本机修改另存为「(冲突副本 - 设备名 时间戳)」文件，<strong>绝不丢失任何一方的数据</strong>。您可在下方直接对比并一键决定保留策略。
+      {/* 状态统计卡片条 */}
+      <div className="conflict-stats-strip">
+        <div className="stat-capsule">
+          <span className="stat-label">待解决冲突：</span>
+          <span className={`stat-num ${unresolvedList.length > 0 ? "text-warn" : "text-ok"}`}>
+            {unresolvedList.length}
+          </span>
         </div>
+        <div className="stat-capsule">
+          <span className="stat-label">已保护归档：</span>
+          <span className="stat-num text-muted">{resolvedList.length}</span>
+        </div>
+        <div className="stat-capsule" style={{ flex: 1, minWidth: "180px" }}>
+          <input
+            type="search"
+            className="input input-sm"
+            style={{ width: "100%", border: "none", background: "transparent", padding: 0 }}
+            placeholder="🔍 搜索文件名或冲突路径…"
+            value={keyword}
+            onChange={(e) => setKeyword(e.target.value)}
+          />
+        </div>
+        {unresolvedList.length > 1 && (
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button
+              className="btn btn-sm btn-ghost"
+              disabled={batchResolving}
+              onClick={() => handleBatchResolve("keep_local")}
+              title="全部保留本地原版，并自动物理清理副本"
+            >
+              🛡️ 一键全部保留本地
+            </button>
+            <button
+              className="btn btn-sm btn-ghost"
+              disabled={batchResolving}
+              onClick={() => handleBatchResolve("keep_both")}
+              title="全部保留两端各自独立存在"
+            >
+              📂 全部保留两者
+            </button>
+          </div>
+        )}
       </div>
 
-      {records.length === 0 ? (
-        <div className="empty-state">
-          <div className="empty-icon">🎉</div>
-          <h2>{showResolved ? "暂无冲突记录" : "当前无未解决冲突"}</h2>
-          <p>所有文件均已安全同步对齐。如果不同设备发生并发编辑，冲突副本将在此处列出。</p>
+      {filteredRecords.length === 0 ? (
+        <div className="conflict-empty-guard">
+          <div className="guard-shield-glow">
+            <span className="guard-shield-icon">🛡️</span>
+          </div>
+          <h2>{showResolved ? "暂无冲突记录" : "当前无待解决冲突 · 数据安全对齐中"}</h2>
+          <p className="guard-desc">
+            所有设备的文件变动均已平稳合并。SyncCloud 在检测到冲突时绝不覆盖本地或云端任何文件，而是自动以时间戳副本隔离存储，让您随时回溯与决策。
+          </p>
+          <div className="guard-features">
+            <div className="gf-item">
+              <span className="gf-icon">🔒</span>
+              <div>
+                <strong>零数据丢失</strong>
+                <p>双方版本物理独立留存</p>
+              </div>
+            </div>
+            <div className="gf-item">
+              <span className="gf-icon">⚡</span>
+              <div>
+                <strong>即时冲突分流</strong>
+                <p>多机同步不中断锁死</p>
+              </div>
+            </div>
+            <div className="gf-item">
+              <span className="gf-icon">⚖️</span>
+              <div>
+                <strong>一键透明决断</strong>
+                <p>保留原版、覆盖或双留</p>
+              </div>
+            </div>
+          </div>
         </div>
       ) : (
-        <div className="conflict-list">
-          {records.map((r) => {
-            const fileName = r.path.split(/[/\\]/).pop();
-            const copyName = r.conflictCopy ? r.conflictCopy.split(/[/\\]/).pop() : null;
+        <div className="conflict-cards-container">
+          {filteredRecords.map((r) => {
+            const fileName = r.path.split(/[/\\]/).pop() || r.path;
+            const copyName = r.conflictCopy ? r.conflictCopy.split(/[/\\]/).pop() : "未知副本";
+            const icon = getFileIcon(r.path);
+            const isResolved = r.resolved;
+
             return (
-              <div key={r.id} className={`conflict-card ${r.resolved ? "resolved" : ""}`}>
-                <div className="conflict-card-head">
-                  <div className="conflict-title-col">
-                    <span className="conflict-icon">⚠️</span>
-                    <div>
-                      <div className="conflict-filename">{fileName}</div>
-                      <div className="conflict-filepath">{r.path}</div>
+              <div
+                key={r.id}
+                className={`conflict-modern-card ${isResolved ? "is-resolved" : ""}`}
+              >
+                {/* 卡片头部 */}
+                <div className="cmc-header">
+                  <div className="cmc-title-group">
+                    <span className="cmc-file-icon">{icon}</span>
+                    <div style={{ minWidth: 0 }}>
+                      <div className="cmc-filename" title={fileName}>
+                        {fileName}
+                      </div>
+                      <div className="cmc-filepath" title={r.path}>
+                        <code>{r.path}</code>
+                      </div>
                     </div>
                   </div>
-                  <div>
-                    {r.resolved ? (
-                      <span className="badge badge-ok">✓ 已解决：{r.resolution}</span>
+                  <div className="cmc-badge-group">
+                    {isResolved ? (
+                      <span className="badge badge-ok">
+                        ✓ 已解决：{r.resolution === "keep_local" ? "保留本地原版" : r.resolution === "keep_copy" ? "采用冲突副本" : "两者均保留"}
+                      </span>
                     ) : (
-                      <span className="badge badge-warn">待解决</span>
+                      <span className="badge badge-warn cmc-pulse">
+                        ⚡ 并发冲突 · 待决断
+                      </span>
                     )}
                   </div>
                 </div>
 
-                <div className="conflict-card-body">
-                  <div className="conflict-versions">
-                    <div className="version-box">
-                      <div className="ver-tag">本地原文件</div>
-                      <div className="ver-name" title={r.path}>{fileName}</div>
-                      <div className="ver-meta">指纹: {r.localHash.slice(0, 10)}…</div>
+                {/* 左右版本对比主视区 */}
+                <div className="cmc-body">
+                  <div className="cmc-split-grid">
+                    {/* 本地原版卡片 */}
+                    <div className="cmc-version-pane pane-local">
+                      <div className="pane-tag tag-local">
+                        <span>💻 本地基准版本</span>
+                        <span className="pane-hash" title={`SHA256: ${r.localHash}`}>
+                          #{r.localHash.slice(0, 8)}
+                        </span>
+                      </div>
+                      <div className="pane-file-title" title={r.path}>
+                        {fileName}
+                      </div>
+                      <div className="pane-hint">本机编辑的工作区原文件</div>
                       <button
-                        className="btn btn-sm btn-ghost"
+                        className="btn btn-sm btn-ghost pane-locate-btn"
                         onClick={() => locateFile(r.path)}
                       >
-                        📁 定位原文件
+                        📁 定位本地文件
                       </button>
                     </div>
 
-                    <div className="version-sep">⚡ 并发修改 ⚡</div>
+                    {/* 中间对比指示连线 */}
+                    <div className="cmc-vs-bridge">
+                      <span className="vs-badge">VS</span>
+                      <span className="vs-sub">并发修改</span>
+                    </div>
 
-                    <div className="version-box">
-                      <div className="ver-tag ver-tag-copy">冲突保护副本</div>
-                      <div className="ver-name" title={r.conflictCopy ?? ""}>
-                        {copyName ?? "未指定副本"}
+                    {/* 冲突副本卡片 */}
+                    <div className="cmc-version-pane pane-copy">
+                      <div className="pane-tag tag-copy">
+                        <span>☁️ 冲突保护副本</span>
+                        <span className="pane-hash" title={`SHA256: ${r.remoteHash}`}>
+                          #{r.remoteHash.slice(0, 8)}
+                        </span>
                       </div>
-                      <div className="ver-meta">指纹: {r.remoteHash.slice(0, 10)}…</div>
+                      <div className="pane-file-title text-warn" title={r.conflictCopy ?? ""}>
+                        {copyName}
+                      </div>
+                      <div className="pane-hint">由其他设备同步产生的冲突存档</div>
                       {r.conflictCopy && (
                         <button
-                          className="btn btn-sm btn-ghost"
+                          className="btn btn-sm btn-ghost pane-locate-btn"
                           onClick={() => locateFile(r.conflictCopy)}
                         >
                           📁 定位冲突副本
@@ -175,38 +332,49 @@ export default function Conflicts() {
                     </div>
                   </div>
 
-                  {!r.resolved && (
-                    <div className="conflict-actions-bar">
-                      <span className="act-hint">选择解决方案：</span>
-                      <button
-                        className="btn btn-sm"
-                        disabled={busyId === r.id}
-                        title="保留本地原文件，系统自动物理删除冲突副本"
-                        onClick={() => handleResolve(r.id, "keep_local")}
-                      >
-                        保留本地原版（清理副本）
-                      </button>
-                      <button
-                        className="btn btn-sm"
-                        disabled={busyId === r.id}
-                        title="以冲突副本为准，自动重命名覆盖原文件并清理副本"
-                        onClick={() => handleResolve(r.id, "keep_copy")}
-                      >
-                        保留冲突副本（覆盖原版）
-                      </button>
-                      <button
-                        className="btn btn-sm btn-ghost"
-                        disabled={busyId === r.id}
-                        title="保留两份文件各自独立存在并继续同步"
-                        onClick={() => handleResolve(r.id, "keep_both")}
-                      >
-                        保留两者
-                      </button>
+                  {/* 决策解决方案按钮组 */}
+                  {!isResolved && (
+                    <div className="cmc-actions-panel">
+                      <div className="cmc-actions-hint">
+                        <span>👉 请选择保留决策：</span>
+                      </div>
+                      <div className="cmc-btn-group">
+                        <button
+                          className="btn-resolve btn-resolve-local"
+                          disabled={busyId === r.id}
+                          onClick={() => handleResolve(r.id, "keep_local")}
+                          title="保留本地原文件，系统自动物理删除冲突副本"
+                        >
+                          <div className="br-title">🛡️ 保留本地原版</div>
+                          <div className="br-sub">清理冲突副本</div>
+                        </button>
+
+                        <button
+                          className="btn-resolve btn-resolve-copy"
+                          disabled={busyId === r.id}
+                          onClick={() => handleResolve(r.id, "keep_copy")}
+                          title="以冲突副本覆盖原文件，并清理副本"
+                        >
+                          <div className="br-title">🔄 采用冲突副本</div>
+                          <div className="br-sub">覆盖本地原文件</div>
+                        </button>
+
+                        <button
+                          className="btn-resolve btn-resolve-both"
+                          disabled={busyId === r.id}
+                          onClick={() => handleResolve(r.id, "keep_both")}
+                          title="两份文件各自独立保留并继续同步"
+                        >
+                          <div className="br-title">📂 两者均保留</div>
+                          <div className="br-sub">各自独立同步</div>
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>
 
-                <div className="conflict-card-foot">
+                {/* 卡片底栏信息 */}
+                <div className="cmc-footer">
                   <span>检测时间：{r.createdAt}</span>
                 </div>
               </div>

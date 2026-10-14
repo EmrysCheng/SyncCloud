@@ -40,6 +40,24 @@ pub enum SyncEvent {
     Error { folder_id: Uuid, folder: String, message: String },
 }
 
+impl SyncEvent {
+    pub fn folder_id(&self) -> Uuid {
+        match self {
+            SyncEvent::CycleStarted { folder_id, .. } => *folder_id,
+            SyncEvent::ScanDone { folder_id, .. } => *folder_id,
+            SyncEvent::CycleSkipped { folder_id, .. } => *folder_id,
+            SyncEvent::Planned { folder_id, .. } => *folder_id,
+            SyncEvent::FileDone { folder_id, .. } => *folder_id,
+            SyncEvent::FileFailed { folder_id, .. } => *folder_id,
+            SyncEvent::FilePending { folder_id, .. } => *folder_id,
+            SyncEvent::SafetyBlocked { folder_id, .. } => *folder_id,
+            SyncEvent::ConflictCreated { folder_id, .. } => *folder_id,
+            SyncEvent::CycleDone { folder_id, .. } => *folder_id,
+            SyncEvent::Error { folder_id, .. } => *folder_id,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EventSink(tokio::sync::mpsc::UnboundedSender<SyncEvent>);
 

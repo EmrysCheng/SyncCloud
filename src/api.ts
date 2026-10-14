@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
+  ActivityItem,
   AliyunQrInfo,
   BaiduLoginInfo,
   BackendConfig,
@@ -93,4 +94,10 @@ export const api = {
   readLogTail: (file: string, lines: number) =>
     invoke<string[]>("read_log_tail", { file, lines }),
   openLogDir: () => invoke<void>("open_log_dir"),
+  getCurrentLogDir: () => invoke<string>("get_current_log_dir"),
+  getActivityHistory: (folderId?: string, action?: string, keyword?: string, limit?: number) =>
+    invoke<ActivityItem[]>("get_activity_history", { folderId, action, keyword, limit }),
+  cleanExpiredActivity: () => invoke<number>("clean_expired_activity"),
+  clearActivityHistory: (folderId?: string) =>
+    invoke<number>("clear_activity_history", { folderId }),
 };

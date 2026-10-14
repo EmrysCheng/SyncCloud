@@ -69,6 +69,9 @@ pub fn run() {
             let cfg = AppConfig::load_or_create(&data_dir)?;
             CLOSE_TO_TRAY.store(cfg.settings.close_to_tray, Ordering::Relaxed);
 
+            // 传输历史：根据自定义保留周期自动清理过期记录
+            let _ = crate::sync::history::clean_expired_history(cfg.settings.activity_retention_days);
+
             let state = AppState::new();
             // 先订阅再移交所有权
             let mut rx = state.manager.subscribe();
@@ -82,6 +85,19 @@ pub fn run() {
                         Ok(ev) => {
                             let _ = handle.emit("synccloud://event", &ev);
                             if let Some(state) = handle.try_state::<AppState>() {
+                                let (fid, fname, fpath) = {
+                                    let guard = state.config.lock().await;
+                                    let fid_str = ev.folder_id().to_string();
+                                    let f = guard.folders.iter().find(|folder| folder.id.to_string() == fid_str);
+                                    (
+                                        fid_str,
+                                        f.map(|folder| folder.name.clone()).unwrap_or_else(|| "未知任务".into()),
+                                        f.map(|folder| folder.local_path.clone()).unwrap_or_default(),
+                                    )
+                                };
+                                if !fid.is_empty() {
+                                    crate::sync::history::record_event(&fid, &fname, &fpath, &ev);
+                                }
                                 let mut buf = state.recent_events.lock().await;
                                 buf.push(ev);
                                 if buf.len() > MAX_RECENT_EVENTS {
@@ -238,6 +254,10 @@ pub fn run() {
             commands::list_log_files,
             commands::read_log_tail,
             commands::open_log_dir,
+            commands::get_current_log_dir,
+            commands::get_activity_history,
+            commands::clean_expired_activity,
+            commands::clear_activity_history,
         ])
         .run(tauri::generate_context!())
         .expect("SyncCloud 启动失败");
