@@ -3,6 +3,7 @@ import { api } from "../api";
 import type { BackendConfig, FolderSummary, SyncEvent, SyncPlan } from "../types";
 import FolderSettingsModal from "../components/FolderSettingsModal";
 import PlanPreviewModal from "../components/PlanPreviewModal";
+import RecycleBinModal from "../components/RecycleBinModal";
 
 const BACKEND_LABEL: Record<string, string> = {
   s3: "S3 兼容",
@@ -14,6 +15,8 @@ const BACKEND_LABEL: Record<string, string> = {
 
 const DIRECTION_LABEL: Record<string, string> = {
   bidirectional: "双向同步",
+  mirror: "镜像同步",
+  contribute: "安全贡献备份",
   upload_only: "仅上传",
   download_only: "仅下载",
 };
@@ -61,6 +64,7 @@ export default function Folders({
     folder: FolderSummary;
     plan: SyncPlan;
   } | null>(null);
+  const [recycleBinFolder, setRecycleBinFolder] = useState<FolderSummary | null>(null);
   const [healthMap, setHealthMap] = useState<
     Record<string, { status: "checking" | "ok" | "err"; msg?: string }>
   >({});
@@ -211,6 +215,7 @@ export default function Folders({
             onPause={() => act(() => api.pauseFolder(f.id), f.id)}
             onResume={() => act(() => api.resumeFolder(f.id), f.id)}
             onTestHealth={() => testHealth(f.id, f.backend)}
+            onOpenRecycleBin={() => setRecycleBinFolder(f)}
             onRefreshed={refresh}
             onRemove={() => {
               if (
@@ -222,6 +227,13 @@ export default function Folders({
           />
         ))}
       </div>
+
+      {recycleBinFolder && (
+        <RecycleBinModal
+          folder={recycleBinFolder}
+          onClose={() => setRecycleBinFolder(null)}
+        />
+      )}
 
       {previewTarget && (
         <PlanPreviewModal
@@ -305,6 +317,7 @@ function FolderCard({
   onResume,
   onRemove,
   onRefreshed,
+  onOpenRecycleBin,
   onTestHealth,
 }: {
   folder: FolderSummary;
@@ -320,6 +333,7 @@ function FolderCard({
   onResume: () => void;
   onRemove: () => void;
   onRefreshed: () => void;
+  onOpenRecycleBin: () => void;
   onTestHealth: () => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -333,6 +347,11 @@ function FolderCard({
       .slice(-60)
       .reverse();
   }, [events, f.id]);
+  const safetyEvent = useMemo(() => {
+    return folderEvents.find((e) => e.type === "safety_blocked") as
+      | { type: "safety_blocked"; reason: string; deletedCount: number; totalCount: number }
+      | undefined;
+  }, [folderEvents]);
 
   function locateFile(relPath: string) {
     const cleanRoot = f.localPath.replace(/[/\\]+$/, "");
@@ -377,6 +396,34 @@ function FolderCard({
           </span>
           <span className="muted">上次同步：{fmtTime(st?.lastSyncAt ?? null)}</span>
         </div>
+        {safetyEvent && (
+          <div
+            style={{
+              marginTop: "8px",
+              padding: "10px 12px",
+              borderRadius: "6px",
+              background: "#fffbeb",
+              border: "1px solid #fde68a",
+              color: "#92400e",
+              fontSize: "13px",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+            }}
+          >
+            <div>
+              <strong>🛡️ 误删保护拦截：</strong>
+              <span>{safetyEvent.reason}</span>
+            </div>
+            <button
+              className="btn btn-sm btn-primary"
+              style={{ marginLeft: "10px", whiteSpace: "nowrap" }}
+              onClick={onAnalyze}
+            >
+              差异分析核验
+            </button>
+          </div>
+        )}
         {st?.lastError && <div className="folder-error">⚠ {st.lastError}</div>}
         {progress && (
           <div className="folder-progress">
@@ -443,10 +490,10 @@ function FolderCard({
         </button>
         <button
           className="btn btn-sm btn-ghost"
-          title="查看被同步删除或被覆盖文件的历史安全备份"
-          onClick={() => api.openRecycleBin(f.id)}
+          title="查看被同步删除或被覆盖文件的安全备份（支持一键还原与清理）"
+          onClick={onOpenRecycleBin}
         >
-          🗑 回收站
+          🛡️ 安全回收站
         </button>
         <button
           className="btn btn-sm btn-ghost"

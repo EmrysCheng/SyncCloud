@@ -43,13 +43,20 @@ impl Manifest {
     }
 }
 
-/// 同步方向。
+/// 同步方向 / 工作模式（对标 FreeFileSync 与 SyncToy）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
+    /// 双向同步 (Two-Way / Synchronize)：双向检测并合并变更，发生冲突时保留双方。
     #[default]
     Bidirectional,
+    /// 镜像同步 (Mirror / Echo)：以本地为绝对基准，远端强制镜像为本地状态（本地删则远端删，远端异动被覆盖）。
+    Mirror,
+    /// 增量贡献备份 (Contribute / Update)：只增不删，新文件和修改同步至远端，但绝不删除远端任何历史文件。
+    Contribute,
+    /// 仅上传 (Upload Only)：仅将本地改动上传，忽略远端新变更。
     UploadOnly,
+    /// 仅下载 (Download Only)：仅从远端拉取改动，不向远端上传。
     DownloadOnly,
 }
 

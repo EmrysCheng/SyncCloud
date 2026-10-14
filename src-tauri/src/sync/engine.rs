@@ -33,6 +33,8 @@ pub enum SyncEvent {
     FileFailed { folder_id: Uuid, path: String, error: String, retry_in_secs: u64 },
     /// 文件被独占锁定：新版本已停放到待替换队列，占用释放后自动应用
     FilePending { folder_id: Uuid, path: String, reason: String },
+    /// 大规模误删安全熔断：单次拟删除过多文件，已被自动挂起保护（对标 GoodSync / Syncthing）
+    SafetyBlocked { folder_id: Uuid, folder: String, deleted_count: usize, total_count: usize, reason: String },
     ConflictCreated { folder_id: Uuid, path: String, copy: String },
     CycleDone { folder_id: Uuid, folder: String, report: CycleReport },
     Error { folder_id: Uuid, folder: String, message: String },
@@ -330,6 +332,31 @@ impl SyncEngine {
         );
         self.events.emit(SyncEvent::Planned { folder_id: fid, stats: plan.stats.clone() });
 
+        // 6.1 大规模误删安全熔断器（对标 GoodSync / Syncthing）
+        let total_deletes = plan.stats.delete_local + plan.stats.delete_remote;
+        let baseline_count = baseline.len();
+        if self.settings.deletion_guard
+            && total_deletes >= self.settings.deletion_guard_threshold as usize
+            && (baseline_count > 0 && total_deletes * 100 / baseline_count >= 20)
+        {
+            let warn_msg = format!(
+                "防误删安全熔断：本轮拟删除 {} 项（占基线 {}%），超过安全阈值（{}项）。已自动挂起删除操作，防止灾难性误删！可在差异分析与预览中核验或按需确认。",
+                total_deletes,
+                total_deletes * 100 / baseline_count,
+                self.settings.deletion_guard_threshold
+            );
+            tracing::warn!(folder = %self.folder.name, "{}", warn_msg);
+            self.events.emit(SyncEvent::SafetyBlocked {
+                folder_id: fid,
+                folder: self.folder.name.clone(),
+                deleted_count: total_deletes,
+                total_count: baseline_count,
+                reason: warn_msg,
+            });
+            // 过滤掉所有删除动作，仅保留上传/下载/冲突处理，避免整批破坏性删除
+            plan.actions.retain(|a| !matches!(a, Action::DeleteLocal { .. } | Action::DeleteRemote { .. }));
+        }
+
         if plan.actions.is_empty() && !remote_dirty {
             // 完全无变化：记录变更戳供下轮快路径使用
             let stamp = remote
@@ -504,14 +531,9 @@ impl SyncEngine {
             Action::DeleteLocal { path } => {
                 let target = abs_path(&root, path);
                 if target.exists() {
-                    // 安全防误删保护（GoodSync / Syncthing 同款）：
-                    // 本地删除时先归档到应用外部回收站，保留防误删备份
-                    let recycle_dir = crate::config::folder_data_dir(&self.folder.id).join("recycle_bin");
-                    let _ = tokio::fs::create_dir_all(&recycle_dir).await;
-                    let file_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-                    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                    let bak_name = format!("{file_name}.{ts}.deleted");
-                    let _ = tokio::fs::copy(&target, recycle_dir.join(bak_name)).await;
+                    // 安全防误删保护（FreeFileSync / Syncthing 同款）：
+                    // 本地删除时先归档到应用外部回收站，保留防误删备份与元数据索引
+                    let _ = crate::sync::recycle::archive_file(&self.folder.id, &target, path, "deleted").await;
                 }
                 match crate::sync::fslock::remove_file_robust(&target).await {
                     Ok(()) => {}
@@ -653,12 +675,7 @@ impl SyncEngine {
         }
         // 安全防误删保护：如果目标文件已存在，先安全备份至回收站再替换
         if target.exists() {
-            let recycle_dir = crate::config::folder_data_dir(&self.folder.id).join("recycle_bin");
-            let _ = tokio::fs::create_dir_all(&recycle_dir).await;
-            let file_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-            let bak_name = format!("{file_name}.{ts}.overwritten");
-            let _ = tokio::fs::copy(&target, recycle_dir.join(bak_name)).await;
+            let _ = crate::sync::recycle::archive_file(&self.folder.id, &target, path, "overwritten").await;
         }
 
         // 落盘：普通 rename → POSIX 语义替换（目标被共享打开也能换）→ 跨卷 staging 副本。

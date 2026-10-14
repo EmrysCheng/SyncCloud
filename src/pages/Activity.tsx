@@ -90,6 +90,17 @@ export default function Activity({
           copy: e.copy,
           timestamp: e.timestamp,
         });
+      } else if (e.type === "safety_blocked") {
+        list.push({
+          id: `${i}-safety`,
+          folderId: fid,
+          folderName,
+          folderLocalPath,
+          type: "safety_blocked",
+          path: `误删保护挂起 (拟删除 ${e.deletedCount} 项 / 占比 ${Math.round((e.deletedCount / Math.max(1, e.totalCount)) * 100)}%)`,
+          reason: e.reason,
+          timestamp: e.timestamp,
+        });
       }
     }
     return list;
@@ -140,6 +151,9 @@ export default function Activity({
   }
 
   function getActionBadge(item: (typeof activityList)[0]) {
+    if (item.type === "safety_blocked") {
+      return <span className="act-badge badge-warn" style={{ background: "#fef3c7", color: "#b45309" }}>🛡️ 误删保护</span>;
+    }
     if (item.type === "file_failed") {
       return <span className="act-badge badge-err">✗ 失败</span>;
     }

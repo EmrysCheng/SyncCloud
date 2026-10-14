@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import QRCode from "qrcode";
 import { api } from "../api";
-import type { BackendConfig, CloudAccount, BaiduLoginInfo, AliyunQrInfo } from "../types";
+import type { BackendConfig, CloudAccount, BaiduLoginInfo, AliyunQrInfo, Direction } from "../types";
 
 type BackendKind = "s3" | "webdav" | "git" | "baidu" | "aliyun";
 
@@ -75,7 +75,7 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
   const [localPath, setLocalPath] = useState("");
   const [backendKind, setBackendKind] = useState<BackendKind>("s3");
   const [backend, setBackend] = useState<Partial<BackendConfig>>({ type: "s3" });
-  const [direction, setDirection] = useState<"bidirectional" | "upload_only" | "download_only">("bidirectional");
+  const [direction, setDirection] = useState<Direction>("bidirectional");
   const [conflictPolicy, setConflictPolicy] = useState<"both_copies" | "newest_wins">("both_copies");
   const [syncMode, setSyncMode] = useState<"realtime" | "interval" | "manual">("realtime");
   const [intervalSecs, setIntervalSecs] = useState(300);
@@ -747,11 +747,13 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
       {step === 3 && (
         <div className="wizard-body">
           <label className="field">
-            <span>同步方向</span>
-            <select value={direction} onChange={(e) => setDirection(e.target.value as typeof direction)}>
-              <option value="bidirectional">双向同步（推荐，本机与云端互相同步）</option>
-              <option value="upload_only">仅上传（本机变更推送到云端，不拉取）</option>
-              <option value="download_only">仅下载（云端变更拉到本机，不上传）</option>
+            <span>同步方向 / 工作模式</span>
+            <select value={direction} onChange={(e) => setDirection(e.target.value as Direction)}>
+              <option value="bidirectional">⇄ 双向同步（推荐，本机与云端双向变动均智能合并）</option>
+              <option value="mirror">⇶ 镜像同步（以本地为主，云端严格镜像，本地删则云端删）</option>
+              <option value="contribute">🛡️ 安全增量贡献（只增不删，同步新文件，永不删除云端任何文件）</option>
+              <option value="upload_only">↑ 仅上传（本机变更推送到云端，不拉取云端变动）</option>
+              <option value="download_only">↓ 仅下载（云端变更拉到本机，不向云端上传）</option>
             </select>
           </label>
           <label className="field">
@@ -822,8 +824,16 @@ export default function AddFolder({ onDone }: { onDone: () => void }) {
               {backend.accountName ? `（账户: ${backend.accountName}）` : ""}
             </div>
             <div>
-              <b>方向：</b>
-              {direction === "bidirectional" ? "双向" : direction === "upload_only" ? "仅上传" : "仅下载"}
+              <b>工作模式：</b>
+              {direction === "bidirectional"
+                ? "双向同步"
+                : direction === "mirror"
+                  ? "镜像同步"
+                  : direction === "contribute"
+                    ? "安全增量贡献"
+                    : direction === "upload_only"
+                      ? "仅上传"
+                      : "仅下载"}
             </div>
             <div>
               <b>冲突策略：</b>

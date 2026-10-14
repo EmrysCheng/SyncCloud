@@ -271,6 +271,36 @@ impl FolderManager {
         }
     }
 
+    /// 全局暂停所有同步任务（对标 Syncthing / Resilio Sync）。
+    pub async fn pause_all(&self) {
+        let folders = self.folders.lock().await;
+        for h in folders.values() {
+            let _ = h.cmd_tx.try_send(FolderCmd::Pause);
+        }
+    }
+
+    /// 全局恢复所有同步任务。
+    pub async fn resume_all(&self) {
+        let folders = self.folders.lock().await;
+        for h in folders.values() {
+            let _ = h.cmd_tx.try_send(FolderCmd::Resume);
+        }
+    }
+
+    /// 当前是否全部处于暂停状态。
+    pub async fn is_all_paused(&self) -> bool {
+        let folders = self.folders.lock().await;
+        if folders.is_empty() {
+            return false;
+        }
+        for h in folders.values() {
+            if h.status.lock().await.state != "paused" {
+                return false;
+            }
+        }
+        true
+    }
+
     pub async fn statuses(&self) -> Vec<FolderStatus> {
         let folders = self.folders.lock().await;
         let mut out = Vec::new();

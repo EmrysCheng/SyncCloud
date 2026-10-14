@@ -1,7 +1,7 @@
 // 与 Rust 侧 serde 序列化对应的类型定义。
 // 注意：枚举 tag 与字段命名与 Rust 的 rename_all 保持一致。
 
-export type Direction = "bidirectional" | "upload_only" | "download_only";
+export type Direction = "bidirectional" | "mirror" | "contribute" | "upload_only" | "download_only";
 export type ConflictPolicy = "both_copies" | "newest_wins";
 export type SyncMode = "realtime" | "interval" | "manual";
 export type EncryptionMode = "off" | "passphrase";
@@ -87,6 +87,8 @@ export interface GlobalSettings {
   aliyunAppSecret: string;
   logLevel: string;
   logToFile: boolean;
+  deletionGuard: boolean;
+  deletionGuardThreshold: number;
 }
 
 export interface AppInfo {
@@ -106,6 +108,7 @@ export type SyncEvent = (
   | { type: "file_failed"; folderId: string; path: string; error: string; retryInSecs: number }
   | { type: "file_pending"; folderId: string; path: string; reason: string }
   | { type: "conflict_created"; folderId: string; path: string; copy: string }
+  | { type: "safety_blocked"; folderId: string; folder: string; deletedCount: number; totalCount: number; reason: string }
   | { type: "cycle_done"; folderId: string; folder: string; report: CycleReport }
   | { type: "error"; folderId: string; folder: string; message: string }
 ) & {
@@ -212,5 +215,14 @@ export interface PlanStats {
 export interface SyncPlan {
   actions: PlanAction[];
   stats: PlanStats;
+}
+
+export interface RecycleItem {
+  id: string;
+  fileName: string;
+  originalPath: string;
+  size: number;
+  action: "deleted" | "overwritten";
+  archivedAt: string;
 }
 

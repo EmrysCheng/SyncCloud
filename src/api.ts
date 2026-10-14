@@ -11,6 +11,7 @@ import type {
   FolderSummary,
   GlobalSettings,
   LogFileInfo,
+  RecycleItem,
   SyncEvent,
   SyncPlan,
 } from "./types";
@@ -75,6 +76,17 @@ export const api = {
     invoke<SyncPlan>("analyze_folder", { folderId }),
   openRecycleBin: (folderId?: string) =>
     invoke<void>("open_recycle_bin", { folderId }),
+  openRecycleBinDir: (folderId: string) =>
+    invoke<void>("open_recycle_bin_dir", { folderId }),
+  listRecycleBin: (folderId: string) =>
+    invoke<RecycleItem[]>("list_recycle_bin", { folderId }),
+  restoreRecycleFile: (folderId: string, itemId: string) =>
+    invoke<string>("restore_recycle_file", { folderId, itemId }),
+  cleanRecycleBin: (folderId: string) =>
+    invoke<number>("clean_recycle_bin", { folderId }),
+  deleteRecycleItem: (folderId: string, itemId: string) =>
+    invoke<void>("delete_recycle_item", { folderId, itemId }),
+  isAllPaused: () => invoke<boolean>("is_all_paused"),
   cloudAccountStatus: (accountId: string) =>
     invoke<CloudAccountStatus>("cloud_account_status", { accountId }),
   listLogFiles: () => invoke<LogFileInfo[]>("list_log_files"),

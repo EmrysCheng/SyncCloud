@@ -5,6 +5,7 @@ pub mod fslock;
 pub mod watcher;
 pub mod plan;
 pub mod conflict;
+pub mod recycle;
 pub mod transfer;
 pub mod engine;
 pub mod manager;

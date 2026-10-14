@@ -133,15 +133,27 @@ pub fn compare(
                     }
                     (false, true) => {
                         // 仅远端变
-                        if direction == Direction::UploadOnly {
-                            stats.unchanged += 1;
-                        } else {
-                            stats.downloads += 1;
-                            stats.bytes_down += rm.size;
-                            actions.push(Action::Download {
-                                path: path.clone(),
-                                meta: rm.clone(),
-                            });
+                        match direction {
+                            Direction::UploadOnly | Direction::Contribute => {
+                                stats.unchanged += 1;
+                            }
+                            Direction::Mirror => {
+                                // 镜像模式以本地为绝对基准：本地未改但远端被改，强制用本地版本覆盖远端
+                                stats.uploads += 1;
+                                stats.bytes_up += lm.size;
+                                actions.push(Action::Upload {
+                                    path: path.clone(),
+                                    meta: lm.clone(),
+                                });
+                            }
+                            Direction::Bidirectional | Direction::DownloadOnly => {
+                                stats.downloads += 1;
+                                stats.bytes_down += rm.size;
+                                actions.push(Action::Download {
+                                    path: path.clone(),
+                                    meta: rm.clone(),
+                                });
+                            }
                         }
                     }
                     (true, true) => {
@@ -153,33 +165,53 @@ pub fn compare(
                                 meta: lm.clone(),
                             });
                         } else {
-                            match conflict_policy {
-                                ConflictPolicy::BothCopies => {
-                                    stats.conflicts += 1;
-                                    stats.downloads += 1;
-                                    stats.bytes_down += rm.size;
-                                    actions.push(Action::Conflict {
+                            match direction {
+                                Direction::Mirror | Direction::Contribute | Direction::UploadOnly => {
+                                    // 单向/镜像/贡献模式下以本地修改为准
+                                    stats.uploads += 1;
+                                    stats.bytes_up += lm.size;
+                                    actions.push(Action::Upload {
                                         path: path.clone(),
-                                        local: lm.clone(),
-                                        remote: rm.clone(),
+                                        meta: lm.clone(),
                                     });
                                 }
-                                ConflictPolicy::NewestWins => {
-                                    // 新 mtime 者胜出；败者仍存冲突副本，永不丢数据
-                                    if lm.mtime_ms >= rm.mtime_ms {
-                                        stats.uploads += 1;
-                                        stats.bytes_up += lm.size;
-                                        actions.push(Action::Upload {
-                                            path: path.clone(),
-                                            meta: lm.clone(),
-                                        });
-                                    } else {
-                                        stats.downloads += 1;
-                                        stats.bytes_down += rm.size;
-                                        actions.push(Action::Download {
-                                            path: path.clone(),
-                                            meta: rm.clone(),
-                                        });
+                                Direction::DownloadOnly => {
+                                    stats.downloads += 1;
+                                    stats.bytes_down += rm.size;
+                                    actions.push(Action::Download {
+                                        path: path.clone(),
+                                        meta: rm.clone(),
+                                    });
+                                }
+                                Direction::Bidirectional => {
+                                    match conflict_policy {
+                                        ConflictPolicy::BothCopies => {
+                                            stats.conflicts += 1;
+                                            stats.downloads += 1;
+                                            stats.bytes_down += rm.size;
+                                            actions.push(Action::Conflict {
+                                                path: path.clone(),
+                                                local: lm.clone(),
+                                                remote: rm.clone(),
+                                            });
+                                        }
+                                        ConflictPolicy::NewestWins => {
+                                            if lm.mtime_ms >= rm.mtime_ms {
+                                                stats.uploads += 1;
+                                                stats.bytes_up += lm.size;
+                                                actions.push(Action::Upload {
+                                                    path: path.clone(),
+                                                    meta: lm.clone(),
+                                                });
+                                            } else {
+                                                stats.downloads += 1;
+                                                stats.bytes_down += rm.size;
+                                                actions.push(Action::Download {
+                                                    path: path.clone(),
+                                                    meta: rm.clone(),
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -188,7 +220,7 @@ pub fn compare(
                 }
             }
             (Some(lm), None) => {
-                // 本地有、远端无 = 远端被删除（相对基线）
+                // 本地有、远端无 = 远端被删除（相对基线）或本地全新创建
                 match b {
                     None => {
                         // 全新文件
@@ -204,8 +236,8 @@ pub fn compare(
                         }
                     }
                     Some(_) => {
-                        // 远端被删：本地未变 → 本地跟随删除；
-                        // 本地已改 → 本地胜出重新上传（保留修改，主流云盘行为）
+                        // 远端被删：
+                        // 如果本地已改动：本地胜出重新上传
                         if local_changed(lm, b) {
                             stats.uploads += 1;
                             stats.bytes_up += lm.size;
@@ -213,47 +245,83 @@ pub fn compare(
                                 path: path.clone(),
                                 local: lm.clone(),
                             });
-                        } else if direction == Direction::UploadOnly {
-                            // 仅上传模式下远端删除不跟随，避免误删
-                            stats.unchanged += 1;
                         } else {
-                            stats.delete_local += 1;
-                            actions.push(Action::DeleteLocal { path: path.clone() });
+                            match direction {
+                                Direction::Mirror | Direction::Contribute | Direction::UploadOnly => {
+                                    // 镜像与单向模式下本地文件不可被轻易抹除，重新上报为上传以恢复云端
+                                    stats.uploads += 1;
+                                    stats.bytes_up += lm.size;
+                                    actions.push(Action::Upload {
+                                        path: path.clone(),
+                                        meta: lm.clone(),
+                                    });
+                                }
+                                Direction::Bidirectional | Direction::DownloadOnly => {
+                                    stats.delete_local += 1;
+                                    actions.push(Action::DeleteLocal { path: path.clone() });
+                                }
+                            }
                         }
                     }
                 }
             }
             (None, Some(rm)) => {
-                // 本地无、远端有 = 本地被删除（相对基线）
+                // 本地无、远端有 = 本地被删除（相对基线）或远端新文件
                 match b {
                     None => {
                         // 远端新文件
-                        if direction == Direction::UploadOnly {
-                            stats.unchanged += 1;
-                        } else {
-                            stats.downloads += 1;
-                            stats.bytes_down += rm.size;
-                            actions.push(Action::Download {
-                                path: path.clone(),
-                                meta: rm.clone(),
-                            });
+                        match direction {
+                            Direction::Mirror => {
+                                // 镜像模式：本地没有的多余文件从远端清理，保持完全镜像
+                                stats.delete_remote += 1;
+                                actions.push(Action::DeleteRemote { path: path.clone() });
+                            }
+                            Direction::Contribute | Direction::UploadOnly => {
+                                stats.unchanged += 1;
+                            }
+                            Direction::Bidirectional | Direction::DownloadOnly => {
+                                stats.downloads += 1;
+                                stats.bytes_down += rm.size;
+                                actions.push(Action::Download {
+                                    path: path.clone(),
+                                    meta: rm.clone(),
+                                });
+                            }
                         }
                     }
                     Some(_) => {
-                        // 本地被删：远端未变 → 远端跟随删除；
-                        // 远端已改 → 保留远端重新下载（不丢他人修改）
-                        if direction == Direction::DownloadOnly {
-                            stats.unchanged += 1;
-                        } else if remote_changed(rm, b) {
-                            stats.downloads += 1;
-                            stats.bytes_down += rm.size;
-                            actions.push(Action::RemoteWinsOverDelete {
-                                path: path.clone(),
-                                remote: rm.clone(),
-                            });
-                        } else {
-                            stats.delete_remote += 1;
-                            actions.push(Action::DeleteRemote { path: path.clone() });
+                        // 本地被删：
+                        match direction {
+                            Direction::Contribute => {
+                                // 贡献安全模式：核心特性为永不删除远端任何历史文件
+                                stats.unchanged += 1;
+                            }
+                            Direction::DownloadOnly => {
+                                stats.unchanged += 1;
+                            }
+                            Direction::Mirror => {
+                                // 镜像模式：本地删则远端坚决删
+                                stats.delete_remote += 1;
+                                actions.push(Action::DeleteRemote { path: path.clone() });
+                            }
+                            Direction::UploadOnly => {
+                                stats.delete_remote += 1;
+                                actions.push(Action::DeleteRemote { path: path.clone() });
+                            }
+                            Direction::Bidirectional => {
+                                if remote_changed(rm, b) {
+                                    // 远端已被修改，保留他人修改
+                                    stats.downloads += 1;
+                                    stats.bytes_down += rm.size;
+                                    actions.push(Action::RemoteWinsOverDelete {
+                                        path: path.clone(),
+                                        remote: rm.clone(),
+                                    });
+                                } else {
+                                    stats.delete_remote += 1;
+                                    actions.push(Action::DeleteRemote { path: path.clone() });
+                                }
+                            }
                         }
                     }
                 }
@@ -467,6 +535,42 @@ mod tests {
         let remote = manifest(tree(&[("a.txt", meta("h2", 3, 300))]));
         let p = compare(&base, Some(remote).as_ref(), &base, Direction::UploadOnly, ConflictPolicy::BothCopies);
         assert!(p.actions.is_empty());
+    }
+
+    #[test]
+    fn direction_contribute_never_deletes_remote() {
+        let base = tree(&[("a.txt", meta("h0", 1, 100))]);
+        let remote = manifest(base.clone());
+        // 本地删除了 a.txt
+        let local = tree(&[]);
+        let p = compare(
+            &local,
+            Some(remote).as_ref(),
+            &base,
+            Direction::Contribute,
+            ConflictPolicy::BothCopies,
+        );
+        // 增量贡献模式下，绝不删除远端
+        assert!(p.actions.is_empty());
+        assert_eq!(p.stats.delete_remote, 0);
+    }
+
+    #[test]
+    fn direction_mirror_removes_untracked_remote() {
+        let base = tree(&[]);
+        // 远端存在新文件，但本地没有
+        let remote = manifest(tree(&[("extra.txt", meta("hx", 1, 100))]));
+        let local = tree(&[]);
+        let p = compare(
+            &local,
+            Some(remote).as_ref(),
+            &base,
+            Direction::Mirror,
+            ConflictPolicy::BothCopies,
+        );
+        // 镜像模式下，远端多余文件必须删除以完全保持与本地镜像
+        assert_eq!(kinds(&p), ["del_remote"]);
+        assert_eq!(p.stats.delete_remote, 1);
     }
 
     #[test]

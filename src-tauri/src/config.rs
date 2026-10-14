@@ -48,6 +48,16 @@ pub struct GlobalSettings {
     /// 是否输出文件日志（数据目录 logs/，轮转保留）
     #[serde(default = "default_true")]
     pub log_to_file: bool,
+    /// 大规模误删安全熔断保护（对标 GoodSync / Syncthing，单次删除过多时阻断）
+    #[serde(default = "default_true")]
+    pub deletion_guard: bool,
+    /// 误删保护触发数量阈值（默认 50 项）
+    #[serde(default = "default_deletion_guard_threshold")]
+    pub deletion_guard_threshold: u32,
+}
+
+fn default_deletion_guard_threshold() -> u32 {
+    50
 }
 
 fn default_log_level() -> String {
@@ -69,6 +79,8 @@ impl Default for GlobalSettings {
             aliyun_app_secret: String::new(),
             log_level: default_log_level(),
             log_to_file: true,
+            deletion_guard: true,
+            deletion_guard_threshold: 50,
         }
     }
 }

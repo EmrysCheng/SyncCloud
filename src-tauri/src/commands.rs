@@ -537,15 +537,6 @@ pub async fn open_recycle_bin(folder_id: Option<String>) -> Result<(), String> {
     open_path_in_explorer(dir.to_string_lossy().to_string(), false).await
 }
 
-/// 暂停所有文件夹的同步
-#[tauri::command]
-pub async fn pause_all_folders(state: State<'_, AppState>) -> Result<(), String> {
-    for s in state.manager.statuses().await {
-        let _ = state.manager.pause_folder(&s.folder_id).await;
-    }
-    Ok(())
-}
-
 // ---- 授权账户状态探测 ----
 
 #[derive(Serialize)]
@@ -636,10 +627,76 @@ pub async fn open_log_dir() -> Result<(), String> {
 /// 恢复所有文件夹的同步
 #[tauri::command]
 pub async fn resume_all_folders(state: State<'_, AppState>) -> Result<(), String> {
-    for s in state.manager.statuses().await {
-        let _ = state.manager.resume_folder(&s.folder_id).await;
-    }
+    state.manager.resume_all().await;
     Ok(())
+}
+
+/// 全局暂停所有文件夹的同步（对标 Syncthing / Resilio Sync）
+#[tauri::command]
+pub async fn pause_all_folders(state: State<'_, AppState>) -> Result<(), String> {
+    state.manager.pause_all().await;
+    Ok(())
+}
+
+/// 查询是否所有同步文件夹均处于暂停状态
+#[tauri::command]
+pub async fn is_all_paused(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.manager.is_all_paused().await)
+}
+
+// ---- 安全防误删回收站管理（对标 FreeFileSync / Syncthing） ----
+
+/// 获取指定文件夹的安全回收站归档列表
+#[tauri::command]
+pub async fn list_recycle_bin(folder_id: String) -> Result<Vec<crate::sync::recycle::RecycleItem>, String> {
+    let id: Uuid = folder_id.parse().map_err(|_| "Folder ID 非法".to_string())?;
+    Ok(crate::sync::recycle::list_items(&id))
+}
+
+/// 从安全回收站一键还原指定文件到原工作路径
+#[tauri::command]
+pub async fn restore_recycle_file(
+    state: State<'_, AppState>,
+    folder_id: String,
+    item_id: String,
+) -> Result<String, String> {
+    let id: Uuid = folder_id.parse().map_err(|_| "Folder ID 非法".to_string())?;
+    let cfg = state.config.lock().await;
+    let folder = cfg
+        .folders
+        .iter()
+        .find(|f| f.id == id)
+        .cloned()
+        .ok_or_else(|| "未找到对应的同步文件夹配置".to_string())?;
+    drop(cfg);
+
+    let local_root = std::path::PathBuf::from(&folder.local_path);
+    crate::sync::recycle::restore_item(&id, &item_id, &local_root)
+        .await
+        .map_err(err)
+}
+
+/// 清空指定文件夹的安全回收站
+#[tauri::command]
+pub async fn clean_recycle_bin(folder_id: String) -> Result<usize, String> {
+    let id: Uuid = folder_id.parse().map_err(|_| "Folder ID 非法".to_string())?;
+    crate::sync::recycle::clean_all(&id).await.map_err(err)
+}
+
+/// 删除指定回收站条目
+#[tauri::command]
+pub async fn delete_recycle_item(folder_id: String, item_id: String) -> Result<(), String> {
+    let id: Uuid = folder_id.parse().map_err(|_| "Folder ID 非法".to_string())?;
+    crate::sync::recycle::delete_item(&id, &item_id).await.map_err(err)
+}
+
+/// 在 Windows 资源管理器中打开安全回收站目录
+#[tauri::command]
+pub async fn open_recycle_bin_dir(folder_id: String) -> Result<(), String> {
+    let id: Uuid = folder_id.parse().map_err(|_| "Folder ID 非法".to_string())?;
+    let dir = crate::sync::recycle::recycle_dir(&id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建回收站目录失败: {e}"))?;
+    open_path_in_explorer(dir.to_string_lossy().to_string(), false).await
 }
 
 // ---- 内部工具 ----

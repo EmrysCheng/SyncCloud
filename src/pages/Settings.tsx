@@ -16,6 +16,8 @@ const DEFAULT_SETTINGS: GlobalSettings = {
   aliyunAppSecret: "",
   logLevel: "info",
   logToFile: true,
+  deletionGuard: true,
+  deletionGuardThreshold: 50,
 };
 
 const LOG_LEVELS: Array<{ value: string; label: string }> = [
@@ -278,6 +280,33 @@ export default function Settings() {
           <span>大文件确认阈值（MB）</span>
           <input type="number" min={0} value={largeFileMb} onChange={(e) => patch({ largeFileThreshold: (Number(e.target.value) || 512) * 1024 * 1024 })} />
         </label>
+        <div style={{ marginTop: "14px", padding: "12px", background: "#f8fafc", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", fontWeight: 500 }}>
+            <input
+              type="checkbox"
+              checked={gs.deletionGuard ?? true}
+              onChange={(e) => patch({ deletionGuard: e.target.checked })}
+            />
+            <span>🛡️ 开启大规模误删安全熔断保护（对标 GoodSync / Syncthing 核心安全机制）</span>
+          </label>
+          <div className="hint" style={{ marginTop: "4px", marginLeft: "24px" }}>
+            当单轮检测到拟删除文件超过阈值（且占原文件总量 20% 以上）时，自动挂起删除动作并发出警报，防止硬盘误拔出或误清空目录导致云端数据被批量抹除。
+          </div>
+          {(gs.deletionGuard ?? true) && (
+            <div style={{ marginTop: "10px", marginLeft: "24px" }}>
+              <label className="field" style={{ margin: 0, maxWidth: "240px" }}>
+                <span>误删拦截触发数量阈值</span>
+                <input
+                  type="number"
+                  min={5}
+                  max={1000}
+                  value={gs.deletionGuardThreshold ?? 50}
+                  onChange={(e) => patch({ deletionGuardThreshold: Number(e.target.value) || 50 })}
+                />
+              </label>
+            </div>
+          )}
+        </div>
         <p className="hint-line">
           无变化时会自动走增量快路径（不取远端锁、不下载清单、零传输）；
           并发数决定同时上传/下载的文件数。
