@@ -92,9 +92,9 @@ export default function FolderSettingsModal({
                   checked={direction === "bidirectional"}
                   onChange={() => setDirection("bidirectional")}
                 />
-                <div>
-                  <div className="rc-title">⇄ 双向同步 (Two-Way)</div>
-                  <div className="rc-sub">多设备协同推荐，本地与云端双向变动均智能对齐</div>
+                <div className="rc-content">
+                  <span className="rc-title">⇄ 双向同步 (Two-Way)</span>
+                  <span className="rc-sub">多设备协同推荐，本地与云端双向变动均智能对齐</span>
                 </div>
               </label>
               <label className={`radio-card ${direction === "mirror" ? "selected" : ""}`}>
@@ -105,9 +105,9 @@ export default function FolderSettingsModal({
                   checked={direction === "mirror"}
                   onChange={() => setDirection("mirror")}
                 />
-                <div>
-                  <div className="rc-title">⇶ 镜像同步 (Mirror)</div>
-                  <div className="rc-sub">以本地为准，云端完全变为本地镜像（本地删云端删，多余项清理）</div>
+                <div className="rc-content">
+                  <span className="rc-title">⇶ 镜像同步 (Mirror)</span>
+                  <span className="rc-sub">以本地为准，云端完全变为本地镜像（本地删云端删，多余项清理）</span>
                 </div>
               </label>
               <label className={`radio-card ${direction === "contribute" ? "selected" : ""}`}>
@@ -118,9 +118,9 @@ export default function FolderSettingsModal({
                   checked={direction === "contribute"}
                   onChange={() => setDirection("contribute")}
                 />
-                <div>
-                  <div className="rc-title">🛡️ 安全贡献备份 (Contribute)</div>
-                  <div className="rc-sub">最适合照片与档案备份：只增不删，永不删除云端任何历史文件</div>
+                <div className="rc-content">
+                  <span className="rc-title">🛡️ 安全贡献备份 (Contribute)</span>
+                  <span className="rc-sub">最适合照片与档案备份：只增不删，永不删除云端任何历史文件</span>
                 </div>
               </label>
               <label className={`radio-card ${direction === "upload_only" ? "selected" : ""}`}>
@@ -131,9 +131,9 @@ export default function FolderSettingsModal({
                   checked={direction === "upload_only"}
                   onChange={() => setDirection("upload_only")}
                 />
-                <div>
-                  <div className="rc-title">↑ 仅单向上传 (Upload Only)</div>
-                  <div className="rc-sub">仅将本地变动推送到云端，不拉取云端变动</div>
+                <div className="rc-content">
+                  <span className="rc-title">↑ 仅单向上传 (Upload Only)</span>
+                  <span className="rc-sub">仅将本地变动推送到云端，不拉取云端变动</span>
                 </div>
               </label>
               <label className={`radio-card ${direction === "download_only" ? "selected" : ""}`}>
@@ -144,9 +144,9 @@ export default function FolderSettingsModal({
                   checked={direction === "download_only"}
                   onChange={() => setDirection("download_only")}
                 />
-                <div>
-                  <div className="rc-title">↓ 仅单向下载 (Download Only)</div>
-                  <div className="rc-sub">仅将云端内容同步拉取至本地，本地改动不上传</div>
+                <div className="rc-content">
+                  <span className="rc-title">↓ 仅单向下载 (Download Only)</span>
+                  <span className="rc-sub">仅将云端内容同步拉取至本地，本地改动不上传</span>
                 </div>
               </label>
             </div>

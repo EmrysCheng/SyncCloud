@@ -991,7 +991,7 @@ h2 {
   border-radius: var(--radius);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
   width: 90%;
-  max-width: 580px;
+  max-width: 620px;
   max-height: 85vh;
   display: flex;
   flex-direction: column;
@@ -1050,6 +1050,72 @@ h2 {
   font-size: 12px;
   line-height: 1.5;
   white-space: pre;
+}
+
+/* ---- 单选卡片（单选按钮与对应信息同行水平排布） ---- */
+
+.radio-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.radio-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--panel, #ffffff);
+  cursor: pointer;
+  transition: all 0.16s ease;
+  user-select: none;
+}
+
+.radio-card:hover {
+  border-color: var(--primary);
+  background: rgba(59, 130, 246, 0.03);
+}
+
+.radio-card.selected {
+  border-color: var(--primary);
+  background: rgba(59, 130, 246, 0.08);
+  box-shadow: 0 0 0 1px var(--primary);
+}
+
+.radio-card input[type="radio"] {
+  margin: 0;
+  cursor: pointer;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+  flex-shrink: 0;
+}
+
+.radio-card .rc-content {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+
+.radio-card .rc-title {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.radio-card .rc-sub {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---------- 传输历史 Activity ---------- */
