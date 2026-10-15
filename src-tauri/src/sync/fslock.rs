@@ -314,11 +314,9 @@ pub fn set_hidden_windows(path: &std::path::Path) {
 #[cfg(not(target_os = "windows"))]
 pub fn set_hidden_windows(_path: &std::path::Path) {}
 
-/// 在 Windows 平台上设置或清除存储模式对应的文件属性（严格对齐坚果云图例）：
-/// - "keep_offline"（保持离线可用）：添加 FILE_ATTRIBUTE_PINNED（0x80000），清除 OFFLINE 与 UNPINNED，
-///   在 Windows 资源管理器【状态】列渲染为「实心绿圈白勾（始终在此设备上可用）」！
-/// - "free_space"（不占用电脑空间）：添加 FILE_ATTRIBUTE_UNPINNED（0x100000）与 FILE_ATTRIBUTE_OFFLINE（0x1000），清除 PINNED，
-///   在 Windows 资源管理器【状态】列渲染为「空心绿圈白勾（联机可用 / 不占空间）」！
+/// 在 Windows 平台上设置存储模式对应的文件属性：
+/// - "keep_offline"（保持离线可用）：彻底清除脱机和异常属性，确保本地所有关联软件可直接原生打开！
+/// - "free_space"（不占用电脑空间）：设置 FILE_ATTRIBUTE_OFFLINE（0x1000）标记为脱机。
 #[cfg(target_os = "windows")]
 pub fn set_storage_mode_attributes(path: &std::path::Path, mode: &str) {
     use std::os::windows::ffi::OsStrExt;
@@ -336,12 +334,12 @@ pub fn set_storage_mode_attributes(path: &std::path::Path, mode: &str) {
         let attrs = GetFileAttributesW(wide.as_ptr());
         if attrs != INVALID_FILE_ATTRIBUTES {
             let next = match mode {
-                "keep_offline" => (attrs & !FILE_ATTRIBUTE_OFFLINE & !FILE_ATTRIBUTE_UNPINNED) | FILE_ATTRIBUTE_PINNED,
-                "free_space" => (attrs & !FILE_ATTRIBUTE_PINNED) | FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_UNPINNED,
+                "keep_offline" => attrs & !FILE_ATTRIBUTE_OFFLINE & !FILE_ATTRIBUTE_PINNED & !FILE_ATTRIBUTE_UNPINNED,
+                "free_space" => (attrs & !FILE_ATTRIBUTE_PINNED) | FILE_ATTRIBUTE_OFFLINE,
                 _ => attrs,
             };
             if next != attrs {
-                let _ = SetFileAttributesW(wide.as_ptr(), next);
+                let _ = SetFileAttributesW(wide.as_ptr(), if next == 0 { 0x20 } else { next });
             }
         }
     }

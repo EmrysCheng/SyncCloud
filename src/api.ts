@@ -13,6 +13,7 @@ import type {
   GlobalSettings,
   LogFileInfo,
   RecycleItem,
+  FolderFileItem,
   SyncEvent,
   SyncPlan,
 } from "./types";
@@ -65,6 +66,10 @@ export const api = {
   setShellMenuEnabled: (enabled: boolean) => invoke<void>("set_shell_menu_enabled", { enabled }),
   setFileStorageMode: (folderId: string, path: string, mode: "keep_offline" | "free_space") =>
     invoke<number>("set_file_storage_mode", { folderId, path, mode }),
+  listFolderFiles: (folderId: string, subPath?: string) =>
+    invoke<FolderFileItem[]>("list_folder_files", { folderId, subPath }),
+  openHydrateFile: (targetPath: string) =>
+    invoke<void>("open_hydrate_file", { targetPath }),
   listCloudAccounts: (provider?: string) =>
     invoke<CloudAccount[]>("list_cloud_accounts", { provider }),
   deleteCloudAccount: (id: string) => invoke<void>("delete_cloud_account", { id }),

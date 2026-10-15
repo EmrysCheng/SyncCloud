@@ -259,3 +259,14 @@ export interface RecycleItem {
   archivedAt: string;
 }
 
+export interface FolderFileItem {
+  name: string;
+  relPath: string;
+  isDir: boolean;
+  size: number;
+  localSize: number;
+  mtimeMs: number;
+  storageMode: "keep_offline" | "free_space";
+  ext: string;
+}
+
