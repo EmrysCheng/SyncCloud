@@ -62,6 +62,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             let mut keep_target = None;
             let mut free_target = None;
+            let mut open_hydrate_target = None;
             let mut it = args.into_iter();
             while let Some(arg) = it.next() {
                 if arg == "--keep-offline" {
@@ -72,9 +73,18 @@ pub fn run() {
                     free_target = it.next();
                 } else if let Some(p) = arg.strip_prefix("--free-space=") {
                     free_target = Some(p.to_string());
+                } else if arg == "--open-hydrate" {
+                    open_hydrate_target = it.next();
+                } else if let Some(p) = arg.strip_prefix("--open-hydrate=") {
+                    open_hydrate_target = Some(p.to_string());
                 }
             }
-            if let Some(path) = keep_target {
+            if let Some(path) = open_hydrate_target {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::sync::storage_mode::handle_open_hydrate(&handle, &path).await;
+                });
+            } else if let Some(path) = keep_target {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     crate::sync::storage_mode::handle_shell_command(&handle, "--keep-offline", &path).await;
@@ -238,10 +248,11 @@ pub fn run() {
             // 确保 Windows 资源管理器右键快捷菜单已注册就绪（坚果云同款云桥功能）
             crate::shell_menu::ensure_shell_menu_registered();
 
-            // 检查冷启动参数：是否由外部右键菜单直接唤起启动
+            // 检查冷启动参数：是否由外部右键菜单或双击占位文件直接唤起启动
             let mut startup_args = std::env::args();
             let mut cold_keep = None;
             let mut cold_free = None;
+            let mut cold_open_hydrate = None;
             while let Some(arg) = startup_args.next() {
                 if arg == "--keep-offline" {
                     cold_keep = startup_args.next();
@@ -251,10 +262,19 @@ pub fn run() {
                     cold_free = startup_args.next();
                 } else if let Some(p) = arg.strip_prefix("--free-space=") {
                     cold_free = Some(p.to_string());
+                } else if arg == "--open-hydrate" {
+                    cold_open_hydrate = startup_args.next();
+                } else if let Some(p) = arg.strip_prefix("--open-hydrate=") {
+                    cold_open_hydrate = Some(p.to_string());
                 }
             }
 
-            if let Some(path) = cold_keep {
+            if let Some(path) = cold_open_hydrate {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::sync::storage_mode::handle_open_hydrate(&handle, &path).await;
+                });
+            } else if let Some(path) = cold_keep {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     crate::sync::storage_mode::handle_shell_command(&handle, "--keep-offline", &path).await;

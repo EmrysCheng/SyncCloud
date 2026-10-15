@@ -12,8 +12,8 @@ use crate::sync::types::{FileMeta, FileTree, RelPath};
 
 /// 内置排除规则：版本库/依赖目录、编辑器/系统临时文件、同步引擎自身元数据。
 pub const BUILTIN_IGNORES: &[&str] = &[
-    ".synccloud*/**",
-    ".synccloud*",
+    ".synccloud/**",
+    ".synccloud",
     "*.synccloud-part",
     "*.sc-stage-*",
     ".git",
@@ -197,18 +197,20 @@ impl<'a> Scanner<'a> {
             if rel.is_empty() || self.is_ignored(&rel, false) {
                 continue;
             }
+            let clean_rel = rel.strip_suffix(".synccloud").unwrap_or(&rel);
+
+            // 坚果云同款云桥按需存储：若该文件已释放本地空间（占位符），复用记录的远端真实大小与哈希，
+            // 避免误判修改或删除，且无需读取 0 字节文件
+            if let Some(placeholder) = self.db.and_then(|db| db.get_placeholder(clean_rel)) {
+                stats.files += 1;
+                tree.insert(clean_rel.to_string(), placeholder);
+                continue;
+            }
+
             let meta = match std::fs::metadata(entry.path()) {
                 Ok(m) => m,
                 Err(_) => continue, // 竞态：扫描期间文件被删除
             };
-
-            // 坚果云同款云桥按需存储：若该文件已释放本地空间（占位符），复用记录的远端真实大小与哈希，
-            // 避免误判修改或删除，且无需读取 0 字节文件
-            if let Some(placeholder) = self.db.and_then(|db| db.get_placeholder(&rel)) {
-                stats.files += 1;
-                tree.insert(rel, placeholder);
-                continue;
-            }
 
             // 单文件体积上限过滤（对标 FreeFileSync 与 GoodSync）
             if let Some(max_bytes) = self.max_file_size_bytes {
