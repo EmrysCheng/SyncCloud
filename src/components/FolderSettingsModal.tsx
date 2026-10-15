@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api } from "../api";
-import type { ConflictPolicy, Direction, FolderConfig, SyncMode } from "../types";
+import type { ConflictPolicy, Direction, FolderConfig, SyncMode, TransferPriority } from "../types";
 
 export default function FolderSettingsModal({
   folder,
@@ -16,6 +16,9 @@ export default function FolderSettingsModal({
   const [conflictPolicy, setConflictPolicy] = useState<ConflictPolicy>(folder.conflictPolicy);
   const [syncMode, setSyncMode] = useState<SyncMode>(folder.syncMode ?? "realtime");
   const [intervalSecs, setIntervalSecs] = useState(folder.intervalSecs ?? 300);
+  const [transferPriority, setTransferPriority] = useState<TransferPriority>(folder.transferPriority ?? "smallest_first");
+  const [maxFileSizeMb, setMaxFileSizeMb] = useState<number | string>(folder.maxFileSizeMb ?? 0);
+  const [ignoreHidden, setIgnoreHidden] = useState<boolean>(folder.ignoreHidden ?? false);
   const [ignoreRulesText, setIgnoreRulesText] = useState((folder.ignoreRules || []).join("\n"));
   const [saving, setSaving] = useState(false);
 
@@ -47,6 +50,9 @@ export default function FolderSettingsModal({
         syncMode,
         intervalSecs: Number(intervalSecs) || 300,
         ignoreRules: rules,
+        transferPriority,
+        maxFileSizeMb: Number(maxFileSizeMb) > 0 ? Number(maxFileSizeMb) : null,
+        ignoreHidden,
       };
 
       await api.updateFolder(updated);
@@ -189,6 +195,46 @@ export default function FolderSettingsModal({
               />
             </div>
           )}
+
+          <div className="field">
+            <label>传输调度优先级（对标 Syncthing 与 PanguFlow）</label>
+            <select
+              className="input"
+              value={transferPriority}
+              onChange={(e) => setTransferPriority(e.target.value as TransferPriority)}
+            >
+              <option value="smallest_first">小文件优先（默认推荐，轻量文档与代码秒级完成）</option>
+              <option value="newest_first">最新修改优先（先同步最近编辑的内容）</option>
+              <option value="largest_first">大文件优先</option>
+              <option value="order_alpha">标准路径字母序</option>
+            </select>
+          </div>
+
+          <div className="field">
+            <div className="flex-row-between">
+              <label>单文件体积上限（MB，0 为不限制）</label>
+              <span className="muted" style={{ fontSize: 12 }}>超过此大小的文件自动跳过</span>
+            </div>
+            <input
+              type="number"
+              min="0"
+              className="input"
+              value={maxFileSizeMb}
+              onChange={(e) => setMaxFileSizeMb(e.target.value)}
+              placeholder="0 表示不限制大小"
+            />
+          </div>
+
+          <div className="field">
+            <label className="checkbox-row" style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
+              <input
+                type="checkbox"
+                checked={ignoreHidden}
+                onChange={(e) => setIgnoreHidden(e.target.checked)}
+              />
+              <span>忽略 Windows 隐藏文件与系统保护文件（对标 FreeFileSync 与 GoodSync）</span>
+            </label>
+          </div>
 
           <div className="field">
             <div className="flex-row-between" style={{ marginBottom: 6 }}>

@@ -34,6 +34,16 @@ const ACTION_CONFIG: Record<
     badgeClass: "badge-orange",
     desc: "本地已删除，云端将同步删除",
   },
+  move_local: {
+    label: "⇄ 本地移动",
+    badgeClass: "badge-purple",
+    desc: "远端已重命名或移动，本地将直接原子重命名（免流量下载）",
+  },
+  move_remote: {
+    label: "⇄ 云端移动",
+    badgeClass: "badge-purple",
+    desc: "本地已重命名或移动，云端将直接服务端重命名（免重复上传）",
+  },
   conflict: {
     label: "⚠️ 冲突预警",
     badgeClass: "badge-warn",
@@ -61,11 +71,13 @@ export default function PlanPreviewModal({
   plan,
   onClose,
   onExecuteSync,
+  onForcePush,
 }: {
   folder: FolderSummary;
   plan: SyncPlan;
   onClose: () => void;
   onExecuteSync: () => void;
+  onForcePush?: () => void;
 }) {
   const [filter, setFilter] = useState<string>("all");
   const s = plan.stats;
@@ -89,6 +101,11 @@ export default function PlanPreviewModal({
     }
     if (filter === "conflict") {
       return plan.actions.filter((a) => a.kind === "conflict");
+    }
+    if (filter === "move") {
+      return plan.actions.filter(
+        (a) => a.kind === "move_local" || a.kind === "move_remote",
+      );
     }
     return plan.actions;
   }, [plan.actions, filter]);
@@ -142,6 +159,13 @@ export default function PlanPreviewModal({
               <span className="p-lbl">待删除文件</span>
               <span className="p-sub">本地 {s.deleteLocal} / 远端 {s.deleteRemote}</span>
             </div>
+            {(s.moved ?? 0) > 0 && (
+              <div className="plan-stat-card">
+                <span className="p-num" style={{ color: "#8b5cf6" }}>{s.moved}</span>
+                <span className="p-lbl">移动/重命名</span>
+                <span className="p-sub" style={{ color: "#10b981", fontWeight: 600 }}>0 B 免流量</span>
+              </div>
+            )}
             <div className="plan-stat-card">
               <span className="p-num stat-red">{s.conflicts}</span>
               <span className="p-lbl">冲突预警</span>
@@ -181,6 +205,14 @@ export default function PlanPreviewModal({
               >
                 待删除 ({s.deleteLocal + s.deleteRemote})
               </button>
+              {(s.moved ?? 0) > 0 && (
+                <button
+                  className={`tab-btn ${filter === "move" ? "active" : ""}`}
+                  onClick={() => setFilter("move")}
+                >
+                  移动/重命名 ({s.moved})
+                </button>
+              )}
               <button
                 className={`tab-btn ${filter === "conflict" ? "active" : ""}`}
                 onClick={() => setFilter("conflict")}
@@ -227,18 +259,32 @@ export default function PlanPreviewModal({
                           </span>
                         </td>
                         <td>
-                          <div className="plan-path" title={a.path}>
-                            {a.path}
-                          </div>
+                          {a.kind === "move_local" || a.kind === "move_remote" ? (
+                            <div className="plan-path" title={`${a.from} ➔ ${a.to}`}>
+                              <span style={{ textDecoration: "line-through", opacity: 0.65 }}>{a.from}</span>
+                              <span style={{ margin: "0 6px", color: "#8b5cf6", fontWeight: "bold" }}>➔</span>
+                              <span style={{ color: "var(--color-primary, #6366f1)", fontWeight: 500 }}>{a.to}</span>
+                            </div>
+                          ) : (
+                            <div className="plan-path" title={a.path}>
+                              {a.path}
+                            </div>
+                          )}
                         </td>
                         <td style={{ textAlign: "right" }} className="muted">
-                          {size > 0 ? fmtBytes(size) : "-"}
+                          {a.kind === "move_local" || a.kind === "move_remote" ? (
+                            <span title="智能检测重命名，无需网络传输" style={{ color: "#10b981", fontSize: 12 }}>0 B (免传输)</span>
+                          ) : size > 0 ? (
+                            fmtBytes(size)
+                          ) : (
+                            "-"
+                          )}
                         </td>
                         <td style={{ textAlign: "center" }}>
                           <button
                             className="btn-tiny-locate"
                             title="在资源管理器中定位"
-                            onClick={() => locateFile(a.path)}
+                            onClick={() => locateFile(a.to || a.path || "")}
                           >
                             📁
                           </button>
@@ -256,10 +302,22 @@ export default function PlanPreviewModal({
           <div className="muted" style={{ fontSize: 13 }}>
             🛡️ <strong>安全保障：</strong>本地删除或覆盖的文件将自动归档至防误删回收站
           </div>
-          <div className="modal-actions">
+          <div className="modal-actions" style={{ display: "flex", gap: "8px" }}>
             <button className="btn" onClick={onClose}>
               取消
             </button>
+            {onForcePush && (
+              <button
+                className="btn btn-danger"
+                title="以本地当前文件为准，强制完全覆盖远端（本地已删的文件将从云端删除，绕过熔断）"
+                onClick={() => {
+                  onClose();
+                  onForcePush();
+                }}
+              >
+                🚀 强制覆盖远端
+              </button>
+            )}
             <button
               className="btn btn-primary"
               onClick={() => {

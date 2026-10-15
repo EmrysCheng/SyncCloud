@@ -84,6 +84,21 @@ pub enum SyncMode {
     Manual,
 }
 
+/// 传输调度优先级（对标 Syncthing 与 PanguFlow）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferPriority {
+    /// 小文件优先（默认推荐）：小体积文件优先传输，日常文档与代码秒级同步
+    #[default]
+    SmallestFirst,
+    /// 最新修改优先：最近修改的文件优先同步
+    NewestFirst,
+    /// 大文件优先
+    LargestFirst,
+    /// 路径标准排序
+    OrderAlpha,
+}
+
 /// 一轮同步的统计报告。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,6 +107,8 @@ pub struct CycleReport {
     pub downloaded: u32,
     pub deleted_local: u32,
     pub deleted_remote: u32,
+    #[serde(default)]
+    pub moved: u32,
     pub conflicts: u32,
     pub conflicts_resolved_content_identical: u32,
     pub failed: u32,

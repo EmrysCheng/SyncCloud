@@ -81,6 +81,12 @@ pub trait RemoteStore: Send + Sync {
 
     async fn delete_file(&self, path: &str) -> anyhow::Result<()>;
 
+    /// 远端重命名/移动文件（支持服务端移动的后端如 S3 copy+delete, WebDAV MOVE 等覆盖实现）。
+    /// 默认实现返回不支持错误，引擎会自动回退到上传新路径 + 删除旧路径。
+    async fn move_file(&self, _from: &str, _to: &str) -> anyhow::Result<()> {
+        anyhow::bail!("服务端移动未实现")
+    }
+
     /// 列出远端实际对象（不含引擎元数据），用于对账与垃圾回收。
     async fn list_objects(&self) -> anyhow::Result<Vec<RemoteEntry>>;
 

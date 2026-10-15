@@ -3,6 +3,8 @@
 //! 一个 SyncEngine 实例对应一个同步文件夹，由 manager 保证串行调用 run_cycle。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
@@ -19,6 +21,21 @@ use crate::sync::types::{CycleReport, FileMeta, FileTree, Manifest};
 
 /// 远端 manifest 缺失时的变更戳哨兵值。
 const STAMP_ABSENT: &str = "absent";
+
+/// 文件被独占锁定导致的动作挂起（非失败）：不计入 failed，不重试，
+/// 基线保持不变，下一轮自动重新规划，占用释放后自然收敛。
+#[derive(Debug, Clone)]
+pub(crate) struct PendingLockError {
+    pub path: String,
+}
+
+impl std::fmt::Display for PendingLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "文件被其他程序占用，已挂起待下一轮处理: {}", self.path)
+    }
+}
+
+impl std::error::Error for PendingLockError {}
 
 /// 引擎对外事件（broadcast 给 UI 与日志）。
 #[derive(Debug, Clone, Serialize)]
@@ -78,6 +95,7 @@ pub struct SyncEngine {
     pub settings: GlobalSettings,
     pub db: StateDb,
     pub events: EventSink,
+    pub paused: Arc<AtomicBool>,
 }
 
 /// 单个动作对远端 manifest 的增量变更（并行执行后统一合并）。
@@ -87,13 +105,22 @@ enum DeltaOp {
 }
 
 impl SyncEngine {
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
     pub fn root(&self) -> PathBuf {
         PathBuf::from(&self.folder.local_path)
     }
 
     /// 仅执行扫描与三方对比计算，不执行任何写入、上传、下载或删除（对标 GoodSync / EchoSync 差异分析）。
     pub async fn analyze(&mut self, store: &dyn RemoteStore) -> anyhow::Result<SyncPlan> {
-        let scanner = Scanner::new(&self.folder.ignore_rules, Some(&self.db))?;
+        let scanner = Scanner::with_options(
+            &self.folder.ignore_rules,
+            Some(&self.db),
+            self.folder.max_file_size_mb,
+            self.folder.ignore_hidden,
+        )?;
         let (local, _) = scanner.scan(&self.root())?;
         let baseline = self.db.load_baseline()?;
 
@@ -119,12 +146,13 @@ impl SyncEngine {
             }
         }
 
-        let plan = plan::compare(
+        let plan = plan::compare_with_ignore(
             &local,
             remote.as_ref(),
             &baseline,
             self.folder.direction,
             self.folder.conflict_policy,
+            &|p| scanner.is_path_ignored(p),
         );
         Ok(plan)
     }
@@ -132,16 +160,44 @@ impl SyncEngine {
     /// 执行一轮完整同步。本地与远端均无实质变化时走增量快路径，
     /// 不获取远端锁、不下载 manifest、不做三方对比（坚果云式增量体验）。
     pub async fn run_cycle(&mut self, store: &dyn RemoteStore) -> CycleReport {
+        self.run_cycle_options(store, false, false).await
+    }
+
+    /// 强制执行一轮同步（用户手动点击「立即同步」时触发），跳过增量快路径探测，
+    /// 强制拉取 manifest 执行三方对比并刷新时间与明细。
+    pub async fn run_cycle_forced(&mut self, store: &dyn RemoteStore) -> CycleReport {
+        self.run_cycle_options(store, true, false).await
+    }
+
+    /// 强制推送同步（用户显式请求「本地覆盖远端」）：
+    /// 临时采用 Mirror（镜像）模式，本地已删除的文件坚决从远端删除（绕过防误删熔断），
+    /// 本地文件完全覆盖远端，绝不反向拉取下载任何文件。
+    pub async fn run_cycle_force_push(&mut self, store: &dyn RemoteStore) -> CycleReport {
+        self.run_cycle_options(store, true, true).await
+    }
+
+    pub async fn run_cycle_options(
+        &mut self,
+        store: &dyn RemoteStore,
+        force: bool,
+        is_force_push: bool,
+    ) -> CycleReport {
+        if self.is_paused() && !is_force_push {
+            let mut report = CycleReport::default();
+            report.skipped = 1;
+            return report;
+        }
+
         let started = Instant::now();
         let mut report = CycleReport::default();
         let fid = self.folder.id;
 
         self.events.emit(SyncEvent::CycleStarted { folder_id: fid, folder: self.folder.name.clone() });
 
-        // 0. 本地同步目录安全保证：绝不在同步文件夹内创建或保留 .synccloud 目录
+        // 0. 本地同步目录安全保证：非用户自主创建的 .synccloud 目录一律显式设置 Windows 隐藏属性
         let local_synccloud = self.root().join(".synccloud");
         if local_synccloud.exists() {
-            let _ = tokio::fs::remove_dir_all(&local_synccloud).await;
+            crate::sync::fslock::set_hidden_windows(&local_synccloud);
         }
 
         // 0.5 应用待替换队列：上一轮被独占锁定而未落盘的新版本，现在再试一次。
@@ -150,7 +206,12 @@ impl SyncEngine {
 
         // 1. 本地扫描（哈希缓存命中时只做 stat）+ 基线
         let scanned = (|| -> anyhow::Result<(crate::sync::types::FileTree, crate::sync::scanner::ScanStats, crate::sync::types::FileTree)> {
-            let scanner = Scanner::new(&self.folder.ignore_rules, Some(&self.db))?;
+            let scanner = Scanner::with_options(
+                &self.folder.ignore_rules,
+                Some(&self.db),
+                self.folder.max_file_size_mb,
+                self.folder.ignore_hidden,
+            )?;
             let (local, stats) = scanner.scan(&self.root())?;
             let baseline = self.db.load_baseline()?;
             Ok((local, stats, baseline))
@@ -175,9 +236,9 @@ impl SyncEngine {
             ignored: scan_stats.ignored,
         });
 
-        // 2. 增量快路径：本地无实质变化、无待重放日志、远端变更戳未变 → 整轮跳过
+        // 2. 增量快路径：非强制触发（自动轮询/监听）、本地无实质变化、无待重放日志、远端变更戳未变 → 整轮跳过
         let has_pending_journal = !self.db.journal_load().unwrap_or_default().is_empty();
-        if !tree_changed(&local, &baseline) && !has_pending_journal {
+        if !force && !tree_changed(&local, &baseline) && !has_pending_journal {
             let stamp_now = match store.manifest_stamp().await {
                 // manifest 缺失也用哨兵值参与比较（首 sync 后远端一直为空时可快路径）
                 Ok(s) => Some(s.unwrap_or_else(|| STAMP_ABSENT.to_string())),
@@ -215,7 +276,14 @@ impl SyncEngine {
             }
         };
 
-        let result = self.run_cycle_locked(store, &mut report, local, baseline).await;
+        let override_dir = if is_force_push {
+            Some(crate::sync::types::Direction::Mirror)
+        } else {
+            None
+        };
+        let result = self
+            .run_cycle_locked(store, &mut report, local, baseline, override_dir, is_force_push)
+            .await;
 
         // 无论成败都释放锁
         if let Some(l) = lock {
@@ -300,6 +368,8 @@ impl SyncEngine {
         report: &mut CycleReport,
         local: FileTree,
         baseline: FileTree,
+        override_direction: Option<crate::sync::types::Direction>,
+        bypass_deletion_guard: bool,
     ) -> anyhow::Result<()> {
         let fid = self.folder.id;
 
@@ -340,20 +410,31 @@ impl SyncEngine {
             tracing::info!(folder = %self.folder.name, n = journal.len(), "重放未提交的远端变更日志");
         }
 
-        // 6. 三方对比
-        let mut plan: SyncPlan = plan::compare(
+        let scanner = Scanner::with_options(
+            &self.folder.ignore_rules,
+            Some(&self.db),
+            self.folder.max_file_size_mb,
+            self.folder.ignore_hidden,
+        )?;
+
+        // 6. 三方对比（传入路径忽略判定闭包，确保排除文件绝不下载到本地，且本地删除后正确推送远端删除）
+        let sync_direction = override_direction.unwrap_or(self.folder.direction);
+        let mut plan: SyncPlan = plan::compare_with_ignore(
             &local,
             remote.as_ref(),
             &baseline,
-            self.folder.direction,
+            sync_direction,
             self.folder.conflict_policy,
+            &|p| scanner.is_path_ignored(p),
         );
         self.events.emit(SyncEvent::Planned { folder_id: fid, stats: plan.stats.clone() });
 
-        // 6.1 大规模误删安全熔断器（对标 GoodSync / Syncthing）
+        // 6.1 大规模误删安全熔断器（对标 GoodSync / Syncthing；强制推送模式跳过此拦截）
         let total_deletes = plan.stats.delete_local + plan.stats.delete_remote;
         let baseline_count = baseline.len();
-        if self.settings.deletion_guard
+        let mut uncompleted_remote_deletes = std::collections::HashSet::new();
+        if !bypass_deletion_guard
+            && self.settings.deletion_guard
             && total_deletes >= self.settings.deletion_guard_threshold as usize
             && (baseline_count > 0 && total_deletes * 100 / baseline_count >= 20)
         {
@@ -371,6 +452,12 @@ impl SyncEngine {
                 total_count: baseline_count,
                 reason: warn_msg,
             });
+            // 记录被熔断挂起的远端删除路径，确保基线中保留该项，避免下一轮误判为远端新文件倒灌下载！
+            for a in &plan.actions {
+                if let Action::DeleteRemote { path } = a {
+                    uncompleted_remote_deletes.insert(path.clone());
+                }
+            }
             // 过滤掉所有删除动作，仅保留上传/下载/冲突处理，避免整批破坏性删除
             plan.actions.retain(|a| !matches!(a, Action::DeleteLocal { .. } | Action::DeleteRemote { .. }));
         }
@@ -385,7 +472,11 @@ impl SyncEngine {
             return Ok(());
         }
 
-        // 7. 并行执行动作（concurrency 上限；每项带指数退避重试应对瞬时文件占用）。
+        // 7. 传输优先级调度（对标 Syncthing 与 PanguFlow）：
+        //    MoveLocal 优先毫秒级完成，删除次之，传输类按配置（默认小文件优先）排序执行
+        sort_actions(&mut plan.actions, self.folder.transfer_priority);
+
+        // 8. 并行执行动作（concurrency 上限；每项带指数退避重试应对瞬时文件占用）。
         //    动作之间路径互斥，并行不会互相干扰；对 manifest 的影响以增量 DeltaOp
         //    返回，合并阶段统一应用（不再每个动作克隆整棵 manifest 树）。
         let max_retries = self.settings.max_retries;
@@ -398,22 +489,40 @@ impl SyncEngine {
                 .map(|action| {
                     let events = events.clone();
                     async move {
+                        if engine.is_paused() {
+                            return (action, Err(anyhow::anyhow!("任务已暂停")));
+                        }
                         let mut attempt: u32 = 0;
                         loop {
+                            if engine.is_paused() {
+                                return (action, Err(anyhow::anyhow!("任务已暂停")));
+                            }
                             match engine.execute_action(store, &action).await {
                                 Ok(ops) => break (action, Ok(ops)),
                                 Err(e) => {
+                                    // 占用挂起类：已入待处理队列，无需重试，立即交给合并阶段
+                                    if e.is::<PendingLockError>() {
+                                        break (action, Err(e));
+                                    }
                                     if attempt >= max_retries {
+                                        // 仅最终失败才上报 FileFailed（写入传输历史）；
+                                        // 中间重试只记日志，避免重试期间刷屏大量失败记录
+                                        events.emit(SyncEvent::FileFailed {
+                                            folder_id: fid,
+                                            path: action_path(&action),
+                                            error: format!("{e:#}"),
+                                            retry_in_secs: 0,
+                                        });
                                         break (action, Err(e));
                                     }
                                     let delay =
                                         Duration::from_secs(1u64.saturating_pow(attempt + 1).min(60));
-                                    events.emit(SyncEvent::FileFailed {
-                                        folder_id: fid,
-                                        path: action_path(&action),
-                                        error: format!("{e:#}"),
-                                        retry_in_secs: delay.as_secs(),
-                                    });
+                                    tracing::warn!(
+                                        path = %action_path(&action),
+                                        error = %e,
+                                        retry_in_secs = delay.as_secs(),
+                                        "动作执行失败，指数退避后重试"
+                                    );
                                     tokio::time::sleep(delay).await;
                                     attempt += 1;
                                 }
@@ -447,14 +556,21 @@ impl SyncEngine {
                         }
                     }
                     apply_report(report, &action);
-                    // 下载类动作会改动本地文件（mtime/冲突副本），基线需要重扫得到真实状态；
+                    // 下载类与本地移动动作会改动本地文件，基线需要重扫得到真实状态；
                     // 纯上传/删除轮次直接复用扫描结果，省一次全目录遍历。
                     need_rescan |= matches!(
                         action,
-                        Action::Download { .. } | Action::RemoteWinsOverDelete { .. } | Action::Conflict { .. }
+                        Action::Download { .. }
+                            | Action::RemoteWinsOverDelete { .. }
+                            | Action::Conflict { .. }
+                            | Action::MoveLocal { .. }
                     );
                     if let Action::DeleteLocal { path } = &action {
                         final_local.remove(path);
+                    }
+                    if let Action::MoveLocal { from, to, meta } = &action {
+                        final_local.remove(from);
+                        final_local.insert(to.clone(), meta.clone());
                     }
                     self.events.emit(SyncEvent::FileDone {
                         folder_id: fid,
@@ -463,6 +579,23 @@ impl SyncEngine {
                     });
                 }
                 Err(e) => {
+                    // 若 DeleteRemote 失败，记录未完成删除路径，基线中必须保留！
+                    if let Action::DeleteRemote { path } = &action {
+                        uncompleted_remote_deletes.insert(path.clone());
+                    }
+                    if e.is::<PendingLockError>() {
+                        // 占用挂起：不计失败（FilePending 事件已在动作内上报），
+                        // 基线保持不变，下一轮自动重新规划收敛。
+                        // 同时使增量快路径的 stamp 缓存失效：本地与远端的差异
+                        // （如待删除的残留源文件）不能被「无变化」跳过掩盖。
+                        self.db.kv_set("manifest_stamp", "");
+                        tracing::info!(
+                            folder = %self.folder.name,
+                            path = %action_path(&action),
+                            "文件被占用，动作挂起待下一轮重试"
+                        );
+                        continue;
+                    }
                     report.failed += 1;
                     tracing::error!(folder = %self.folder.name, path = %action_path(&action), error = %e, "动作执行失败");
                 }
@@ -498,19 +631,39 @@ impl SyncEngine {
             self.db.journal_clear();
             stamp = manifest_stamp_of(&manifest);
         }
+        // 动作阶段若发生占用挂起（PendingLockError / MoveLocal 源残留），
+        // stamp 已被置空作为标记：此处先写入正常 stamp，再恢复失效标记，
+        // 确保下一轮不命中增量快路径，残留差异能被重新规划收敛
+        let has_deferred = self.db.kv_get("manifest_stamp").as_deref() == Some("");
         self.db.kv_set("manifest_stamp", &stamp);
+        if has_deferred {
+            self.db.kv_set("manifest_stamp", "");
+        }
 
-        // 10. 基线更新：下载类轮次重扫真实本地状态（mtime、冲突副本如实反映），
-        //     其余轮次用扫描结果扣除本轮删除的本地文件即可。
-        if need_rescan {
-            let (final_local, _) = {
-                let scanner = Scanner::new(&self.folder.ignore_rules, Some(&self.db))?;
+        // 10. 基线更新：新基线 = 本地实际就位的文件 + 尚未在远端成功删除的基线项
+        let mut next_baseline = if need_rescan {
+            let (scanned, _) = {
+                let scanner = Scanner::with_options(
+                    &self.folder.ignore_rules,
+                    Some(&self.db),
+                    self.folder.max_file_size_mb,
+                    self.folder.ignore_hidden,
+                )?;
                 scanner.scan(&self.root())?
             };
-            self.db.replace_baseline(&final_local)?;
+            scanned
         } else {
-            self.db.replace_baseline(&final_local)?;
+            final_local
+        };
+
+        // 关键安全保证：未完成远端删除的条目在基线中予以保留，
+        // 防止基线提前丢失后下一轮被三方对比误判为「远端新文件」倒灌下载回本地！
+        for path in &uncompleted_remote_deletes {
+            if let Some(m) = baseline.get(path) {
+                next_baseline.insert(path.clone(), m.clone());
+            }
         }
+        self.db.replace_baseline(&next_baseline)?;
 
         Ok(())
     }
@@ -529,10 +682,21 @@ impl SyncEngine {
         match action {
             Action::Upload { path, meta } | Action::LocalWinsOverDelete { path, local: meta } => {
                 let src = abs_path(&root, path);
+                crate::sync::transfer::upload_limiter().consume(meta.size as usize).await;
                 store.put_file(path, &src).await?;
                 Ok(vec![DeltaOp::Put(path.clone(), meta.clone())])
             }
             Action::Download { path, meta } | Action::RemoteWinsOverDelete { path, remote: meta } => {
+                let scanner = Scanner::with_options(
+                    &self.folder.ignore_rules,
+                    None,
+                    self.folder.max_file_size_mb,
+                    self.folder.ignore_hidden,
+                )?;
+                if scanner.is_path_ignored(path) {
+                    tracing::info!(path = %path, "跳过被排除文件的下载");
+                    return Ok(Vec::new());
+                }
                 self.download_to(store, path, &root, meta).await?;
                 match action {
                     // 本地曾删除而远端被他人修改：恢复 manifest 条目
@@ -542,6 +706,61 @@ impl SyncEngine {
                     _ => Ok(Vec::new()),
                 }
             }
+            Action::MoveLocal { from, to, meta } => {
+                let abs_from = abs_path(&root, from);
+                let abs_to = abs_path(&root, to);
+                if let Some(parent) = abs_to.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                if abs_to.exists() {
+                    let _ = crate::sync::recycle::archive_file(&self.folder.id, &abs_to, to, "overwritten").await;
+                }
+                match crate::sync::fslock::replace_file(&abs_from, &abs_to).await {
+                    Ok(()) => {}
+                    Err(e) if crate::sync::fslock::is_lock_error(&e) => {
+                        // 源文件被独占锁定（如正被 Office 打开）：降级为共享读复制 + 健壮删除。
+                        // 复制成功后目标立即就位；源删除失败时不报错，残留源文件由下一轮
+                        // 重新规划为 DeleteLocal 自然收敛（最终一致，无感知、不丢数据）。
+                        crate::sync::fslock::copy_shared(&abs_from, &abs_to).await?;
+                        match crate::sync::fslock::remove_file_robust(&abs_from).await {
+                            Ok(()) => {}
+                            Err(_) if !abs_from.exists() => {}
+                            Err(del_err) => {
+                                self.events.emit(SyncEvent::FilePending {
+                                    folder_id: self.folder.id,
+                                    path: from.clone(),
+                                    reason: format!(
+                                        "已复制到新路径，原文件被占用（{del_err}），将在占用释放后自动删除"
+                                    ),
+                                });
+                                // 残留源文件需下一轮重新规划删除：使快路径 stamp 失效，
+                                // 避免「本地==基线」跳过掩盖本地与远端的差异
+                                self.db.kv_set("manifest_stamp", "");
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                self.prune_empty_parents(&root, Path::new(from));
+                Ok(vec![
+                    DeltaOp::Remove(from.clone()),
+                    DeltaOp::Put(to.clone(), meta.clone()),
+                ])
+            }
+            Action::MoveRemote { from, to, meta } => {
+                // 优先尝试后端原生服务端移动（S3/WebDAV 等），不支持则回退到 put + delete
+                if let Err(e) = store.move_file(from, to).await {
+                    tracing::debug!(error = %e, "存储后端服务端移动不可用，回退至上传+删除");
+                    let src = abs_path(&root, to);
+                    crate::sync::transfer::upload_limiter().consume(meta.size as usize).await;
+                    store.put_file(to, &src).await?;
+                    let _ = store.delete_file(from).await;
+                }
+                Ok(vec![
+                    DeltaOp::Remove(from.clone()),
+                    DeltaOp::Put(to.clone(), meta.clone()),
+                ])
+            }
             Action::DeleteRemote { path } => {
                 store.delete_file(path).await?;
                 Ok(vec![DeltaOp::Remove(path.clone())])
@@ -549,6 +768,18 @@ impl SyncEngine {
             Action::DeleteLocal { path } => {
                 let target = abs_path(&root, path);
                 if target.exists() {
+                    // 被独占锁定的文件直接挂起：不归档（避免下轮重复归档）、不计失败，
+                    // 占用释放后下一轮重新规划删除，最终一致
+                    if !crate::sync::fslock::can_delete(&target) {
+                        self.events.emit(SyncEvent::FilePending {
+                            folder_id: self.folder.id,
+                            path: path.clone(),
+                            reason: "文件被其他程序占用，将在占用释放后自动删除".into(),
+                        });
+                        return Err(anyhow::Error::new(PendingLockError {
+                            path: path.clone(),
+                        }));
+                    }
                     // 安全防误删保护（FreeFileSync / Syncthing 同款）：
                     // 本地删除时先归档到应用外部回收站，保留防误删备份与元数据索引
                     let _ = crate::sync::recycle::archive_file(&self.folder.id, &target, path, "deleted").await;
@@ -556,6 +787,18 @@ impl SyncEngine {
                 match crate::sync::fslock::remove_file_robust(&target).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) if crate::sync::fslock::is_lock_error(&e) => {
+                        // 探测与删除之间的窄窗口内被锁定：已归档过，不再重复归档；
+                        // 挂起等待下一轮收敛，不计失败
+                        self.events.emit(SyncEvent::FilePending {
+                            folder_id: self.folder.id,
+                            path: path.clone(),
+                            reason: "文件被其他程序占用，将在占用释放后自动删除".into(),
+                        });
+                        return Err(anyhow::Error::new(PendingLockError {
+                            path: path.clone(),
+                        }));
+                    }
                     Err(e) => return Err(e.into()),
                 }
                 // 清理空父目录（仅限同步根内的空目录，尽力而为）
@@ -674,6 +917,7 @@ impl SyncEngine {
         tokio::fs::create_dir_all(&temp_dir).await?;
         let tmp = temp_dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
         store.get_file(path, &tmp).await?;
+        crate::sync::transfer::download_limiter().consume(expected.size as usize).await;
         // 内容校验：远端 manifest 的 size/hash 为权威。某些云存储（如百度 dlink）
         // 刚上传后可能返回空/过期响应，校验失败交给外层动作重试，防止静默损坏本地文件。
         let got_size = tokio::fs::metadata(&tmp).await?.len();
@@ -789,6 +1033,9 @@ fn apply_report(report: &mut CycleReport, action: &Action) {
             report.downloaded += 1;
             report.bytes_downloaded += remote.size;
         }
+        Action::MoveLocal { .. } | Action::MoveRemote { .. } => {
+            report.moved += 1;
+        }
     }
 }
 
@@ -802,6 +1049,7 @@ fn action_path(a: &Action) -> String {
         | Action::Conflict { path, .. }
         | Action::RemoteWinsOverDelete { path, .. }
         | Action::LocalWinsOverDelete { path, .. } => path.clone(),
+        Action::MoveLocal { to, .. } | Action::MoveRemote { to, .. } => to.clone(),
     }
 }
 
@@ -811,10 +1059,85 @@ fn action_kind(a: &Action) -> String {
         Action::Download { .. } => "download".into(),
         Action::DeleteRemote { .. } => "delete_remote".into(),
         Action::DeleteLocal { .. } => "delete_local".into(),
+        Action::MoveLocal { .. } => "move_local".into(),
+        Action::MoveRemote { .. } => "move_remote".into(),
         Action::Identical { .. } => "identical".into(),
         Action::Conflict { .. } => "conflict".into(),
         Action::RemoteWinsOverDelete { .. } => "remote_wins".into(),
         Action::LocalWinsOverDelete { .. } => "local_wins".into(),
+    }
+}
+
+/// 传输动作优先级调度排序（对标 Syncthing 与 PanguFlow）。
+fn sort_actions(actions: &mut [Action], priority: crate::sync::types::TransferPriority) {
+    actions.sort_by(|a, b| {
+        let stage_a = action_stage(a);
+        let stage_b = action_stage(b);
+        if stage_a != stage_b {
+            return stage_a.cmp(&stage_b);
+        }
+        match priority {
+            crate::sync::types::TransferPriority::SmallestFirst => {
+                let size_a = action_size(a);
+                let size_b = action_size(b);
+                size_a.cmp(&size_b).then_with(|| action_path(a).cmp(&action_path(b)))
+            }
+            crate::sync::types::TransferPriority::LargestFirst => {
+                let size_a = action_size(a);
+                let size_b = action_size(b);
+                size_b.cmp(&size_a).then_with(|| action_path(a).cmp(&action_path(b)))
+            }
+            crate::sync::types::TransferPriority::NewestFirst => {
+                let mtime_a = action_mtime(a);
+                let mtime_b = action_mtime(b);
+                mtime_b.cmp(&mtime_a).then_with(|| action_path(a).cmp(&action_path(b)))
+            }
+            crate::sync::types::TransferPriority::OrderAlpha => {
+                action_path(a).cmp(&action_path(b))
+            }
+        }
+    });
+}
+
+fn action_stage(a: &Action) -> u8 {
+    match a {
+        Action::MoveLocal { .. } => 0,
+        Action::DeleteLocal { .. } | Action::DeleteRemote { .. } => 1,
+        Action::Upload { .. }
+        | Action::Download { .. }
+        | Action::MoveRemote { .. }
+        | Action::Conflict { .. }
+        | Action::LocalWinsOverDelete { .. }
+        | Action::RemoteWinsOverDelete { .. } => 2,
+        Action::Identical { .. } => 3,
+    }
+}
+
+fn action_size(a: &Action) -> u64 {
+    match a {
+        Action::Upload { meta, .. }
+        | Action::Download { meta, .. }
+        | Action::MoveLocal { meta, .. }
+        | Action::MoveRemote { meta, .. }
+        | Action::Identical { meta, .. }
+        | Action::LocalWinsOverDelete { local: meta, .. }
+        | Action::RemoteWinsOverDelete { remote: meta, .. } => meta.size,
+        Action::Conflict { remote, .. } => remote.size,
+        Action::DeleteLocal { .. } | Action::DeleteRemote { .. } => 0,
+    }
+}
+
+fn action_mtime(a: &Action) -> i64 {
+    match a {
+        Action::Upload { meta, .. }
+        | Action::Download { meta, .. }
+        | Action::MoveLocal { meta, .. }
+        | Action::MoveRemote { meta, .. }
+        | Action::Identical { meta, .. }
+        | Action::LocalWinsOverDelete { local: meta, .. }
+        | Action::RemoteWinsOverDelete { remote: meta, .. } => meta.mtime_ms,
+        Action::Conflict { remote, .. } => remote.mtime_ms,
+        Action::DeleteLocal { .. } | Action::DeleteRemote { .. } => 0,
     }
 }
 
@@ -971,6 +1294,9 @@ mod tests {
             sync_mode: crate::sync::types::SyncMode::Manual,
             interval_secs: 3600,
             encryption: Default::default(),
+            transfer_priority: Default::default(),
+            max_file_size_mb: None,
+            ignore_hidden: false,
             enabled: true,
         }
     }
@@ -999,6 +1325,7 @@ mod tests {
             settings: Default::default(),
             db,
             events: sink,
+            paused: Arc::new(AtomicBool::new(false)),
         };
 
         // 预置基线 = 本地 v1（三方对比：本地与基线一致，远端有新版）
@@ -1086,6 +1413,7 @@ mod tests {
             settings: Default::default(),
             db,
             events: sink,
+            paused: Arc::new(AtomicBool::new(false)),
         };
 
         let store = MemStore::new();
@@ -1098,5 +1426,241 @@ mod tests {
         let m = store.read_manifest().await.unwrap().unwrap();
         assert!(m.files.contains_key("a.txt"));
         assert!(manifest_stamp_of(&m).starts_with("v"));
+    }
+
+    fn seed_baseline_from_local(engine: &SyncEngine, local: &Path, rel: &str) {
+        let p = local.join(rel);
+        let meta = std::fs::metadata(&p).unwrap();
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut tree = crate::sync::types::FileTree::new();
+        tree.insert(
+            rel.to_string(),
+            FileMeta {
+                size: meta.len(),
+                mtime_ms,
+                hash: crate::sync::scanner::hash_file(&p).unwrap(),
+            },
+        );
+        engine.db.replace_baseline(&tree).unwrap();
+    }
+
+    /// 端到端：远端重命名 + 本地源文件被占用（无共享删除）→
+    /// MoveLocal 降级为「共享读复制 + 源挂起」，不计失败；
+    /// 占用释放后下一轮源文件自动删除，最终收敛。
+    #[tokio::test]
+    async fn locked_source_move_degrades_to_copy() {
+        let data_root = std::env::temp_dir().join("synccloud-e2e-shared");
+        let local = data_root.join("local-move");
+        let _ = std::fs::remove_dir_all(&local);
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("old.txt"), b"shared-content").unwrap();
+        crate::config::set_app_data_dir_in_memory(data_root.clone());
+
+        let folder = test_folder(&local);
+        let db = StateDb::open(&crate::config::folder_data_dir(&folder.id).join("state.db")).unwrap();
+        let (sink, _rx) = EventSink::new();
+        let mut engine = SyncEngine {
+            folder,
+            device_id: "device-a".into(),
+            device_name: "DeviceA".into(),
+            settings: Default::default(),
+            db,
+            events: sink,
+            paused: Arc::new(AtomicBool::new(false)),
+        };
+        seed_baseline_from_local(&engine, &local, "old.txt");
+
+        // 远端：old.txt 已重命名为 new.txt（内容相同）
+        let store = MemStore::new();
+        let meta = store.seed_file("new.txt", b"shared-content");
+        store.write_manifest_with(vec![("new.txt".into(), meta)]);
+
+        // 以「允许共享读写但不允许共享删除」的方式持有源文件 → rename/POSIX 替换必败
+        #[cfg(target_os = "windows")]
+        let guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1 | 0x2) // READ | WRITE，不含 DELETE
+                .open(local.join("old.txt"))
+                .unwrap()
+        };
+
+        // 第一轮：降级为共享读复制，目标就位，源挂起不计失败
+        let report = engine.run_cycle(&store).await;
+        assert_eq!(report.failed, 0, "源被占用的移动不应计为失败");
+        assert_eq!(
+            std::fs::read(local.join("new.txt")).unwrap(),
+            b"shared-content",
+            "降级复制后目标应就位"
+        );
+        assert!(local.join("old.txt").exists(), "占用期间源文件保留");
+        let m = store.read_manifest().await.unwrap().unwrap();
+        assert!(m.files.contains_key("new.txt"), "manifest 应含新路径");
+        assert!(!m.files.contains_key("old.txt"), "manifest 不应再含旧路径");
+
+        // 释放占用
+        #[cfg(target_os = "windows")]
+        drop(guard);
+
+        // 第二轮：残留源文件重新规划为 DeleteLocal，占用释放后删除收敛
+        let report2 = engine.run_cycle(&store).await;
+        assert_eq!(report2.failed, 0);
+        assert!(!local.join("old.txt").exists(), "释放后源文件应被删除");
+        assert_eq!(
+            std::fs::read(local.join("new.txt")).unwrap(),
+            b"shared-content"
+        );
+    }
+
+    /// 端到端：远端已删 + 本地被独占锁定 → DeleteLocal 挂起不计失败，
+    /// 占用释放后下一轮自动删除，最终收敛。
+    #[tokio::test]
+    async fn locked_delete_defers_without_failure() {
+        let data_root = std::env::temp_dir().join("synccloud-e2e-shared");
+        let local = data_root.join("local-del");
+        let _ = std::fs::remove_dir_all(&local);
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("doomed.txt"), b"to-be-deleted").unwrap();
+        crate::config::set_app_data_dir_in_memory(data_root.clone());
+
+        let folder = test_folder(&local);
+        let db = StateDb::open(&crate::config::folder_data_dir(&folder.id).join("state.db")).unwrap();
+        let (sink, _rx) = EventSink::new();
+        let mut engine = SyncEngine {
+            folder,
+            device_id: "device-a".into(),
+            device_name: "DeviceA".into(),
+            settings: Default::default(),
+            db,
+            events: sink,
+            paused: Arc::new(AtomicBool::new(false)),
+        };
+        seed_baseline_from_local(&engine, &local, "doomed.txt");
+
+        // 远端：doomed.txt 已被删除
+        let store = MemStore::new();
+        store.write_manifest_with(vec![]);
+
+        // 以「允许共享读写但不允许共享删除」的方式持有文件
+        #[cfg(target_os = "windows")]
+        let guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1 | 0x2)
+                .open(local.join("doomed.txt"))
+                .unwrap()
+        };
+
+        // 第一轮：删除挂起（不计失败、不归档重复），文件保留
+        let report = engine.run_cycle(&store).await;
+        assert_eq!(report.failed, 0, "被占用的删除不应计为失败");
+        assert!(local.join("doomed.txt").exists(), "占用期间文件应保留");
+
+        // 释放占用
+        #[cfg(target_os = "windows")]
+        drop(guard);
+
+        // 第二轮：重新规划删除并成功，回收站有归档
+        let report2 = engine.run_cycle(&store).await;
+        assert_eq!(report2.failed, 0);
+        assert!(!local.join("doomed.txt").exists(), "释放后文件应被删除");
+    }
+
+    #[tokio::test]
+    async fn test_pause_halts_cycle() {
+        let data_root = std::env::temp_dir().join("synccloud-test-pause");
+        let local = data_root.join("local-pause");
+        let _ = std::fs::remove_dir_all(&local);
+        std::fs::create_dir_all(&local).unwrap();
+        crate::config::set_app_data_dir_in_memory(data_root.clone());
+        std::fs::write(local.join("file.txt"), b"data").unwrap();
+
+        let folder = test_folder(&local);
+        let db = StateDb::open(&crate::config::folder_data_dir(&folder.id).join("state.db")).unwrap();
+        let (sink, _rx) = EventSink::new();
+        let paused = Arc::new(AtomicBool::new(true)); // 初始即为暂停状态
+        let mut engine = SyncEngine {
+            folder,
+            device_id: "device-pause".into(),
+            device_name: "DevicePause".into(),
+            settings: Default::default(),
+            db,
+            events: sink,
+            paused: paused.clone(),
+        };
+
+        let store = MemStore::new();
+        let r = engine.run_cycle(&store).await;
+        assert_eq!(r.skipped, 1, "处于暂停状态的引擎执行 run_cycle 应当直接跳过");
+        assert_eq!(r.uploaded, 0);
+
+        // 恢复后可正常同步
+        paused.store(false, Ordering::Relaxed);
+        let r2 = engine.run_cycle(&store).await;
+        assert_eq!(r2.uploaded, 1);
+    }
+
+    #[tokio::test]
+    async fn test_force_push_overwrites_remote_bypassing_guard() {
+        let data_root = std::env::temp_dir().join("synccloud-test-force-push");
+        let local = data_root.join("local-fp");
+        let _ = std::fs::remove_dir_all(&local);
+        std::fs::create_dir_all(&local).unwrap();
+        crate::config::set_app_data_dir_in_memory(data_root.clone());
+
+        // 本地只保留 1 个文件
+        std::fs::write(local.join("keep.txt"), b"local-content").unwrap();
+
+        let folder = test_folder(&local);
+        let db = StateDb::open(&crate::config::folder_data_dir(&folder.id).join("state.db")).unwrap();
+        let (sink, _rx) = EventSink::new();
+        let mut engine = SyncEngine {
+            folder,
+            device_id: "device-fp".into(),
+            device_name: "DeviceFP".into(),
+            settings: GlobalSettings {
+                deletion_guard: true,
+                deletion_guard_threshold: 10, // 阈值设小方便测试
+                ..Default::default()
+            },
+            db,
+            events: sink,
+            paused: Arc::new(AtomicBool::new(false)),
+        };
+
+        // 模拟远端与旧基线有 60 个文件（其中 59 个在本地已删除）
+        let mut old_tree = crate::sync::types::FileTree::new();
+        let mut remote_files = Vec::new();
+        for i in 0..60 {
+            let name = format!("file_{i}.txt");
+            let m = FileMeta { size: 10, mtime_ms: 100, hash: format!("h{i}") };
+            old_tree.insert(name.clone(), m.clone());
+            remote_files.push((name, m));
+        }
+        engine.db.replace_baseline(&old_tree).unwrap();
+
+        let store = MemStore::new();
+        store.write_manifest_with(remote_files);
+
+        // 1. 普通同步：由于删除了 60 个文件，触发安全熔断，远端删除被拦截挂起，但本地新增文件可正常上传
+        let r_normal = engine.run_cycle(&store).await;
+        assert_eq!(r_normal.deleted_remote, 0, "普通同步应被安全防误删拦截");
+        assert_eq!(r_normal.uploaded, 1, "普通同步先行上传了本地新文件");
+
+        // 2. 强制推送：用户显式授权覆盖远端，绕过熔断，将远端 60 个文件彻底删除
+        let r_forced = engine.run_cycle_force_push(&store).await;
+        assert_eq!(r_forced.deleted_remote, 60, "强制推送应成功删除远端 60 项");
+
+        // 验证远端 manifest 只剩下本地保留的这 1 项
+        let m = store.read_manifest().await.unwrap().unwrap();
+        assert_eq!(m.files.len(), 1);
+        assert!(m.files.contains_key("keep.txt"));
     }
 }

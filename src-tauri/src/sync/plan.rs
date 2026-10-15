@@ -16,6 +16,10 @@ pub enum Action {
     DeleteRemote { path: RelPath },
     /// 远端已删且本地未变 → 本地删除
     DeleteLocal { path: RelPath },
+    /// 本地重命名/移动（对标 FreeFileSync 与 GoodSync，零网络下载）
+    MoveLocal { from: RelPath, to: RelPath, meta: FileMeta },
+    /// 远端重命名/移动（服务端移动或增量覆盖，避免重新上传）
+    MoveRemote { from: RelPath, to: RelPath, meta: FileMeta },
     /// 双方内容一致（如两台机器创建了相同内容）→ 仅更新基线
     Identical { path: RelPath, meta: FileMeta },
     /// 双方都改且内容不同 → 冲突：
@@ -34,6 +38,8 @@ pub struct PlanStats {
     pub downloads: usize,
     pub delete_local: usize,
     pub delete_remote: usize,
+    #[serde(default)]
+    pub moved: usize,
     pub conflicts: usize,
     pub identical: usize,
     pub unchanged: usize,
@@ -71,6 +77,18 @@ pub fn compare(
     baseline: &FileTree,
     direction: Direction,
     conflict_policy: ConflictPolicy,
+) -> SyncPlan {
+    compare_with_ignore(local, remote, baseline, direction, conflict_policy, &|_| false)
+}
+
+/// 支持路径排除判断的三方对比。
+pub fn compare_with_ignore(
+    local: &FileTree,
+    remote: Option<&Manifest>,
+    baseline: &FileTree,
+    direction: Direction,
+    conflict_policy: ConflictPolicy,
+    is_ignored: &dyn Fn(&str) -> bool,
 ) -> SyncPlan {
     let mut actions = Vec::new();
     let mut stats = PlanStats::default();
@@ -267,6 +285,30 @@ pub fn compare(
             }
             (None, Some(rm)) => {
                 // 本地无、远端有 = 本地被删除（相对基线）或远端新文件
+                // 若该路径命中排除规则（例如隐藏文件开启 ignore_hidden 或匹配用户规则）：
+                if is_ignored(path) {
+                    match b {
+                        Some(_) => {
+                            // 基线中曾经有，现在本地已删除或被用户忽略：
+                            // 双向/镜像/仅上传模式下，推动删除存储后端中的残留文件，绝不能逆向拉取到本地！
+                            match direction {
+                                Direction::Bidirectional | Direction::Mirror | Direction::UploadOnly => {
+                                    stats.delete_remote += 1;
+                                    actions.push(Action::DeleteRemote { path: path.clone() });
+                                }
+                                _ => {
+                                    stats.unchanged += 1;
+                                }
+                            }
+                        }
+                        None => {
+                            // 远端存在但本地已配置排除且基线无记录：直接跳过，绝不下载拉取到本地
+                            stats.unchanged += 1;
+                        }
+                    }
+                    continue;
+                }
+
                 match b {
                     None => {
                         // 远端新文件
@@ -332,7 +374,158 @@ pub fn compare(
         }
     }
 
+    // 移动与重命名感知检测（对标 FreeFileSync 与 GoodSync）
+    detect_moves(
+        &mut actions,
+        &mut stats,
+        local,
+        remote_files,
+        baseline,
+        direction,
+    );
+
     SyncPlan { actions, stats }
+}
+
+/// 移动与重命名感知检测（对标 FreeFileSync 与 GoodSync）。
+/// 当一侧存在删除、另一侧存在新增，且内容哈希和大小一致时，
+/// 将其智能升格为移动/重命名动作，免去全量重新上传或下载。
+fn detect_moves(
+    actions: &mut Vec<Action>,
+    stats: &mut PlanStats,
+    local: &FileTree,
+    _remote: Option<&FileTree>,
+    baseline: &FileTree,
+    direction: Direction,
+) {
+    if direction == Direction::Contribute {
+        // Contribute 模式只增不删，不参与移动消除
+        return;
+    }
+
+    // 1. 探测远端移动/重命名 -> 升格为本地 MoveLocal（免网络下载）
+    if direction == Direction::Bidirectional || direction == Direction::DownloadOnly {
+        let mut del_locals: Vec<(usize, RelPath)> = Vec::new();
+        let mut downloads: Vec<(usize, RelPath, FileMeta)> = Vec::new();
+
+        for (idx, action) in actions.iter().enumerate() {
+            match action {
+                Action::DeleteLocal { path } => {
+                    del_locals.push((idx, path.clone()));
+                }
+                Action::Download { path, meta } if meta.size > 0 && !meta.hash.is_empty() => {
+                    downloads.push((idx, path.clone(), meta.clone()));
+                }
+                _ => {}
+            }
+        }
+
+        let mut matched_del = std::collections::HashSet::new();
+        let mut matched_down = std::collections::HashSet::new();
+        let mut new_moves = Vec::new();
+
+        for &(down_idx, ref to_path, ref rm) in &downloads {
+            // 匹配本地仍存有该内容（待删）的原文件
+            let candidate = del_locals.iter().find(|(del_idx, from_path)| {
+                !matched_del.contains(del_idx)
+                    && local.get(from_path).map(|lm| lm.hash == rm.hash).unwrap_or(false)
+            });
+
+            if let Some(&(del_idx, ref from_path)) = candidate {
+                matched_del.insert(del_idx);
+                matched_down.insert(down_idx);
+                new_moves.push((
+                    del_idx,
+                    down_idx,
+                    Action::MoveLocal {
+                        from: from_path.clone(),
+                        to: to_path.clone(),
+                        meta: rm.clone(),
+                    },
+                    rm.size,
+                ));
+            }
+        }
+
+        if !new_moves.is_empty() {
+            let mut remove_indices: Vec<usize> = Vec::new();
+            for (del_idx, down_idx, move_action, size) in new_moves {
+                remove_indices.push(del_idx);
+                remove_indices.push(down_idx);
+                actions.push(move_action);
+                stats.delete_local = stats.delete_local.saturating_sub(1);
+                stats.downloads = stats.downloads.saturating_sub(1);
+                stats.bytes_down = stats.bytes_down.saturating_sub(size);
+                stats.moved += 1;
+            }
+            remove_indices.sort_unstable();
+            for idx in remove_indices.into_iter().rev() {
+                actions.remove(idx);
+            }
+        }
+    }
+
+    // 2. 探测本地移动/重命名 -> 升格为远端 MoveRemote（免全量重新上传）
+    if direction == Direction::Bidirectional || direction == Direction::Mirror || direction == Direction::UploadOnly {
+        let mut del_remotes: Vec<(usize, RelPath)> = Vec::new();
+        let mut uploads: Vec<(usize, RelPath, FileMeta)> = Vec::new();
+
+        for (idx, action) in actions.iter().enumerate() {
+            match action {
+                Action::DeleteRemote { path } => {
+                    del_remotes.push((idx, path.clone()));
+                }
+                Action::Upload { path, meta } if meta.size > 0 && !meta.hash.is_empty() => {
+                    uploads.push((idx, path.clone(), meta.clone()));
+                }
+                _ => {}
+            }
+        }
+
+        let mut matched_del = std::collections::HashSet::new();
+        let mut matched_up = std::collections::HashSet::new();
+        let mut new_moves = Vec::new();
+
+        for &(up_idx, ref to_path, ref lm) in &uploads {
+            // 匹配基线中记录的原内容且本地已删的远端项
+            let candidate = del_remotes.iter().find(|(del_idx, from_path)| {
+                !matched_del.contains(del_idx)
+                    && baseline.get(from_path).map(|bm| bm.hash == lm.hash).unwrap_or(false)
+            });
+
+            if let Some(&(del_idx, ref from_path)) = candidate {
+                matched_del.insert(del_idx);
+                matched_up.insert(up_idx);
+                new_moves.push((
+                    del_idx,
+                    up_idx,
+                    Action::MoveRemote {
+                        from: from_path.clone(),
+                        to: to_path.clone(),
+                        meta: lm.clone(),
+                    },
+                    lm.size,
+                ));
+            }
+        }
+
+        if !new_moves.is_empty() {
+            let mut remove_indices: Vec<usize> = Vec::new();
+            for (del_idx, up_idx, move_action, size) in new_moves {
+                remove_indices.push(del_idx);
+                remove_indices.push(up_idx);
+                actions.push(move_action);
+                stats.delete_remote = stats.delete_remote.saturating_sub(1);
+                stats.uploads = stats.uploads.saturating_sub(1);
+                stats.bytes_up = stats.bytes_up.saturating_sub(size);
+                stats.moved += 1;
+            }
+            remove_indices.sort_unstable();
+            for idx in remove_indices.into_iter().rev() {
+                actions.remove(idx);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +571,8 @@ mod tests {
                 Action::Download { .. } => "download",
                 Action::DeleteRemote { .. } => "del_remote",
                 Action::DeleteLocal { .. } => "del_local",
+                Action::MoveLocal { .. } => "move_local",
+                Action::MoveRemote { .. } => "move_remote",
                 Action::Identical { .. } => "identical",
                 Action::Conflict { .. } => "conflict",
                 Action::RemoteWinsOverDelete { .. } => "remote_wins",
@@ -601,5 +796,75 @@ mod tests {
         assert_eq!(p.stats.uploads, 2);
         assert_eq!(p.stats.delete_local, 1);
         assert_eq!(p.stats.unchanged, 2);
+    }
+
+    #[test]
+    fn test_detect_remote_rename_to_move_local() {
+        // 基线：old.txt
+        let base = tree(&[("old.txt", meta("content_hash", 1024, 100))]);
+        // 远端重命名为 new.txt，old.txt 已不存在
+        let remote = manifest(tree(&[("new.txt", meta("content_hash", 1024, 200))]));
+        // 本地仍是 old.txt
+        let local = tree(&[("old.txt", meta("content_hash", 1024, 100))]);
+
+        let p = plan_with(local, Some(remote), base);
+        assert_eq!(kinds(&p), ["move_local"]);
+        assert_eq!(p.stats.moved, 1);
+        assert_eq!(p.stats.downloads, 0);
+        assert_eq!(p.stats.delete_local, 0);
+        assert_eq!(p.stats.bytes_down, 0);
+    }
+
+    #[test]
+    fn test_detect_local_rename_to_move_remote() {
+        // 基线：doc.docx
+        let base = tree(&[("doc.docx", meta("doc_hash", 2048, 100))]);
+        // 远端仍是 doc.docx
+        let remote = manifest(tree(&[("doc.docx", meta("doc_hash", 2048, 100))]));
+        // 本地已重命名为 renamed.docx，原 doc.docx 已不存在
+        let local = tree(&[("renamed.docx", meta("doc_hash", 2048, 200))]);
+
+        let p = plan_with(local, Some(remote), base);
+        assert_eq!(kinds(&p), ["move_remote"]);
+        assert_eq!(p.stats.moved, 1);
+        assert_eq!(p.stats.uploads, 0);
+        assert_eq!(p.stats.delete_remote, 0);
+        assert_eq!(p.stats.bytes_up, 0);
+    }
+
+    #[test]
+    fn test_ignored_file_on_remote_never_downloads() {
+        // 远端有 .obsidian/main.js，本地无，基线无；该文件被忽略
+        let remote = manifest(tree(&[(".obsidian/main.js", meta("hash1", 100, 100))]));
+        let p = compare_with_ignore(
+            &tree(&[]),
+            Some(&remote),
+            &tree(&[]),
+            Direction::Bidirectional,
+            ConflictPolicy::BothCopies,
+            &|path| path.starts_with('.'),
+        );
+        // 绝不能判定为 download，应直接忽略跳过
+        assert_eq!(kinds(&p), Vec::<String>::new());
+        assert_eq!(p.stats.downloads, 0);
+    }
+
+    #[test]
+    fn test_ignored_file_in_baseline_deletes_remote() {
+        // 基线有 .obsidian/main.js，本地已删除（或新配置了忽略），远端仍存在
+        let base = tree(&[(".obsidian/main.js", meta("hash1", 100, 100))]);
+        let remote = manifest(base.clone());
+        let p = compare_with_ignore(
+            &tree(&[]),
+            Some(&remote),
+            &base,
+            Direction::Bidirectional,
+            ConflictPolicy::BothCopies,
+            &|path| path.starts_with('.'),
+        );
+        // 双向同步下应推送删除存储后端中的文件，绝不重新下载到本地
+        assert_eq!(kinds(&p), ["del_remote"]);
+        assert_eq!(p.stats.delete_remote, 1);
+        assert_eq!(p.stats.downloads, 0);
     }
 }

@@ -30,6 +30,7 @@ pub struct FolderStatus {
 #[derive(Clone)]
 pub enum FolderCmd {
     SyncNow,
+    ForcePush,
     Pause,
     Resume,
 }
@@ -99,21 +100,29 @@ impl FolderManager {
         // 事件转发：引擎事件 → broadcast（UI 订阅）+ 状态更新
         let (sink, mut sink_rx) = EventSink::new();
         let forward_folder = folder.clone();
+        let paused_event = paused.clone();
         tokio::spawn(async move {
             while let Some(ev) = sink_rx.recv().await {
                 // 状态机推进
                 match &ev {
                     SyncEvent::CycleStarted { .. } => {
-                        status_task.lock().await.state = "syncing".into();
+                        let mut s = status_task.lock().await;
+                        if !paused_event.load(Ordering::Relaxed) {
+                            s.state = "syncing".into();
+                        }
                     }
                     SyncEvent::Error { message, .. } => {
                         let mut s = status_task.lock().await;
-                        s.state = if s.state == "paused" { "paused".into() } else { "error".into() };
+                        s.state = if s.state == "paused" || paused_event.load(Ordering::Relaxed) {
+                            "paused".into()
+                        } else {
+                            "error".into()
+                        };
                         s.last_error = Some(message.clone());
                     }
                     SyncEvent::CycleDone { report, .. } => {
                         let mut s = status_task.lock().await;
-                        if s.state != "paused" {
+                        if s.state != "paused" && !paused_event.load(Ordering::Relaxed) {
                             s.state = "idle".into();
                         }
                         s.last_sync_at = Some(chrono::Local::now().to_rfc3339());
@@ -172,6 +181,7 @@ impl FolderManager {
                 settings: cfg_snap,
                 db,
                 events: sink.clone(),
+                paused: paused_task.clone(),
             };
 
             // 启动即同步一次
@@ -183,7 +193,20 @@ impl FolderManager {
                     cmd = cmd_rx.recv() => {
                         match cmd {
                             Some(FolderCmd::SyncNow) => {
-                                engine.run_cycle(store.as_ref()).await;
+                                // 用户显式点击「立即同步」，强制执行全量检查，若原先为暂停则自动恢复
+                                if paused_task.load(Ordering::Relaxed) {
+                                    paused_task.store(false, Ordering::Relaxed);
+                                    status_task.lock().await.state = "idle".into();
+                                }
+                                engine.run_cycle_forced(store.as_ref()).await;
+                            }
+                            Some(FolderCmd::ForcePush) => {
+                                // 用户显式点击「强制推送」，以本地完全覆盖远端
+                                if paused_task.load(Ordering::Relaxed) {
+                                    paused_task.store(false, Ordering::Relaxed);
+                                    status_task.lock().await.state = "idle".into();
+                                }
+                                engine.run_cycle_force_push(store.as_ref()).await;
                             }
                             Some(FolderCmd::Pause) => {
                                 paused_task.store(true, Ordering::Relaxed);
@@ -239,6 +262,7 @@ impl FolderManager {
             settings: settings.clone(),
             db,
             events: sink,
+            paused: Arc::new(AtomicBool::new(false)),
         };
         engine.analyze(store.as_ref()).await
     }
@@ -251,7 +275,22 @@ impl FolderManager {
     pub async fn sync_now(&self, id: &Uuid) -> bool {
         let folders = self.folders.lock().await;
         if let Some(h) = folders.get(id) {
+            // 用户主动点击同步：自动解除暂停并给前端即时的 syncing 状态反馈
+            h.paused.store(false, Ordering::Relaxed);
+            h.status.lock().await.state = "syncing".into();
             h.cmd_tx.try_send(FolderCmd::SyncNow).is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// 强制推送同步：以本地当前状态强制完全覆盖远端。
+    pub async fn force_push(&self, id: &Uuid) -> bool {
+        let folders = self.folders.lock().await;
+        if let Some(h) = folders.get(id) {
+            h.paused.store(false, Ordering::Relaxed);
+            h.status.lock().await.state = "syncing".into();
+            h.cmd_tx.try_send(FolderCmd::ForcePush).is_ok()
         } else {
             false
         }
@@ -260,6 +299,8 @@ impl FolderManager {
     pub async fn pause_folder(&self, id: &Uuid) {
         let folders = self.folders.lock().await;
         if let Some(h) = folders.get(id) {
+            h.paused.store(true, Ordering::Relaxed);
+            h.status.lock().await.state = "paused".into();
             let _ = h.cmd_tx.try_send(FolderCmd::Pause);
         }
     }
@@ -267,6 +308,8 @@ impl FolderManager {
     pub async fn resume_folder(&self, id: &Uuid) {
         let folders = self.folders.lock().await;
         if let Some(h) = folders.get(id) {
+            h.paused.store(false, Ordering::Relaxed);
+            h.status.lock().await.state = "idle".into();
             let _ = h.cmd_tx.try_send(FolderCmd::Resume);
         }
     }
@@ -275,6 +318,8 @@ impl FolderManager {
     pub async fn pause_all(&self) {
         let folders = self.folders.lock().await;
         for h in folders.values() {
+            h.paused.store(true, Ordering::Relaxed);
+            h.status.lock().await.state = "paused".into();
             let _ = h.cmd_tx.try_send(FolderCmd::Pause);
         }
     }
@@ -283,6 +328,8 @@ impl FolderManager {
     pub async fn resume_all(&self) {
         let folders = self.folders.lock().await;
         for h in folders.values() {
+            h.paused.store(false, Ordering::Relaxed);
+            h.status.lock().await.state = "idle".into();
             let _ = h.cmd_tx.try_send(FolderCmd::Resume);
         }
     }

@@ -4,6 +4,7 @@
 export type Direction = "bidirectional" | "mirror" | "contribute" | "upload_only" | "download_only";
 export type ConflictPolicy = "both_copies" | "newest_wins";
 export type SyncMode = "realtime" | "interval" | "manual";
+export type TransferPriority = "smallest_first" | "newest_first" | "largest_first" | "order_alpha";
 export type EncryptionMode = "off" | "passphrase";
 
 export interface BackendConfig {
@@ -45,6 +46,9 @@ export interface FolderConfig {
   syncMode: SyncMode;
   intervalSecs: number;
   encryption: { mode: EncryptionMode };
+  transferPriority?: TransferPriority;
+  maxFileSizeMb?: number | null;
+  ignoreHidden?: boolean;
   enabled: boolean;
 }
 
@@ -53,6 +57,7 @@ export interface CycleReport {
   downloaded: number;
   deletedLocal: number;
   deletedRemote: number;
+  moved?: number;
   conflicts: number;
   conflictsResolvedContentIdentical: number;
   failed: number;
@@ -91,6 +96,8 @@ export interface GlobalSettings {
   deletionGuardThreshold: number;
   customLogDir?: string | null;
   activityRetentionDays?: number;
+  maxUploadKbps: number;
+  maxDownloadKbps: number;
 }
 
 export interface ActivityItem {
@@ -105,6 +112,11 @@ export interface ActivityItem {
   reason?: string;
   copy?: string;
   timestamp: number;
+}
+
+export interface ActivityPage {
+  items: ActivityItem[];
+  total: number;
 }
 
 export interface AppInfo {
@@ -203,6 +215,8 @@ export type PlanActionKind =
   | "download"
   | "delete_remote"
   | "delete_local"
+  | "move_local"
+  | "move_remote"
   | "conflict"
   | "identical"
   | "remote_wins_over_delete"
@@ -210,7 +224,9 @@ export type PlanActionKind =
 
 export interface PlanAction {
   kind: PlanActionKind;
-  path: string;
+  path?: string;
+  from?: string;
+  to?: string;
   meta?: FileMeta;
   local?: FileMeta;
   remote?: FileMeta;
@@ -221,6 +237,7 @@ export interface PlanStats {
   downloads: number;
   deleteLocal: number;
   deleteRemote: number;
+  moved?: number;
   conflicts: number;
   identical: number;
   unchanged: number;

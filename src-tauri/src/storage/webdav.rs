@@ -54,8 +54,8 @@ impl WebDavStore {
             path.push_str("/synccloud/");
             base.set_path(&path);
         }
-        // 元数据区与仓库根同级，用户在同步目录内看不到任何引擎文件
-        let meta = base.join("../.synccloud/synccloud/").expect("join meta path");
+        // 严格位于用户指定的同步目录内部（.synccloud/），绝不向指定目录外部上传任何文件
+        let meta = base.join(".synccloud/").expect("join meta path");
         let auth = (!username.is_empty() || !password.is_empty())
             .then(|| (username, password));
         Self { http, base, meta, auth }
@@ -89,26 +89,19 @@ impl WebDavStore {
         rb
     }
 
-    /// MKCOL 元数据目录（逐级，已存在 405/409 容忍）。
+    /// MKCOL 元数据目录（已存在 405/409 容忍）。
     async fn ensure_meta_dir(&self) -> anyhow::Result<()> {
-        let parent = {
-            let s = self.base.as_str().trim_end_matches('/');
-            s.strip_suffix("/synccloud").unwrap_or(s).to_string()
-        };
-        for seg in ["/.synccloud", "/.synccloud/synccloud"] {
-            let u = Url::parse(&format!("{parent}{seg}"))
-                .map_err(|e| anyhow::anyhow!("元数据 URL 非法: {e}"))?;
-            let status = self
-                .request_url(Method::from_bytes(b"MKCOL")?, u)
-                .send()
-                .await?
-                .status();
-            let ok = status.is_success()
-                || status == StatusCode::METHOD_NOT_ALLOWED
-                || status == StatusCode::CONFLICT;
-            if !ok {
-                anyhow::bail!("MKCOL 元数据目录失败: HTTP {status}");
-            }
+        let u = self.meta_url_of("");
+        let status = self
+            .request_url(Method::from_bytes(b"MKCOL")?, u)
+            .send()
+            .await?
+            .status();
+        let ok = status.is_success()
+            || status == StatusCode::METHOD_NOT_ALLOWED
+            || status == StatusCode::CONFLICT;
+        if !ok {
+            anyhow::bail!("MKCOL 元数据目录失败: HTTP {status}");
         }
         Ok(())
     }
@@ -427,6 +420,30 @@ impl RemoteStore for WebDavStore {
             Ok(())
         } else {
             anyhow::bail!("删除 WebDAV:{path} 失败: HTTP {status}");
+        }
+    }
+
+    async fn move_file(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        if let Some(parent) = Path::new(to).parent() {
+            let parent_str = parent.to_string_lossy().replace('\\', "/");
+            let parent_str = parent_str.trim_start_matches('/').to_string();
+            if !parent_str.is_empty() {
+                self.mkcol_all(&parent_str).await?;
+            }
+        }
+        let dest_url = self.url_of(to).to_string();
+        let move_method = Method::from_bytes(b"MOVE")?;
+        let status = self
+            .request(move_method, from)
+            .header("Destination", dest_url)
+            .header("Overwrite", "T")
+            .send()
+            .await?
+            .status();
+        if status.is_success() || status == StatusCode::CREATED || status == StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            anyhow::bail!("WebDAV MOVE {from} -> {to} 失败: HTTP {status}");
         }
     }
 

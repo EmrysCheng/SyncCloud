@@ -171,6 +171,9 @@ fn make_device(local: &Path, state_db: &Path, name: &str) -> Device {
         sync_mode: SyncMode::Manual,
         interval_secs: 3600,
         encryption: Default::default(),
+        transfer_priority: Default::default(),
+        max_file_size_mb: None,
+        ignore_hidden: false,
         enabled: true,
     };
     std::fs::create_dir_all(local).unwrap();
@@ -184,6 +187,7 @@ fn make_device(local: &Path, state_db: &Path, name: &str) -> Device {
             settings: Default::default(),
             db,
             events: sink,
+            paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     }
 }

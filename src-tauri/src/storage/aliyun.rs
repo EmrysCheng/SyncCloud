@@ -408,8 +408,8 @@ fn keyring_account(auth_id: &str) -> String {
 impl AliyunStore {
     pub fn new(auth_id: String, remote_dir: String) -> Self {
         let remote_dir = remote_dir.trim_end_matches('/').to_string();
-        // "/Sync" → "/.synccloud/Sync"；根目录同步时退化为 "/.synccloud"
-        let meta_dir = format!("/{}", sibling_meta(&remote_dir));
+        // 严格位于用户指定的同步目录内部（{remote_dir}/.synccloud），绝不向指定目录外上传任何文件
+        let meta_dir = format!("{remote_dir}/.synccloud");
         Self {
             auth_id,
             meta_dir,
@@ -821,7 +821,20 @@ impl RemoteStore for AliyunStore {
     }
 
     async fn read_manifest(&self) -> anyhow::Result<Option<Manifest>> {
-        self.manifest_at(&self.meta_path("manifest.json")).await
+        let internal_path = self.meta_path("manifest.json");
+        if let Some(m) = self.manifest_at(&internal_path).await? {
+            return Ok(Some(m));
+        }
+        // 兼容迁移：若指定同步目录内尚无 manifest，但历史外部兄弟目录存在，读取并迁入内部，同时清理外部旧文件
+        let legacy_sibling = format!("/{}", sibling_meta(&self.remote_dir));
+        let legacy_manifest = format!("{legacy_sibling}/manifest.json");
+        if let Some(legacy) = self.manifest_at(&legacy_manifest).await? {
+            let _ = self.write_manifest(&legacy).await;
+            let _ = self.delete_abs(&legacy_manifest).await;
+            let _ = self.delete_abs(&legacy_sibling).await;
+            return Ok(Some(legacy));
+        }
+        Ok(None)
     }
 
     /// 覆盖上传 = 删除旧文件再创建新文件，file_id 每个版本都不同，

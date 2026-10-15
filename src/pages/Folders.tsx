@@ -4,6 +4,7 @@ import type { BackendConfig, FolderSummary, SyncEvent, SyncPlan } from "../types
 import FolderSettingsModal from "../components/FolderSettingsModal";
 import PlanPreviewModal from "../components/PlanPreviewModal";
 import RecycleBinModal from "../components/RecycleBinModal";
+import ForcePushConfirmModal from "../components/ForcePushConfirmModal";
 
 const BACKEND_LABEL: Record<string, string> = {
   s3: "S3 兼容",
@@ -65,6 +66,7 @@ export default function Folders({
     plan: SyncPlan;
   } | null>(null);
   const [recycleBinFolder, setRecycleBinFolder] = useState<FolderSummary | null>(null);
+  const [forcePushFolder, setForcePushFolder] = useState<FolderSummary | null>(null);
   const [healthMap, setHealthMap] = useState<
     Record<string, { status: "checking" | "ok" | "err"; msg?: string }>
   >({});
@@ -116,10 +118,14 @@ export default function Folders({
     }
   }
 
+  function handleForcePush(f: FolderSummary) {
+    setForcePushFolder(f);
+  }
+
   const anyActive = folders.some((f) => f.status?.state !== "paused");
 
   async function handleSyncAll() {
-    await act(() => api.syncAllFolders());
+    await act(() => api.syncAllFolders(), "all");
   }
 
   async function handleTogglePauseAll() {
@@ -158,8 +164,8 @@ export default function Folders({
           <div className="header-sub">多存储统一对齐 · 差异预演分析与安全同步</div>
         </div>
         <div className="header-actions">
-          <button className="btn btn-sm" onClick={handleSyncAll}>
-            ⟳ 全部立即同步
+          <button className="btn btn-sm" disabled={!!busy} onClick={handleSyncAll}>
+            {busy === "all" ? "⟳ 正在同步全部…" : "⟳ 全部立即同步"}
           </button>
           <button className="btn btn-sm" onClick={handleTogglePauseAll}>
             {anyActive ? "⏸ 全部暂停" : "▶ 全部恢复"}
@@ -211,6 +217,7 @@ export default function Folders({
             analyzing={analyzingId === f.id}
             onToggle={() => setExpanded(expanded === f.id ? null : f.id)}
             onSync={() => act(() => api.syncNow(f.id), f.id)}
+            onForcePush={() => handleForcePush(f)}
             onAnalyze={() => handleAnalyze(f)}
             onPause={() => act(() => api.pauseFolder(f.id), f.id)}
             onResume={() => act(() => api.resumeFolder(f.id), f.id)}
@@ -243,6 +250,19 @@ export default function Folders({
           onExecuteSync={() =>
             act(() => api.syncNow(previewTarget.folder.id), previewTarget.folder.id)
           }
+          onForcePush={() => handleForcePush(previewTarget.folder)}
+        />
+      )}
+
+      {forcePushFolder && (
+        <ForcePushConfirmModal
+          folder={forcePushFolder}
+          onClose={() => setForcePushFolder(null)}
+          onConfirm={async () => {
+            const id = forcePushFolder.id;
+            setForcePushFolder(null);
+            await act(() => api.forcePushFolder(id), id);
+          }}
         />
       )}
     </div>
@@ -312,6 +332,7 @@ function FolderCard({
   analyzing,
   onToggle,
   onSync,
+  onForcePush,
   onAnalyze,
   onPause,
   onResume,
@@ -328,6 +349,7 @@ function FolderCard({
   analyzing: boolean;
   onToggle: () => void;
   onSync: () => void;
+  onForcePush: () => void;
   onAnalyze: () => void;
   onPause: () => void;
   onResume: () => void;
@@ -400,7 +422,7 @@ function FolderCard({
           <div
             style={{
               marginTop: "8px",
-              padding: "10px 12px",
+              padding: "10px 14px",
               borderRadius: "6px",
               background: "#fffbeb",
               border: "1px solid #fde68a",
@@ -409,19 +431,29 @@ function FolderCard({
               display: "flex",
               justifyContent: "space-between",
               alignItems: "center",
+              gap: "12px",
             }}
           >
             <div>
               <strong>🛡️ 误删保护拦截：</strong>
               <span>{safetyEvent.reason}</span>
             </div>
-            <button
-              className="btn btn-sm btn-primary"
-              style={{ marginLeft: "10px", whiteSpace: "nowrap" }}
-              onClick={onAnalyze}
-            >
-              差异分析核验
-            </button>
+            <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
+              <button
+                className="btn btn-sm btn-ghost"
+                style={{ background: "#ffffff", borderColor: "#fcd34d" }}
+                onClick={onAnalyze}
+              >
+                🔍 差异分析核验
+              </button>
+              <button
+                className="btn btn-sm btn-danger"
+                title="以本地当前文件为准，强制从云端彻底删除本地已删除的文件"
+                onClick={onForcePush}
+              >
+                🚀 强制覆盖远端
+              </button>
+            </div>
           </div>
         )}
         {st?.lastError && <div className="folder-error">⚠ {st.lastError}</div>}
@@ -469,8 +501,21 @@ function FolderCard({
         >
           {analyzing ? "🔍 分析中…" : "🔍 分析差异"}
         </button>
-        <button className="btn btn-sm" disabled={busy || analyzing} onClick={onSync}>
-          ⟳ 立即同步
+        <button
+          className="btn btn-sm"
+          disabled={busy || analyzing || syncing}
+          onClick={onSync}
+          title="强制拉取远端元数据执行完整三方对比与同步"
+        >
+          {busy || syncing ? "⟳ 同步中…" : "⟳ 立即同步"}
+        </button>
+        <button
+          className="btn btn-sm btn-ghost"
+          disabled={busy || analyzing || syncing}
+          onClick={onForcePush}
+          title="以本地当前文件为准完全覆盖远端（本地已删的文件将从云端删除，绝不反向拉取）"
+        >
+          🚀 强制推送
         </button>
         {st?.state === "paused" ? (
           <button className="btn btn-sm" disabled={busy} onClick={onResume}>
@@ -591,7 +636,7 @@ function describeEvent(e: SyncEvent): string {
       const rep: any = e.report;
       const took = ((rep.tookMs ?? rep.took_ms ?? 0) / 1000).toFixed(1);
       return rep.skipped > 0
-        ? `⚡ 完成（无变化，已跳过 ${took}s）`
+        ? `⚡ 同步检查完成：本地与云端已对齐，无文件变动（${took}s）`
         : `✓ 完成 ↑${rep.uploaded} ↓${rep.downloaded} ⚠${rep.conflicts} ✗${rep.failed}（${took}s）`;
     }
     case "error":

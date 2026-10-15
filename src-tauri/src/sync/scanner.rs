@@ -29,10 +29,17 @@ pub const BUILTIN_IGNORES: &[&str] = &[
     ".DS_Store",
     "*.crdownload",
     "*.part",
+    "*.db-wal",
+    "*.db-shm",
+    "*.sqlite-wal",
+    "*.sqlite-shm",
 ];
 
 pub struct Scanner<'a> {
     ignore: GlobSet,
+    whitelist: Option<GlobSet>,
+    max_file_size_bytes: Option<u64>,
+    ignore_hidden: bool,
     db: Option<&'a StateDb>,
 }
 
@@ -47,44 +54,90 @@ pub struct ScanStats {
 
 impl<'a> Scanner<'a> {
     pub fn new(extra_rules: &[String], db: Option<&'a StateDb>) -> anyhow::Result<Self> {
-        let mut builder = GlobSetBuilder::new();
+        Self::with_options(extra_rules, db, None, false)
+    }
+
+    pub fn with_options(
+        extra_rules: &[String],
+        db: Option<&'a StateDb>,
+        max_file_size_mb: Option<u64>,
+        ignore_hidden: bool,
+    ) -> anyhow::Result<Self> {
+        let mut ignore_builder = GlobSetBuilder::new();
+        let mut whitelist_builder = GlobSetBuilder::new();
+        let mut has_whitelist = false;
+
         for pat in BUILTIN_IGNORES {
-            builder.add(globset::Glob::new(pat)?);
+            ignore_builder.add(globset::Glob::new(pat)?);
         }
         for rule in extra_rules {
             let r = rule.trim();
             if r.is_empty() {
                 continue;
             }
-            // `node_modules/` 这类目录规则去掉尾斜杠后按目录名匹配，
-            // 其下内容由逐前缀段检查覆盖。
-            let r = r.trim_end_matches('/');
-            if r.is_empty() {
-                continue;
+            // 支持 Syncthing .stignore 风格的否定规则（!开头的白名单覆盖规则）
+            if let Some(white) = r.strip_prefix('!') {
+                let w = white.trim().trim_end_matches('/');
+                if !w.is_empty() {
+                    whitelist_builder.add(globset::Glob::new(w)?);
+                    has_whitelist = true;
+                }
+            } else {
+                let r = r.trim_end_matches('/');
+                if !r.is_empty() {
+                    ignore_builder.add(globset::Glob::new(r)?);
+                }
             }
-            builder.add(globset::Glob::new(r)?);
         }
+        let whitelist = if has_whitelist {
+            Some(whitelist_builder.build()?)
+        } else {
+            None
+        };
         Ok(Self {
-            ignore: builder.build()?,
+            ignore: ignore_builder.build()?,
+            whitelist,
+            max_file_size_bytes: max_file_size_mb.and_then(|mb| if mb > 0 { Some(mb * 1024 * 1024) } else { None }),
+            ignore_hidden,
             db,
         })
     }
 
     /// 判断相对路径是否被排除：
-    /// 1) 整体匹配（支持 `build/dist/*` 这类路径 glob）；
-    /// 2) 纯名字规则（不含 `/` 的 pattern，如 `node_modules`、`*.iso`）
+    /// 1) 隐藏文件过滤（ignore_hidden）：路径中任何段以 '.' 开头；
+    /// 2) 白名单优先匹配（!开头的规则，对标 Syncthing .stignore）；
+    /// 3) 整体匹配（支持 `build/dist/*` 这类路径 glob）；
+    /// 4) 纯名字规则（不含 `/` 的 pattern，如 `node_modules`、`*.iso`）
     ///    对任意层级的同名段生效（`web/node_modules/x.js` 也命中 `node_modules`）。
+    pub fn is_path_ignored(&self, rel: &str) -> bool {
+        self.is_ignored(rel, false)
+    }
+
     fn is_ignored(&self, rel: &str, _is_dir: bool) -> bool {
-        if self.ignore.is_match(rel) {
+        let normalized = rel.replace('\\', "/");
+        if self.ignore_hidden {
+            for part in normalized.split('/') {
+                if part.starts_with('.') && part != "." && part != ".." {
+                    return true;
+                }
+            }
+        }
+        if let Some(ref wl) = self.whitelist {
+            if wl.is_match(&normalized) || normalized.split('/').any(|part| wl.is_match(part)) {
+                return false;
+            }
+        }
+        if self.ignore.is_match(&normalized) {
             return true;
         }
-        rel.split('/').any(|part| self.ignore.is_match(part))
+        normalized.split('/').any(|part| self.ignore.is_match(part))
     }
 
     /// 扫描目录，返回相对路径（`/` 分隔）→ 元数据。
     pub fn scan(&self, root: &Path) -> anyhow::Result<(FileTree, ScanStats)> {
         let mut tree = FileTree::new();
         let mut stats = ScanStats::default();
+        let ignored_cell = std::cell::Cell::new(0usize);
 
         for entry in WalkDir::new(root)
             .follow_links(false)
@@ -95,13 +148,33 @@ impl<'a> Scanner<'a> {
                 if e.depth() == 0 {
                     return true;
                 }
+                // 忽略 Windows 隐藏与系统文件（对标 FreeFileSync 与 GoodSync）
+                if self.ignore_hidden {
+                    let fname = e.file_name().to_string_lossy();
+                    if fname.starts_with('.') && fname != "." && fname != ".." {
+                        ignored_cell.set(ignored_cell.get() + 1);
+                        return false;
+                    }
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::fs::MetadataExt;
+                        if let Ok(m) = e.metadata() {
+                            let attrs = m.file_attributes();
+                            // 0x2 = FILE_ATTRIBUTE_HIDDEN, 0x4 = FILE_ATTRIBUTE_SYSTEM
+                            if (attrs & 0x2 != 0) || (attrs & 0x4 != 0) {
+                                ignored_cell.set(ignored_cell.get() + 1);
+                                return false;
+                            }
+                        }
+                    }
+                }
                 let rel = rel_path(root, e.path());
                 if rel.is_empty() {
                     return true;
                 }
                 let ok = !self.is_ignored(&rel, e.file_type().is_dir());
                 if !ok {
-                    stats.ignored += 1;
+                    ignored_cell.set(ignored_cell.get() + 1);
                 }
                 ok
             })
@@ -128,6 +201,13 @@ impl<'a> Scanner<'a> {
                 Ok(m) => m,
                 Err(_) => continue, // 竞态：扫描期间文件被删除
             };
+            // 单文件体积上限过滤（对标 FreeFileSync 与 GoodSync）
+            if let Some(max_bytes) = self.max_file_size_bytes {
+                if max_bytes > 0 && meta.len() > max_bytes {
+                    ignored_cell.set(ignored_cell.get() + 1);
+                    continue;
+                }
+            }
             let mtime_ms = meta
                 .modified()
                 .ok()
@@ -165,6 +245,7 @@ impl<'a> Scanner<'a> {
                 },
             );
         }
+        stats.ignored = ignored_cell.into_inner();
         Ok((tree, stats))
     }
 }
@@ -228,6 +309,19 @@ mod tests {
         assert!(s.is_ignored("ubuntu.iso", false));
         assert!(s.is_ignored("build/output.js", false));
         assert!(!s.is_ignored("src/main.rs", false));
+    }
+
+    #[test]
+    fn test_whitelist_negation() {
+        // 对标 Syncthing .stignore：忽略所有 log，但保留 !important.log
+        let rules: Vec<String> = ["*.log", "!important.log"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let s = Scanner::new(&rules, None).unwrap();
+        assert!(s.is_ignored("debug.log", false));
+        assert!(s.is_ignored("app.log", false));
+        assert!(!s.is_ignored("important.log", false));
     }
 
     #[test]

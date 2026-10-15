@@ -68,6 +68,10 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let cfg = AppConfig::load_or_create(&data_dir)?;
             CLOSE_TO_TRAY.store(cfg.settings.close_to_tray, Ordering::Relaxed);
+            crate::sync::transfer::apply_bandwidth_limits(
+                cfg.settings.max_upload_kbps,
+                cfg.settings.max_download_kbps,
+            );
 
             // 传输历史：根据自定义保留周期自动清理过期记录
             let _ = crate::sync::history::clean_expired_history(cfg.settings.activity_retention_days);
@@ -201,6 +205,28 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // 同步/升级开机自启动命令行格式（若已开启，确保带 --autostart 参数）
+            crate::autostart::ensure_autostart_command_updated();
+
+            // 检查启动参数：若由开机自启或 --minimized 启动，程序默认最小化/退到托盘
+            let is_autostart_launch = crate::autostart::is_autostart_arg_present();
+            if let Some(win) = app.get_webview_window("main") {
+                if is_autostart_launch {
+                    tracing::info!("检测到开机自启动/最小化启动参数，程序启动后默认最小化运行");
+                    if !CLOSE_TO_TRAY.load(Ordering::Relaxed) {
+                        let _ = win.minimize();
+                        let _ = win.show();
+                    } else {
+                        let _ = win.minimize();
+                        let _ = win.hide();
+                    }
+                } else {
+                    let _ = win.show();
+                    let _ = win.unminimize();
+                    let _ = win.set_focus();
+                }
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -222,6 +248,7 @@ pub fn run() {
             commands::update_folder,
             commands::remove_folder,
             commands::sync_now,
+            commands::force_push_folder,
             commands::pause_folder,
             commands::resume_folder,
             commands::test_backend,

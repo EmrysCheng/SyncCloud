@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::sync::types::{ConflictPolicy, Direction, SyncMode};
+use crate::sync::types::{ConflictPolicy, Direction, SyncMode, TransferPriority};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +60,12 @@ pub struct GlobalSettings {
     /// 传输历史保留周期（天数，默认 7 天，0 表示永久保留）
     #[serde(default = "default_activity_retention_days")]
     pub activity_retention_days: u32,
+    /// 上传限速（KB/s，0 为不限速，对标 GoodSync / Syncthing / Resilio Sync）
+    #[serde(default)]
+    pub max_upload_kbps: u32,
+    /// 下载限速（KB/s，0 为不限速）
+    #[serde(default)]
+    pub max_download_kbps: u32,
 }
 
 fn default_activity_retention_days() -> u32 {
@@ -93,6 +99,8 @@ impl Default for GlobalSettings {
             deletion_guard_threshold: 50,
             custom_log_dir: None,
             activity_retention_days: 7,
+            max_upload_kbps: 0,
+            max_download_kbps: 0,
         }
     }
 }
@@ -117,6 +125,15 @@ pub struct FolderConfig {
     pub interval_secs: u64,
     #[serde(default)]
     pub encryption: EncryptionConfig,
+    /// 传输调度优先级（对标 Syncthing 与 PanguFlow）
+    #[serde(default)]
+    pub transfer_priority: TransferPriority,
+    /// 单文件大小上限限制（MB，0 或 None 表示不限制）
+    #[serde(default)]
+    pub max_file_size_mb: Option<u64>,
+    /// 忽略 Windows 隐藏与系统文件（对标 FreeFileSync 与 GoodSync）
+    #[serde(default)]
+    pub ignore_hidden: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }

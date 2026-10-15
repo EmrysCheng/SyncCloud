@@ -82,7 +82,12 @@ pub fn record_event(
                 params![folder_id, folder_name, folder_local_path, path, action, now],
             );
         }
-        SyncEvent::FileFailed { path, error, .. } => {
+        SyncEvent::FileFailed { path, error, retry_in_secs, .. } => {
+            // 重试中间态（retry_in_secs > 0）不入库：避免同一文件一次同步产生多条失败记录；
+            // 仅最终失败（retry_in_secs == 0）才写入传输历史
+            if *retry_in_secs > 0 {
+                return;
+            }
             let _ = conn_mutex.lock().unwrap().execute(
                 "INSERT INTO activity_history (folder_id, folder_name, folder_local_path, event_type, path, error, timestamp)
                  VALUES (?1, ?2, ?3, 'file_failed', ?4, ?5, ?6)",
@@ -115,12 +120,62 @@ pub fn record_event(
     }
 }
 
-/// 查询传输历史
+/// 分页结果：当前页条目 + 筛选条件下总条数
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityPage {
+    pub items: Vec<ActivityItem>,
+    pub total: u64,
+}
+
+/// 查询条件（WHERE 子句与参数）——分页查询与总数统计共用，保证口径一致。
+struct HistoryFilter {
+    clause: String,
+    params: Vec<Box<dyn rusqlite::ToSql>>,
+}
+
+fn build_history_filter(
+    folder_id: Option<&str>,
+    action: Option<&str>,
+    keyword: Option<&str>,
+) -> HistoryFilter {
+    let mut clause = " WHERE 1=1".to_string();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(fid) = folder_id {
+        if !fid.is_empty() && fid != "all" {
+            clause.push_str(" AND folder_id = ?");
+            params.push(Box::new(fid.to_string()));
+        }
+    }
+    if let Some(act) = action {
+        if !act.is_empty() && act != "all" {
+            clause.push_str(" AND (action = ? OR event_type = ?)");
+            params.push(Box::new(act.to_string()));
+            params.push(Box::new(act.to_string()));
+        }
+    }
+    if let Some(kw) = keyword {
+        let trimmed = kw.trim();
+        if !trimmed.is_empty() {
+            clause.push_str(" AND (path LIKE ? OR folder_name LIKE ? OR error LIKE ? OR reason LIKE ?)");
+            let like = format!("%{trimmed}%");
+            params.push(Box::new(like.clone()));
+            params.push(Box::new(like.clone()));
+            params.push(Box::new(like.clone()));
+            params.push(Box::new(like));
+        }
+    }
+    HistoryFilter { clause, params }
+}
+
+/// 查询传输历史（分页：按 id 倒序 + offset 偏移）
 pub fn query_history(
     folder_id: Option<&str>,
     action: Option<&str>,
     keyword: Option<&str>,
     limit: usize,
+    offset: usize,
 ) -> Vec<ActivityItem> {
     let conn_mutex = match get_conn() {
         Ok(c) => c,
@@ -128,39 +183,16 @@ pub fn query_history(
     };
     let conn = conn_mutex.lock().unwrap();
 
-    let mut sql = "SELECT id, folder_id, folder_name, folder_local_path, event_type, path, action, error, reason, copy, timestamp
-                   FROM activity_history WHERE 1=1".to_string();
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-    if let Some(fid) = folder_id {
-        if !fid.is_empty() && fid != "all" {
-            sql.push_str(" AND folder_id = ?");
-            params_vec.push(Box::new(fid.to_string()));
-        }
-    }
-    if let Some(act) = action {
-        if !act.is_empty() && act != "all" {
-            sql.push_str(" AND (action = ? OR event_type = ?)");
-            params_vec.push(Box::new(act.to_string()));
-            params_vec.push(Box::new(act.to_string()));
-        }
-    }
-    if let Some(kw) = keyword {
-        let trimmed = kw.trim();
-        if !trimmed.is_empty() {
-            sql.push_str(" AND (path LIKE ? OR folder_name LIKE ? OR error LIKE ? OR reason LIKE ?)");
-            let like = format!("%{trimmed}%");
-            params_vec.push(Box::new(like.clone()));
-            params_vec.push(Box::new(like.clone()));
-            params_vec.push(Box::new(like.clone()));
-            params_vec.push(Box::new(like));
-        }
-    }
-
-    sql.push_str(" ORDER BY id DESC LIMIT ?");
-    params_vec.push(Box::new(limit.clamp(1, 2000) as i64));
-
-    let rusqlite_params: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    let filter = build_history_filter(folder_id, action, keyword);
+    let sql = format!(
+        "SELECT id, folder_id, folder_name, folder_local_path, event_type, path, action, error, reason, copy, timestamp \
+         FROM activity_history{} ORDER BY id DESC LIMIT ? OFFSET ?",
+        filter.clause
+    );
+    let mut params = filter.params;
+    params.push(Box::new(limit.clamp(1, 2000) as i64));
+    params.push(Box::new(offset as i64));
+    let rusqlite_params: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
 
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -187,6 +219,26 @@ pub fn query_history(
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// 统计筛选条件下的记录总数（用于分页）
+pub fn count_history(
+    folder_id: Option<&str>,
+    action: Option<&str>,
+    keyword: Option<&str>,
+) -> u64 {
+    let conn_mutex = match get_conn() {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let conn = conn_mutex.lock().unwrap();
+    let filter = build_history_filter(folder_id, action, keyword);
+    let sql = format!("SELECT COUNT(*) FROM activity_history{}", filter.clause);
+    let rusqlite_params: Vec<&dyn rusqlite::ToSql> =
+        filter.params.iter().map(|b| b.as_ref()).collect();
+    conn.query_row(&sql, &rusqlite_params[..], |row| row.get::<_, i64>(0))
+        .map(|n| n.max(0) as u64)
+        .unwrap_or(0)
 }
 
 /// 自动清理超过指定保留周期的历史数据。

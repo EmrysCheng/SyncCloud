@@ -22,13 +22,14 @@ pub struct BaiduStore {
     app_key: String,
     secret_key: String,
     remote_dir: String,
-    /// 元数据区（manifest/锁），位于同步目录之外的兄弟目录
+    /// 元数据区（manifest/锁），严格位于用户指定的同步目录内部（{remote_dir}/.synccloud）
     meta_dir: String,
     http: reqwest::Client,
     token: tokio::sync::Mutex<Option<TokenState>>,
     /// 目录列表缓存（dir → 子项）。百度同样没有按路径直达的 API，
     /// 逐级 list 是每轮同步的最大开销；任何写操作后整体清空保证一致。
     list_cache: tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<BaiduFile>>>>,
+    created_dirs: tokio::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,8 +167,8 @@ struct CreateResp {
 impl BaiduStore {
     pub fn new(auth_id: String, app_key: String, secret_key: String, remote_dir: String) -> Self {
         let remote_dir = remote_dir.trim_end_matches('/').to_string();
-        // "/Sync" → "/.synccloud/Sync"；根目录同步时退化为 "/.synccloud"
-        let meta_dir = format!("/{}", sibling_meta(&remote_dir));
+        // 严格位于用户指定的同步目录内部（{remote_dir}/.synccloud），绝不向指定目录外上传任何文件
+        let meta_dir = format!("{remote_dir}/.synccloud");
         Self {
             auth_id,
             app_key,
@@ -181,6 +182,7 @@ impl BaiduStore {
                 .expect("reqwest client"),
             token: tokio::sync::Mutex::new(None),
             list_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            created_dirs: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -392,46 +394,40 @@ impl BaiduStore {
         self.mkdir_p_abs(&self.abs_path(rel_dir)).await
     }
 
-    /// 按绝对云端路径逐级创建目录（可越出同步目录，供元数据区使用）。
+    /// 按绝对云端路径创建目录（带内存缓存加速，避免重复请求触发网盘限流）。
     async fn mkdir_p_abs(&self, abs: &str) -> anyhow::Result<()> {
-        let mut cur = String::new();
-        let mut created = false;
-        for seg in abs.trim_start_matches('/').split('/') {
-            if seg.is_empty() {
-                continue;
-            }
-            cur = format!("{cur}/{seg}");
-            if self.lookup_abs(&cur).await?.is_some() {
-                continue;
-            }
-            created = true;
-            let token = self.access_token().await?;
-            let resp: CreateResp = self
-                .http
-                .post(format!("{PAN}/xpan/file"))
-                .query(&[
-                    ("method", "create"),
-                    ("access_token", token.as_str()),
-                ])
-                .form(&[
-                    ("path", cur.as_str()),
-                    ("isdir", "1"),
-                    ("size", "0"),
-                    ("rtype", "0"),
-                ])
-                .send()
-                .await?
-                .json()
-                .await?;
-            if resp.errno != 0 && resp.errno != -8 {
-                // -8 = 已存在
-                anyhow::bail!("创建目录 {cur} 失败 errno={}", resp.errno);
+        let abs = abs.trim_end_matches('/');
+        if abs.is_empty() || abs == "/" {
+            return Ok(());
+        }
+        {
+            let guard = self.created_dirs.lock().await;
+            if guard.contains(abs) {
+                return Ok(());
             }
         }
-        if created {
+        let token = self.access_token().await?;
+        let resp: CreateResp = self
+            .http
+            .post(format!("{PAN}/xpan/file"))
+            .query(&[("method", "create"), ("access_token", token.as_str())])
+            .form(&[
+                ("path", abs),
+                ("isdir", "1"),
+                ("size", "0"),
+                ("rtype", "0"),
+            ])
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.errno == 0 || resp.errno == -8 {
+            let mut guard = self.created_dirs.lock().await;
+            guard.insert(abs.to_string());
             self.invalidate_list_cache().await;
+            return Ok(());
         }
-        Ok(())
+        anyhow::bail!("创建目录 {abs} 失败 errno={}", resp.errno);
     }
 
     /// 读取指定绝对路径的 manifest（不存在返回 None）。
@@ -513,7 +509,20 @@ impl RemoteStore for BaiduStore {
     }
 
     async fn read_manifest(&self) -> anyhow::Result<Option<Manifest>> {
-        self.manifest_at(&self.meta_path("manifest.json")).await
+        let internal_path = self.meta_path("manifest.json");
+        if let Some(m) = self.manifest_at(&internal_path).await? {
+            return Ok(Some(m));
+        }
+        // 兼容迁移：若指定同步目录内尚无 manifest，但历史外部兄弟目录存在，读取并迁入内部，同时清理外部旧文件
+        let legacy_sibling = format!("/{}", sibling_meta(&self.remote_dir));
+        let legacy_manifest = format!("{legacy_sibling}/manifest.json");
+        if let Some(legacy) = self.manifest_at(&legacy_manifest).await? {
+            let _ = self.write_manifest(&legacy).await;
+            let _ = self.delete_abs(&legacy_manifest).await;
+            let _ = self.delete_abs(&legacy_sibling).await;
+            return Ok(Some(legacy));
+        }
+        Ok(None)
     }
 
     async fn write_manifest(&self, manifest: &Manifest) -> anyhow::Result<()> {
@@ -839,7 +848,10 @@ impl BaiduStore {
                 ("opera", "delete"),
                 ("access_token", token.as_str()),
             ])
-            .form(&[("filelist", filelist.as_str())])
+            .form(&[
+                ("async", "0"),
+                ("filelist", filelist.as_str()),
+            ])
             .send()
             .await?;
         let status = resp.status();

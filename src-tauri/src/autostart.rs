@@ -35,7 +35,8 @@ pub fn set_autostart_enabled(enabled: bool) -> anyhow::Result<()> {
         if enabled {
             let exe = std::env::current_exe()?;
             let exe_str = exe.to_string_lossy().to_string();
-            let val = format!("\"{exe_str}\"");
+            // 写入带有 --autostart 参数的启动命令，以便开机自启时静默最小化到托盘/后台
+            let val = format!("\"{exe_str}\" --autostart");
             let output = std::process::Command::new("reg")
                 .args(["add", REG_KEY, "/v", APP_NAME, "/t", "REG_SZ", "/d", &val, "/f"])
                 .creation_flags(CREATE_NO_WINDOW)
@@ -57,5 +58,23 @@ pub fn set_autostart_enabled(enabled: bool) -> anyhow::Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
         anyhow::bail!("当前操作系统暂不支持开机自启动设置");
+    }
+}
+
+/// 检查当前进程启动命令行中是否包含开机自启动或后台最小化运行参数。
+pub fn is_autostart_arg_present() -> bool {
+    std::env::args().any(|arg| {
+        let s = arg.to_lowercase();
+        s == "--autostart" || s == "--minimized" || s == "-m" || s == "/autostart" || s == "/minimized"
+    })
+}
+
+/// 若当前已启用自启动，确保注册表中的命令包含 --autostart 参数（兼容旧版配置平滑升级）。
+pub fn ensure_autostart_command_updated() {
+    #[cfg(target_os = "windows")]
+    {
+        if is_autostart_enabled() {
+            let _ = set_autostart_enabled(true);
+        }
     }
 }

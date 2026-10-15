@@ -142,17 +142,22 @@ export default function Conflicts() {
         </div>
 
         <div className="header-actions" style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-          <select
-            className="input input-sm conflict-folder-select"
-            value={folderId}
-            onChange={(e) => setFolderId(e.target.value)}
-          >
-            {folders.map((f) => (
-              <option key={f.id} value={f.id}>
-                📂 {f.name}
-              </option>
-            ))}
-          </select>
+          <div className="folder-select-capsule">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="fsc-icon">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+            </svg>
+            <select
+              className="select-custom modern-folder-select"
+              value={folderId}
+              onChange={(e) => setFolderId(e.target.value)}
+            >
+              {folders.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.name}
+                </option>
+              ))}
+            </select>
+          </div>
           <label className="checkbox-pill">
             <input
               type="checkbox"
@@ -164,48 +169,65 @@ export default function Conflicts() {
         </div>
       </div>
 
-      {/* 状态统计卡片条 */}
-      <div className="conflict-stats-strip">
-        <div className="stat-capsule">
-          <span className="stat-label">待解决冲突：</span>
-          <span className={`stat-num ${unresolvedList.length > 0 ? "text-warn" : "text-ok"}`}>
-            {unresolvedList.length}
-          </span>
-        </div>
-        <div className="stat-capsule">
-          <span className="stat-label">已保护归档：</span>
-          <span className="stat-num text-muted">{resolvedList.length}</span>
-        </div>
-        <div className="stat-capsule" style={{ flex: 1, minWidth: "180px" }}>
-          <input
-            type="search"
-            className="input input-sm"
-            style={{ width: "100%", border: "none", background: "transparent", padding: 0 }}
-            placeholder="🔍 搜索文件名或冲突路径…"
-            value={keyword}
-            onChange={(e) => setKeyword(e.target.value)}
-          />
-        </div>
-        {unresolvedList.length > 1 && (
-          <div style={{ display: "flex", gap: "8px" }}>
-            <button
-              className="btn btn-sm btn-ghost"
-              disabled={batchResolving}
-              onClick={() => handleBatchResolve("keep_local")}
-              title="全部保留本地原版，并自动物理清理副本"
-            >
-              🛡️ 一键全部保留本地
-            </button>
-            <button
-              className="btn btn-sm btn-ghost"
-              disabled={batchResolving}
-              onClick={() => handleBatchResolve("keep_both")}
-              title="全部保留两端各自独立存在"
-            >
-              📂 全部保留两者
-            </button>
+      {/* 现代高质感冲突工具栏（取代旧版粗糙长条） */}
+      <div className="conflict-toolbar">
+        <div className="conflict-toolbar-left">
+          <div className={`conflict-stat-pill ${unresolvedList.length > 0 ? "has-conflicts" : "is-clean"}`}>
+            <span className="csp-dot"></span>
+            <span className="csp-label">待解决冲突：</span>
+            <strong className="csp-val">{unresolvedList.length}</strong>
           </div>
-        )}
+          <div className="conflict-stat-pill is-neutral">
+            <span className="csp-label">已保护归档：</span>
+            <strong className="csp-val">{resolvedList.length}</strong>
+          </div>
+          {unresolvedList.length > 1 && (
+            <div className="batch-actions-group">
+              <button
+                className="btn btn-sm btn-ghost"
+                disabled={batchResolving}
+                onClick={() => handleBatchResolve("keep_local")}
+                title="全部保留本地原版，并自动物理清理副本"
+              >
+                🛡️ 全部保留本地
+              </button>
+              <button
+                className="btn btn-sm btn-ghost"
+                disabled={batchResolving}
+                onClick={() => handleBatchResolve("keep_both")}
+                title="全部保留两端各自独立存在"
+              >
+                📂 全部保留两者
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="conflict-toolbar-right">
+          <div className="modern-search-box">
+            <svg className="msb-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="11" cy="11" r="8" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+            <input
+              type="search"
+              className="msb-input"
+              placeholder="搜索冲突文件路径或副本…"
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+            />
+            {keyword && (
+              <button
+                type="button"
+                className="msb-clear"
+                title="清空搜索"
+                onClick={() => setKeyword("")}
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        </div>
       </div>
 
       {filteredRecords.length === 0 ? (

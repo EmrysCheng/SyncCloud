@@ -20,6 +20,8 @@ const DEFAULT_SETTINGS: GlobalSettings = {
   deletionGuardThreshold: 50,
   customLogDir: null,
   activityRetentionDays: 7,
+  maxUploadKbps: 0,
+  maxDownloadKbps: 0,
 };
 
 const LOG_LEVELS: Array<{ value: string; label: string }> = [
@@ -320,6 +322,61 @@ export default function Settings() {
             </div>
           )}
         </div>
+        <div style={{ marginTop: "14px", padding: "12px", background: "#f8fafc", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
+          <div style={{ fontWeight: 600, fontSize: "14px", marginBottom: "4px" }}>
+            🚀 网络传输带宽限速（对标 GoodSync / Syncthing / Resilio Sync / PanguFlow）
+          </div>
+          <div className="hint" style={{ marginBottom: "12px" }}>
+            通过令牌桶平滑流控限制上传与下载速率，避免同步占满网络造成卡顿。设为 0 表示不限速，保存后即刻生效。
+          </div>
+          <div className="grid-2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+            <label className="field" style={{ margin: 0 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span>最大上传速率 (KB/s)</span>
+                <span className="muted" style={{ fontSize: "12px" }}>
+                  {(gs.maxUploadKbps ?? 0) > 0 ? `${((gs.maxUploadKbps ?? 0) / 1024).toFixed(1)} MB/s` : "无限制"}
+                </span>
+              </div>
+              <input
+                type="number"
+                min={0}
+                step={512}
+                value={gs.maxUploadKbps || 0}
+                onChange={(e) => patch({ maxUploadKbps: Math.max(0, Number(e.target.value) || 0) })}
+                placeholder="0 为不限制"
+              />
+              <div style={{ display: "flex", gap: "6px", marginTop: "4px" }}>
+                <button type="button" className="btn-preset" onClick={() => patch({ maxUploadKbps: 0 })}>不限速</button>
+                <button type="button" className="btn-preset" onClick={() => patch({ maxUploadKbps: 1024 })}>1 MB/s</button>
+                <button type="button" className="btn-preset" onClick={() => patch({ maxUploadKbps: 5120 })}>5 MB/s</button>
+                <button type="button" className="btn-preset" onClick={() => patch({ maxUploadKbps: 10240 })}>10 MB/s</button>
+              </div>
+            </label>
+            <label className="field" style={{ margin: 0 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span>最大下载速率 (KB/s)</span>
+                <span className="muted" style={{ fontSize: "12px" }}>
+                  {(gs.maxDownloadKbps ?? 0) > 0 ? `${((gs.maxDownloadKbps ?? 0) / 1024).toFixed(1)} MB/s` : "无限制"}
+                </span>
+              </div>
+              <input
+                type="number"
+                min={0}
+                step={512}
+                value={gs.maxDownloadKbps || 0}
+                onChange={(e) => patch({ maxDownloadKbps: Math.max(0, Number(e.target.value) || 0) })}
+                placeholder="0 为不限制"
+              />
+              <div style={{ display: "flex", gap: "6px", marginTop: "4px" }}>
+                <button type="button" className="btn-preset" onClick={() => patch({ maxDownloadKbps: 0 })}>不限速</button>
+                <button type="button" className="btn-preset" onClick={() => patch({ maxDownloadKbps: 1024 })}>1 MB/s</button>
+                <button type="button" className="btn-preset" onClick={() => patch({ maxDownloadKbps: 5120 })}>5 MB/s</button>
+                <button type="button" className="btn-preset" onClick={() => patch({ maxDownloadKbps: 10240 })}>10 MB/s</button>
+              </div>
+            </label>
+          </div>
+        </div>
+
         <div style={{ marginTop: "14px", padding: "12px", background: "#f8fafc", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px" }}>
             <div>

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
-  ActivityItem,
+  ActivityPage,
   AliyunQrInfo,
   BaiduLoginInfo,
   BackendConfig,
@@ -28,6 +28,7 @@ export const api = {
   updateFolder: (folder: FolderConfig) => invoke<void>("update_folder", { folder }),
   removeFolder: (folderId: string) => invoke<void>("remove_folder", { folderId }),
   syncNow: (folderId: string) => invoke<boolean>("sync_now", { folderId }),
+  forcePushFolder: (folderId: string) => invoke<boolean>("force_push_folder", { folderId }),
   pauseFolder: (folderId: string) => invoke<void>("pause_folder", { folderId }),
   resumeFolder: (folderId: string) => invoke<void>("resume_folder", { folderId }),
   testBackend: (backend: BackendConfig) => invoke<string>("test_backend", { backend }),
@@ -95,8 +96,14 @@ export const api = {
     invoke<string[]>("read_log_tail", { file, lines }),
   openLogDir: () => invoke<void>("open_log_dir"),
   getCurrentLogDir: () => invoke<string>("get_current_log_dir"),
-  getActivityHistory: (folderId?: string, action?: string, keyword?: string, limit?: number) =>
-    invoke<ActivityItem[]>("get_activity_history", { folderId, action, keyword, limit }),
+  getActivityHistory: (
+    folderId?: string,
+    action?: string,
+    keyword?: string,
+    limit?: number,
+    offset?: number,
+  ) =>
+    invoke<ActivityPage>("get_activity_history", { folderId, action, keyword, limit, offset }),
   cleanExpiredActivity: () => invoke<number>("clean_expired_activity"),
   clearActivityHistory: (folderId?: string) =>
     invoke<number>("clear_activity_history", { folderId }),

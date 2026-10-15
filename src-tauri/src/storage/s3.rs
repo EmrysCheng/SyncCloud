@@ -53,7 +53,12 @@ impl S3Store {
             builder = builder.force_path_style(true);
         }
         let prefix = root_prefix.trim_matches('/').to_string();
-        let meta_prefix = sibling_meta(&prefix);
+        // 严格位于用户指定的前缀目录内部（{prefix}/.synccloud），绝不越出指定目录创建任何对象
+        let meta_prefix = if prefix.is_empty() {
+            ".synccloud".to_string()
+        } else {
+            format!("{prefix}/.synccloud")
+        };
         Self {
             client: Client::from_conf(builder.build()),
             bucket,
@@ -145,7 +150,24 @@ impl RemoteStore for S3Store {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 Ok(Some(serde_json::from_str(&raw)?))
             }
-            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) if is_not_found(&e) => {
+                // 兼容迁移：若指定同步目录内尚无 manifest，但历史外部兄弟前缀存在，读取并迁入内部，同时清理外部旧对象
+                let legacy_prefix = sibling_meta(&self.prefix);
+                let legacy_key = format!("{legacy_prefix}/manifest.json");
+                if let Ok(obj) = self.client.get_object().bucket(&self.bucket).key(&legacy_key).send().await {
+                    let tmp = std::env::temp_dir()
+                        .join(format!("synccloud-manifest-{}.json", uuid::Uuid::new_v4()));
+                    write_object_to_file(obj, &tmp).await?;
+                    let raw = tokio::fs::read_to_string(&tmp).await?;
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    if let Ok(m) = serde_json::from_str::<Manifest>(&raw) {
+                        let _ = self.write_manifest(&m).await;
+                        let _ = self.client.delete_object().bucket(&self.bucket).key(&legacy_key).send().await;
+                        return Ok(Some(m));
+                    }
+                }
+                Ok(None)
+            }
             Err(e) => Err(anyhow::anyhow!("读取 manifest 失败: {e}")),
         }
     }
@@ -232,6 +254,28 @@ impl RemoteStore for S3Store {
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("删除失败 s3://{}/{}: {e}", self.bucket, key))?;
+        Ok(())
+    }
+
+    async fn move_file(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        let src_key = self.key(from);
+        let dest_key = self.key(to);
+        let copy_source = format!("{}/{}", self.bucket, src_key);
+        self.client
+            .copy_object()
+            .bucket(&self.bucket)
+            .copy_source(&copy_source)
+            .key(&dest_key)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("S3 服务端复制失败 {}: {e}", dest_key))?;
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&src_key)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("S3 清理原对象失败 {}: {e}", src_key))?;
         Ok(())
     }
 

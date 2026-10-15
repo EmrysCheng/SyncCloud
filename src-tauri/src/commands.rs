@@ -53,6 +53,11 @@ pub async fn save_settings(
     cfg.save(&app_data_dir()).map_err(err)?;
     // 关窗到托盘的开关在窗口事件（同步上下文）里读取，用原子变量即时生效
     crate::CLOSE_TO_TRAY.store(cfg.settings.close_to_tray, std::sync::atomic::Ordering::Relaxed);
+    // 网络带宽限速即刻热生效
+    crate::sync::transfer::apply_bandwidth_limits(
+        cfg.settings.max_upload_kbps,
+        cfg.settings.max_download_kbps,
+    );
     // 日志等级、文件开关与自定义目录热生效（无需重启）
     crate::logging::apply_settings(
         &cfg.settings.log_level,
@@ -156,6 +161,12 @@ pub async fn remove_folder(state: State<'_, AppState>, folder_id: String) -> Res
 pub async fn sync_now(state: State<'_, AppState>, folder_id: String) -> Result<bool, String> {
     let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
     Ok(state.manager.sync_now(&id).await)
+}
+
+#[tauri::command]
+pub async fn force_push_folder(state: State<'_, AppState>, folder_id: String) -> Result<bool, String> {
+    let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
+    Ok(state.manager.force_push(&id).await)
 }
 
 #[tauri::command]
@@ -719,14 +730,25 @@ pub async fn get_activity_history(
     folder_id: Option<String>,
     action: Option<String>,
     keyword: Option<String>,
-    limit: usize,
-) -> Result<Vec<crate::sync::history::ActivityItem>, String> {
-    Ok(crate::sync::history::query_history(
-        folder_id.as_deref(),
-        action.as_deref(),
-        keyword.as_deref(),
-        limit,
-    ))
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<crate::sync::history::ActivityPage, String> {
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    let offset = offset.unwrap_or(0);
+    Ok(crate::sync::history::ActivityPage {
+        items: crate::sync::history::query_history(
+            folder_id.as_deref(),
+            action.as_deref(),
+            keyword.as_deref(),
+            limit,
+            offset,
+        ),
+        total: crate::sync::history::count_history(
+            folder_id.as_deref(),
+            action.as_deref(),
+            keyword.as_deref(),
+        ),
+    })
 }
 
 #[tauri::command]

@@ -473,7 +473,8 @@ impl RemoteStore for GitStore {
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::copy(src, &dest).await?;
+        // 共享模式复制：源文件被编辑器/杀毒占用时仍可读取（同步不再被占用阻塞）
+        crate::sync::fslock::copy_shared(src, &dest).await?;
         Ok(())
     }
 

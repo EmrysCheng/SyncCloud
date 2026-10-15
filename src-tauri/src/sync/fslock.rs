@@ -48,6 +48,31 @@ pub async fn read_shared(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// 以共享读复制文件（源被编辑器/杀毒占用时仍可复制），用于本地移动的降级路径。
+pub async fn copy_shared(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    let mut reader = open_read_shared_async(src).await?;
+    let mut writer = tokio::fs::File::create(dst).await?;
+    tokio::io::copy(&mut reader, &mut writer).await
+}
+
+/// 探测文件当前能否被删除（Windows：以 DELETE 访问权限打开即视为可删；
+/// 被独占锁定时打开失败返回 false）。用于删除/移动前避免无谓的归档与报错。
+pub fn can_delete(path: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .access_mode(win::DELETE | win::SYNCHRONIZE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)
+            .is_ok()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.exists()
+    }
+}
+
 /// 把 `src` 原子替换到 `dst`。
 /// 链路：普通 rename → Windows POSIX 语义替换（目标被共享打开也能换）
 /// → 同目录 staging 副本 + rename（跨卷 rename 不可用时的兜底）。
@@ -67,10 +92,13 @@ pub async fn replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
             let staging = dst.with_extension(format!("sc-stage-{}", uuid::Uuid::new_v4()));
             match tokio::fs::copy(src, &staging).await {
                 Ok(_) => match tokio::fs::rename(&staging, dst).await {
-                    Ok(()) => {
-                        let _ = tokio::fs::remove_file(src).await;
-                        return Ok(());
-                    }
+                    Ok(()) => match tokio::fs::remove_file(src).await {
+                        Ok(()) => return Ok(()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                        // 目标已就位但源删除失败（如被独占锁定）：如实上抛，
+                        // 由调用方决定后续（挂起/降级），不能静默吞掉源文件残留状态
+                        Err(e) => return Err(e),
+                    },
                     Err(e) => {
                         let _ = tokio::fs::remove_file(&staging).await;
                         return Err(e);
@@ -263,6 +291,28 @@ fn posix_delete(path: &Path) -> bool {
     // 2) 经典 delete-on-close（BOOLEAN TRUE = 1）
     try_dispose(FILE_DISPOSITION_INFO_CLASS, 1)
 }
+
+/// 在 Windows 平台上将目录或文件设置为隐藏属性（适用于非用户自主创建的内部系统产物，如 .synccloud 等）。
+#[cfg(target_os = "windows")]
+pub fn set_hidden_windows(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    extern "system" {
+        fn GetFileAttributesW(lpFileName: *const u16) -> u32;
+        fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
+    }
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
+    unsafe {
+        let attrs = GetFileAttributesW(wide.as_ptr());
+        if attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_HIDDEN) == 0 {
+            let _ = SetFileAttributesW(wide.as_ptr(), attrs | FILE_ATTRIBUTE_HIDDEN);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_hidden_windows(_path: &std::path::Path) {}
 
 #[cfg(test)]
 mod tests {
