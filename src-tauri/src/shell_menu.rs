@@ -9,7 +9,6 @@
 const SHELL_ROOTS: &[(&str, &str)] = &[
     (r"HKCU\Software\Classes\*\shell\SyncCloud", "*\\shell\\SyncCloud"),
     (r"HKCU\Software\Classes\Directory\shell\SyncCloud", "Directory\\shell\\SyncCloud"),
-    (r"HKCU\Software\Classes\Folder\shell\SyncCloud", "Folder\\shell\\SyncCloud"),
     (r"HKCU\Software\Classes\Directory\Background\shell\SyncCloud", "Directory\\Background\\shell\\SyncCloud"),
 ];
 
@@ -42,6 +41,12 @@ pub fn set_shell_menu_enabled(enabled: bool) -> anyhow::Result<()> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
         if enabled {
+            // 清理可能导致文件夹右键菜单重复的旧版 Folder 项
+            let _ = std::process::Command::new("reg")
+                .args(["delete", r"HKCU\Software\Classes\Folder\shell\SyncCloud", "/f"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+
             let exe = std::env::current_exe()?;
             let exe_str = exe.to_string_lossy().to_string();
 
@@ -127,6 +132,10 @@ pub fn set_shell_menu_enabled(enabled: bool) -> anyhow::Result<()> {
                 .creation_flags(CREATE_NO_WINDOW)
                 .output()?;
         } else {
+            let _ = std::process::Command::new("reg")
+                .args(["delete", r"HKCU\Software\Classes\Folder\shell\SyncCloud", "/f"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
             for (root_key, _) in SHELL_ROOTS {
                 let _ = std::process::Command::new("reg")
                     .args(["delete", root_key, "/f"])
