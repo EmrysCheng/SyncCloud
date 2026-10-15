@@ -364,8 +364,9 @@ function FolderCard({
   const syncing = st?.state === "syncing";
   const progress = useCycleProgress(f.id, events, syncing);
   const folderEvents = useMemo(() => {
+    // 需求2：文件上传、下载记录在传输历史中统一展示，同步日志中不堆叠展示单文件传输条目，保持周期日志清爽
     return events
-      .filter((e) => getFolderId(e) === f.id)
+      .filter((e) => getFolderId(e) === f.id && e.type !== "file_done")
       .slice(-60)
       .reverse();
   }, [events, f.id]);
@@ -561,10 +562,10 @@ function FolderCard({
       {expanded && (
         <div className="event-log">
           <div className="event-log-header">
-            <span>同步操作明细（最近 {folderEvents.length} 条）</span>
+            <span>同步任务日志（最近 {folderEvents.length} 条 · 单文件传输明细请查看「传输历史」）</span>
           </div>
           {folderEvents.length === 0 && (
-            <div className="muted event-row">暂无最近同步事件，点击上方「立即同步」即可查看实时过程</div>
+            <div className="muted event-row">暂无同步任务周期日志，单文件上传/下载记录请在左侧「传输历史」中查阅</div>
           )}
           {folderEvents.map((e, i) => (
             <div className="event-row flex-row-between" key={i}>

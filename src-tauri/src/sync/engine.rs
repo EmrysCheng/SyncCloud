@@ -104,6 +104,19 @@ enum DeltaOp {
     Remove(String),
 }
 
+/// 同步触发来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncTrigger {
+    /// 用户手动点击（立即同步 / 全部立即同步）
+    Manual,
+    /// 用户显式请求「强制推送（本地覆盖远端）」
+    ForcePush,
+    /// 实时文件监听器检测到本地改动
+    Watcher,
+    /// 周期性定时扫描兜底（后台静默运行）
+    Periodic,
+}
+
 impl SyncEngine {
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
@@ -157,31 +170,34 @@ impl SyncEngine {
         Ok(plan)
     }
 
-    /// 执行一轮完整同步。本地与远端均无实质变化时走增量快路径，
-    /// 不获取远端锁、不下载 manifest、不做三方对比（坚果云式增量体验）。
+    /// 执行一轮常规同步（监听变动等场景触发）。
     pub async fn run_cycle(&mut self, store: &dyn RemoteStore) -> CycleReport {
-        self.run_cycle_options(store, false, false).await
+        self.run_cycle_with_trigger(store, SyncTrigger::Watcher).await
     }
 
     /// 强制执行一轮同步（用户手动点击「立即同步」时触发），跳过增量快路径探测，
     /// 强制拉取 manifest 执行三方对比并刷新时间与明细。
     pub async fn run_cycle_forced(&mut self, store: &dyn RemoteStore) -> CycleReport {
-        self.run_cycle_options(store, true, false).await
+        self.run_cycle_with_trigger(store, SyncTrigger::Manual).await
     }
 
     /// 强制推送同步（用户显式请求「本地覆盖远端」）：
     /// 临时采用 Mirror（镜像）模式，本地已删除的文件坚决从远端删除（绕过防误删熔断），
     /// 本地文件完全覆盖远端，绝不反向拉取下载任何文件。
     pub async fn run_cycle_force_push(&mut self, store: &dyn RemoteStore) -> CycleReport {
-        self.run_cycle_options(store, true, true).await
+        self.run_cycle_with_trigger(store, SyncTrigger::ForcePush).await
     }
 
-    pub async fn run_cycle_options(
+    /// 全功能同步编排主入口（支持不同触发来源的差异化静默与优化）。
+    pub async fn run_cycle_with_trigger(
         &mut self,
         store: &dyn RemoteStore,
-        force: bool,
-        is_force_push: bool,
+        trigger: SyncTrigger,
     ) -> CycleReport {
+        let is_force_push = trigger == SyncTrigger::ForcePush;
+        let force = trigger == SyncTrigger::Manual || is_force_push;
+        let is_periodic = trigger == SyncTrigger::Periodic;
+
         if self.is_paused() && !is_force_push {
             let mut report = CycleReport::default();
             report.skipped = 1;
@@ -192,8 +208,6 @@ impl SyncEngine {
         let mut report = CycleReport::default();
         let fid = self.folder.id;
 
-        self.events.emit(SyncEvent::CycleStarted { folder_id: fid, folder: self.folder.name.clone() });
-
         // 0. 本地同步目录安全保证：非用户自主创建的 .synccloud 目录一律显式设置 Windows 隐藏属性
         let local_synccloud = self.root().join(".synccloud");
         if local_synccloud.exists() {
@@ -201,7 +215,6 @@ impl SyncEngine {
         }
 
         // 0.5 应用待替换队列：上一轮被独占锁定而未落盘的新版本，现在再试一次。
-        //     成功后文件即为最新内容，随后的扫描与对比自然收敛。
         self.apply_pending_replaces().await;
 
         // 1. 本地扫描（哈希缓存命中时只做 stat）+ 基线
@@ -219,15 +232,56 @@ impl SyncEngine {
         let (local, scan_stats, baseline) = match scanned {
             Ok(v) => v,
             Err(e) => {
-                self.events.emit(SyncEvent::Error {
-                    folder_id: fid,
-                    folder: self.folder.name.clone(),
-                    message: format!("本地扫描失败：{e:#}"),
-                });
+                if !is_periodic {
+                    self.events.emit(SyncEvent::Error {
+                        folder_id: fid,
+                        folder: self.folder.name.clone(),
+                        message: format!("本地扫描失败：{e:#}"),
+                    });
+                }
                 report.failed += 1;
                 return report;
             }
         };
+
+        // 2. 增量快路径判定：无实质变化且远端未变 → 整轮跳过
+        let has_pending_journal = !self.db.journal_load().unwrap_or_default().is_empty();
+        if !force && !tree_changed(&local, &baseline) && !has_pending_journal {
+            let stamp_now = match store.manifest_stamp().await {
+                Ok(s) => Some(s.unwrap_or_else(|| STAMP_ABSENT.to_string())),
+                Err(_) => None,
+            };
+            if stamp_now.as_deref() == self.db.kv_get("manifest_stamp").as_deref() {
+                report.skipped = 1;
+                self.db.kv_set("last_sync_at", &chrono::Local::now().to_rfc3339());
+                report.took_ms = started.elapsed().as_millis() as u64;
+
+                // 核心优化（需求4）：周期扫描兜底且无变化时，静默完成，不发射任何无意义的跳过事件与日志！
+                if !is_periodic {
+                    self.events.emit(SyncEvent::CycleStarted { folder_id: fid, folder: self.folder.name.clone() });
+                    self.events.emit(SyncEvent::ScanDone {
+                        folder_id: fid,
+                        files: scan_stats.files,
+                        hashed: scan_stats.hashed,
+                        cache_hits: scan_stats.hash_cache_hits,
+                        ignored: scan_stats.ignored,
+                    });
+                    self.events.emit(SyncEvent::CycleSkipped {
+                        folder_id: fid,
+                        folder: self.folder.name.clone(),
+                    });
+                    self.events.emit(SyncEvent::CycleDone {
+                        folder_id: fid,
+                        folder: self.folder.name.clone(),
+                        report: report.clone(),
+                    });
+                }
+                return report;
+            }
+        }
+
+        // 确实有实质变化，或手动强制触发：正式发射周期开始与扫描事件
+        self.events.emit(SyncEvent::CycleStarted { folder_id: fid, folder: self.folder.name.clone() });
         self.events.emit(SyncEvent::ScanDone {
             folder_id: fid,
             files: scan_stats.files,
@@ -235,31 +289,6 @@ impl SyncEngine {
             cache_hits: scan_stats.hash_cache_hits,
             ignored: scan_stats.ignored,
         });
-
-        // 2. 增量快路径：非强制触发（自动轮询/监听）、本地无实质变化、无待重放日志、远端变更戳未变 → 整轮跳过
-        let has_pending_journal = !self.db.journal_load().unwrap_or_default().is_empty();
-        if !force && !tree_changed(&local, &baseline) && !has_pending_journal {
-            let stamp_now = match store.manifest_stamp().await {
-                // manifest 缺失也用哨兵值参与比较（首 sync 后远端一直为空时可快路径）
-                Ok(s) => Some(s.unwrap_or_else(|| STAMP_ABSENT.to_string())),
-                Err(_) => None, // 探测失败不致命，退回完整路径
-            };
-            if stamp_now.as_deref() == self.db.kv_get("manifest_stamp").as_deref() {
-                report.skipped = 1;
-                self.db.kv_set("last_sync_at", &chrono::Local::now().to_rfc3339());
-                self.events.emit(SyncEvent::CycleSkipped {
-                    folder_id: fid,
-                    folder: self.folder.name.clone(),
-                });
-                report.took_ms = started.elapsed().as_millis() as u64;
-                self.events.emit(SyncEvent::CycleDone {
-                    folder_id: fid,
-                    folder: self.folder.name.clone(),
-                    report: report.clone(),
-                });
-                return report;
-            }
-        }
 
         // 3. 远端锁：防止多机同时写 manifest 交叉覆盖
         let lock = match storage::acquire_remote_lock(store, &self.device_id, Duration::from_secs(60)).await {
@@ -498,7 +527,15 @@ impl SyncEngine {
                                 return (action, Err(anyhow::anyhow!("任务已暂停")));
                             }
                             match engine.execute_action(store, &action).await {
-                                Ok(ops) => break (action, Ok(ops)),
+                                Ok(ops) => {
+                                    // 传输完成立即实时上报 FileDone，保证进度条平滑递增
+                                    events.emit(SyncEvent::FileDone {
+                                        folder_id: fid,
+                                        path: action_path(&action),
+                                        action: action_kind(&action),
+                                    });
+                                    break (action, Ok(ops));
+                                }
                                 Err(e) => {
                                     // 占用挂起类：已入待处理队列，无需重试，立即交给合并阶段
                                     if e.is::<PendingLockError>() {
@@ -572,11 +609,6 @@ impl SyncEngine {
                         final_local.remove(from);
                         final_local.insert(to.clone(), meta.clone());
                     }
-                    self.events.emit(SyncEvent::FileDone {
-                        folder_id: fid,
-                        path: action_path(&action),
-                        action: action_kind(&action),
-                    });
                 }
                 Err(e) => {
                     // 若 DeleteRemote 失败，记录未完成删除路径，基线中必须保留！

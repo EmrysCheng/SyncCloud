@@ -76,6 +76,10 @@ pub fn record_event(
 
     match ev {
         SyncEvent::FileDone { path, action, .. } => {
+            // 节约存储空间：内容一致无需传输的 identical 状态不占用历史记录
+            if action == "identical" {
+                return;
+            }
             let _ = conn_mutex.lock().unwrap().execute(
                 "INSERT INTO activity_history (folder_id, folder_name, folder_local_path, event_type, path, action, timestamp)
                  VALUES (?1, ?2, ?3, 'file_done', ?4, ?5, ?6)",
@@ -241,7 +245,7 @@ pub fn count_history(
         .unwrap_or(0)
 }
 
-/// 自动清理超过指定保留周期的历史数据。
+/// 自动清理超过指定保留周期的历史数据并释放磁盘物理空间。
 /// retention_days: 0 表示永久保留；>0 表示保留天数。
 pub fn clean_expired_history(retention_days: u32) -> usize {
     if retention_days == 0 {
@@ -253,26 +257,37 @@ pub fn clean_expired_history(retention_days: u32) -> usize {
     };
     let cutoff = chrono::Utc::now().timestamp_millis() - (retention_days as i64 * 86400 * 1000);
     let conn = conn_mutex.lock().unwrap();
-    conn.execute(
+    let n = conn.execute(
         "DELETE FROM activity_history WHERE timestamp < ?1",
         params![cutoff],
     )
-    .unwrap_or(0)
+    .unwrap_or(0);
+    if n > 0 {
+        // 清理后主动释放空间，避免 history.db 膨胀
+        let _ = conn.execute("VACUUM", []);
+    }
+    n
 }
 
-/// 用户手动清空所有或指定文件夹的传输历史
+/// 用户手动清空所有或指定文件夹的传输历史并物理收缩数据库
 pub fn clear_all_history(folder_id: Option<&str>) -> usize {
     let conn_mutex = match get_conn() {
         Ok(c) => c,
         Err(_) => return 0,
     };
     let conn = conn_mutex.lock().unwrap();
-    if let Some(fid) = folder_id {
+    let n = if let Some(fid) = folder_id {
         if !fid.is_empty() && fid != "all" {
-            return conn
-                .execute("DELETE FROM activity_history WHERE folder_id = ?1", params![fid])
-                .unwrap_or(0);
+            conn.execute("DELETE FROM activity_history WHERE folder_id = ?1", params![fid])
+                .unwrap_or(0)
+        } else {
+            conn.execute("DELETE FROM activity_history", []).unwrap_or(0)
         }
+    } else {
+        conn.execute("DELETE FROM activity_history", []).unwrap_or(0)
+    };
+    if n > 0 {
+        let _ = conn.execute("VACUUM", []);
     }
-    conn.execute("DELETE FROM activity_history", []).unwrap_or(0)
+    n
 }

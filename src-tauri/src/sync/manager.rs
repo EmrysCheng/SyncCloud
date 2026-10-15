@@ -228,11 +228,11 @@ impl FolderManager {
                         if triggered.is_some()
                             && engine.folder.sync_mode == crate::sync::types::SyncMode::Realtime
                         {
-                            engine.run_cycle(store.as_ref()).await;
+                            engine.run_cycle_with_trigger(store.as_ref(), crate::sync::engine::SyncTrigger::Watcher).await;
                         }
                     }
                     _ = ticker.tick(), if !is_paused => {
-                        engine.run_cycle(store.as_ref()).await;
+                        engine.run_cycle_with_trigger(store.as_ref(), crate::sync::engine::SyncTrigger::Periodic).await;
                     }
                 }
             }
