@@ -10,3 +10,4 @@ pub mod history;
 pub mod transfer;
 pub mod engine;
 pub mod manager;
+pub mod storage_mode;

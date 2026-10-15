@@ -122,6 +122,26 @@ export default function Folders({
     setForcePushFolder(f);
   }
 
+  async function handleStorageMode(f: FolderSummary) {
+    const choice = prompt(
+      `【按需存储方式管理 · 坚果云同款云桥】\n\n` +
+      `任务名称：「${f.name}」\n` +
+      `本地目录：${f.localPath}\n\n` +
+      `请选择本地存储模式（输入序号）：\n` +
+      `1. ☁️ 释放本地空间 (不占电脑内存，文件转为脱机占位符)\n` +
+      `2. 📥 保持离线可用 (全量下载，完整保存在本地电脑上)\n\n` +
+      `提示：您也可随时在 Windows 资源管理器中右击文件选择`,
+      "1"
+    );
+    if (!choice) return;
+    const mode = choice.trim() === "2" ? "keep_offline" : "free_space";
+    const modeName = mode === "keep_offline" ? "保持离线可用" : "释放本地空间";
+    await act(async () => {
+      const count = await api.setFileStorageMode(f.id, "", mode);
+      alert(`已成功将「${f.name}」中的 ${count} 个文件设置为【${modeName}】！`);
+    }, f.id);
+  }
+
   const anyActive = folders.some((f) => f.status?.state !== "paused");
 
   async function handleSyncAll() {
@@ -218,6 +238,7 @@ export default function Folders({
             onToggle={() => setExpanded(expanded === f.id ? null : f.id)}
             onSync={() => act(() => api.syncNow(f.id), f.id)}
             onForcePush={() => handleForcePush(f)}
+            onStorageMode={() => handleStorageMode(f)}
             onAnalyze={() => handleAnalyze(f)}
             onPause={() => act(() => api.pauseFolder(f.id), f.id)}
             onResume={() => act(() => api.resumeFolder(f.id), f.id)}
@@ -333,6 +354,7 @@ function FolderCard({
   onToggle,
   onSync,
   onForcePush,
+  onStorageMode,
   onAnalyze,
   onPause,
   onResume,
@@ -350,6 +372,7 @@ function FolderCard({
   onToggle: () => void;
   onSync: () => void;
   onForcePush: () => void;
+  onStorageMode: () => void;
   onAnalyze: () => void;
   onPause: () => void;
   onResume: () => void;
@@ -533,6 +556,14 @@ function FolderCard({
           onClick={() => api.openInExplorer(f.localPath, false)}
         >
           📁 打开目录
+        </button>
+        <button
+          className="btn btn-sm btn-ghost"
+          disabled={busy || analyzing || syncing}
+          onClick={onStorageMode}
+          title="坚果云同款云桥：在「保持离线可用」与「释放空间不占电脑内存」之间切换"
+        >
+          ☁️ 按需存储…
         </button>
         <button
           className="btn btn-sm btn-ghost"

@@ -8,6 +8,7 @@ pub mod storage;
 pub mod sync;
 pub mod commands;
 pub mod autostart;
+pub mod shell_menu;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -58,8 +59,30 @@ pub fn run() {
     crate::logging::init_logging();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_main_window(app);
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let mut keep_target = None;
+            let mut free_target = None;
+            let mut it = args.into_iter();
+            while let Some(arg) = it.next() {
+                if arg == "--keep-offline" {
+                    keep_target = it.next();
+                } else if arg == "--free-space" {
+                    free_target = it.next();
+                }
+            }
+            if let Some(path) = keep_target {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::sync::storage_mode::handle_shell_command(&handle, "--keep-offline", &path).await;
+                });
+            } else if let Some(path) = free_target {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::sync::storage_mode::handle_shell_command(&handle, "--free-space", &path).await;
+                });
+            } else {
+                show_main_window(app);
+            }
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -263,6 +286,9 @@ pub fn run() {
             commands::baidu_authorized,
             commands::is_autostart,
             commands::set_autostart,
+            commands::is_shell_menu_enabled,
+            commands::set_shell_menu_enabled,
+            commands::set_file_storage_mode,
             commands::list_cloud_accounts,
             commands::delete_cloud_account,
             commands::save_cloud_account,

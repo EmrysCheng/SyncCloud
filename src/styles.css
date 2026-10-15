@@ -146,6 +146,28 @@ body,
   padding-top: 12px;
 }
 
+.sidebar-github-link {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #8ba0c7;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sidebar-github-link:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
 .ticker {
   font-size: 11px;
   color: #8ba0c7;
@@ -2719,8 +2741,83 @@ h2 {
   background: var(--primary-soft);
 }
 
-.force-push-confirm-check input[type="checkbox"] {
-  width: 15px;
-  height: 15px;
+/* ---------- 关于与开源项目卡片 ---------- */
+.github-info-card {
+  background: var(--panel, #ffffff);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  box-shadow: 0 1px 3px rgba(20, 32, 60, 0.03);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.gic-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.gic-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.gic-octocat {
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.gic-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.2;
+}
+
+.gic-desc {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+.gic-links {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.gic-link-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-soft);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
   cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.gic-link-btn:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--primary-soft);
+  transform: translateY(-1px);
+}
+
+.gic-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  flex-wrap: wrap;
 }

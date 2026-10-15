@@ -201,6 +201,15 @@ impl<'a> Scanner<'a> {
                 Ok(m) => m,
                 Err(_) => continue, // 竞态：扫描期间文件被删除
             };
+
+            // 坚果云同款云桥按需存储：若该文件已释放本地空间（占位符），复用记录的远端真实大小与哈希，
+            // 避免误判修改或删除，且无需读取 0 字节文件
+            if let Some(placeholder) = self.db.and_then(|db| db.get_placeholder(&rel)) {
+                stats.files += 1;
+                tree.insert(rel, placeholder);
+                continue;
+            }
+
             // 单文件体积上限过滤（对标 FreeFileSync 与 GoodSync）
             if let Some(max_bytes) = self.max_file_size_bytes {
                 if max_bytes > 0 && meta.len() > max_bytes {
@@ -356,5 +365,28 @@ mod tests {
         assert_eq!(stats.files, 2);
         let keys: Vec<&String> = tree.keys().collect();
         assert!(!keys.iter().any(|k| k.contains('\\')));
+    }
+
+    #[test]
+    fn test_placeholder_preserves_meta_in_scanner() {
+        let root = std::env::temp_dir().join(format!("synccloud-test-ph-scan-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("workspace");
+        let dir_db = root.join("db");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir_db).unwrap();
+        // 本地为 0 字节释放空间状态
+        std::fs::write(dir.join("cloud_doc.pdf"), b"").unwrap();
+
+        let db = StateDb::open(&dir_db.join("state.db")).unwrap();
+        db.add_placeholder("cloud_doc.pdf", 999999, 5000, "original_hash_value");
+
+        let s = Scanner::new(&[], Some(&db)).unwrap();
+        let (tree, stats) = s.scan(&dir).unwrap();
+
+        assert_eq!(stats.files, 1);
+        let m = tree.get("cloud_doc.pdf").unwrap();
+        assert_eq!(m.size, 999999, "占位文件扫描时应保持远端记录的真实逻辑大小");
+        assert_eq!(m.hash, "original_hash_value", "占位文件扫描时应保持远端记录的真实哈希");
     }
 }

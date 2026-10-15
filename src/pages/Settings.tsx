@@ -37,6 +37,7 @@ export default function Settings() {
   const [deviceName, setDeviceName] = useState("");
   const [gs, setGs] = useState<GlobalSettings>(DEFAULT_SETTINGS);
   const [autostart, setAutostart] = useState(false);
+  const [shellMenu, setShellMenu] = useState(false);
   const [saved, setSaved] = useState(false);
   const timer = useRef<number | null>(null);
 
@@ -52,6 +53,7 @@ export default function Settings() {
     loadAppInfo();
     api.getSettings().then(setGs).catch(() => {});
     api.isAutostart().then(setAutostart).catch(() => {});
+    api.isShellMenuEnabled().then(setShellMenu).catch(() => {});
   }, []);
 
   function loadAppInfo() {
@@ -92,6 +94,16 @@ export default function Settings() {
     } catch (e) {
       console.error("切换开机自启动失败:", e);
       api.isAutostart().then(setAutostart).catch(() => {});
+    }
+  }
+
+  async function toggleShellMenu(enabled: boolean) {
+    setShellMenu(enabled);
+    try {
+      await api.setShellMenuEnabled(enabled);
+    } catch (e) {
+      console.error("切换右键菜单扩展失败:", e);
+      api.isShellMenuEnabled().then(setShellMenu).catch(() => {});
     }
   }
 
@@ -168,6 +180,14 @@ export default function Settings() {
             }}
           />
           <span>关闭窗口时最小化到系统托盘（后台继续同步，右键托盘图标可退出）</span>
+        </label>
+        <label className="field checkbox">
+          <input
+            type="checkbox"
+            checked={shellMenu}
+            onChange={(e) => toggleShellMenu(e.target.checked)}
+          />
+          <span>Windows 资源管理器右键菜单集成（坚果云同款云桥：保持离线可用 / 释放空间不占电脑内存）</span>
         </label>
       </section>
 
@@ -432,11 +452,51 @@ export default function Settings() {
       />
 
       <section className="settings-section">
-        <h2>关于</h2>
-        <p className="muted">
-          SyncCloud — 多后端文件同步。S3 兼容 / WebDAV / Git / 百度网盘 / 阿里云盘。
-          冲突采用 Dropbox 式双方保留策略，远端 manifest + 本地基线三方对比同步。
-        </p>
+        <h2>关于与开源项目</h2>
+        <div className="github-info-card">
+          <div className="gic-header">
+            <div className="gic-brand">
+              <svg className="gic-octocat" width="26" height="26" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
+              </svg>
+              <div>
+                <div className="gic-title">SyncCloud</div>
+                <div className="gic-desc">多后端多云盘桌面文件同步工具 · 基于 Tauri 2 + Rust 构建</div>
+              </div>
+            </div>
+            <span className="badge badge-plain">v{info?.version || "0.1.0"}</span>
+          </div>
+
+          <div className="gic-links">
+            <button
+              type="button"
+              className="btn btn-sm gic-link-btn"
+              onClick={() => api.openExternal("https://github.com/EmrysCheng/SyncCloud")}
+            >
+              ⭐️ GitHub 仓库主页 ↗
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm gic-link-btn"
+              onClick={() => api.openExternal("https://github.com/EmrysCheng/SyncCloud/releases")}
+            >
+              📦 发行版本 (Releases) ↗
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm gic-link-btn"
+              onClick={() => api.openExternal("https://github.com/EmrysCheng/SyncCloud/issues")}
+            >
+              💬 问题反馈与建议 ↗
+            </button>
+          </div>
+
+          <div className="gic-meta">
+            <span>开源协议：MIT License</span>
+            <span>·</span>
+            <span>支持后端：S3 兼容 / WebDAV / Git / 百度网盘 / 阿里云盘</span>
+          </div>
+        </div>
       </section>
     </div>
   );

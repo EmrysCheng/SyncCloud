@@ -314,6 +314,35 @@ pub fn set_hidden_windows(path: &std::path::Path) {
 #[cfg(not(target_os = "windows"))]
 pub fn set_hidden_windows(_path: &std::path::Path) {}
 
+/// 在 Windows 平台上设置或清除脱机文件属性 FILE_ATTRIBUTE_OFFLINE（0x1000，坚果云同款云桥图标）。
+#[cfg(target_os = "windows")]
+pub fn set_offline_windows(path: &std::path::Path, offline: bool) {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    extern "system" {
+        fn GetFileAttributesW(lpFileName: *const u16) -> u32;
+        fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
+    }
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+    const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
+    unsafe {
+        let attrs = GetFileAttributesW(wide.as_ptr());
+        if attrs != INVALID_FILE_ATTRIBUTES {
+            let next = if offline {
+                attrs | FILE_ATTRIBUTE_OFFLINE
+            } else {
+                attrs & !FILE_ATTRIBUTE_OFFLINE
+            };
+            if next != attrs {
+                let _ = SetFileAttributesW(wide.as_ptr(), next);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_offline_windows(_path: &std::path::Path, _offline: bool) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -92,6 +92,13 @@ impl StateDb {
                 hash       TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS placeholders (
+                path       TEXT PRIMARY KEY,
+                size       INTEGER NOT NULL,
+                mtime_ms   INTEGER NOT NULL,
+                hash       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
         ")?;
         Ok(Self { conn: std::sync::Mutex::new(conn) })
     }
@@ -369,5 +376,97 @@ impl StateDb {
             "INSERT OR REPLACE INTO kv (k, v) VALUES (?1, ?2)",
             params![key, value],
         );
+    }
+
+    // ---- 脱机占位符（不占用电脑空间 / 坚果云同款云桥按需存储） ----
+
+    pub fn add_placeholder(&self, path: &str, size: u64, mtime_ms: i64, hash: &str) {
+        let _ = self.conn.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO placeholders (path, size, mtime_ms, hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                path,
+                size as i64,
+                mtime_ms,
+                hash,
+                chrono::Local::now().to_rfc3339()
+            ],
+        );
+    }
+
+    pub fn remove_placeholder(&self, path: &str) {
+        let _ = self.conn.lock().unwrap().execute(
+            "DELETE FROM placeholders WHERE path = ?1",
+            params![path],
+        );
+    }
+
+    pub fn get_placeholder(&self, path: &str) -> Option<FileMeta> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT size, mtime_ms, hash FROM placeholders WHERE path = ?1",
+                params![path],
+                |row| {
+                    Ok(FileMeta {
+                        size: row.get::<_, i64>(0)?.max(0) as u64,
+                        mtime_ms: row.get(1)?,
+                        hash: row.get(2)?,
+                    })
+                },
+            )
+            .ok()
+    }
+
+    pub fn is_placeholder(&self, path: &str) -> bool {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM placeholders WHERE path = ?1",
+                params![path],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    pub fn count_placeholders(&self) -> usize {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM placeholders", [], |r| r.get::<_, i64>(0))
+            .map(|n| n.max(0) as usize)
+            .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholder_crud_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("synccloud-state-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = StateDb::open(&dir.join("state.db")).unwrap();
+
+        assert_eq!(db.count_placeholders(), 0);
+        assert!(!db.is_placeholder("doc.txt"));
+
+        db.add_placeholder("doc.txt", 1024, 200, "hash123");
+        assert_eq!(db.count_placeholders(), 1);
+        assert!(db.is_placeholder("doc.txt"));
+
+        let meta = db.get_placeholder("doc.txt").unwrap();
+        assert_eq!(meta.size, 1024);
+        assert_eq!(meta.mtime_ms, 200);
+        assert_eq!(meta.hash, "hash123");
+
+        db.remove_placeholder("doc.txt");
+        assert_eq!(db.count_placeholders(), 0);
+        assert!(!db.is_placeholder("doc.txt"));
+        assert!(db.get_placeholder("doc.txt").is_none());
     }
 }

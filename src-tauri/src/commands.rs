@@ -444,6 +444,38 @@ pub async fn set_autostart(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+// ---- Windows 资源管理器右键扩展（坚果云同款云桥功能） ----
+
+#[tauri::command]
+pub async fn is_shell_menu_enabled() -> Result<bool, String> {
+    Ok(crate::shell_menu::is_shell_menu_enabled())
+}
+
+#[tauri::command]
+pub async fn set_shell_menu_enabled(enabled: bool) -> Result<(), String> {
+    crate::shell_menu::set_shell_menu_enabled(enabled).map_err(err)
+}
+
+#[tauri::command]
+pub async fn set_file_storage_mode(
+    state: State<'_, AppState>,
+    folder_id: String,
+    path: String,
+    mode: String,
+) -> Result<usize, String> {
+    let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
+    let cfg = state.config.lock().await;
+    let folder = cfg.folders.iter().find(|f| f.id == id).cloned().ok_or_else(|| "文件夹不存在".to_string())?;
+    drop(cfg);
+
+    let data_dir = crate::config::folder_data_dir(&folder.id);
+    let db = crate::sync::state::StateDb::open(&data_dir.join("state.db")).map_err(err)?;
+
+    crate::sync::storage_mode::apply_storage_mode_path(&folder, &db, &path, &mode)
+        .await
+        .map_err(err)
+}
+
 // ---- 数据目录管理 ----
 
 #[tauri::command]
