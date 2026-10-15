@@ -2,7 +2,7 @@
 //! 负责本地文件的脱机占位截断、Windows 脱机属性打标，以及按需回拉下载。
 
 use std::path::{Path, PathBuf};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tracing::{info, warn};
 
 use crate::config::{folder_data_dir, FolderConfig};
@@ -152,6 +152,14 @@ pub async fn apply_storage_mode_path(
     Ok(success_count)
 }
 
+/// Windows 路径前缀匹配（不区分大小写与正反斜杠）。
+fn path_starts_with_case_insensitive(path: &Path, prefix: &Path) -> bool {
+    let p_str = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let pre_str = prefix.to_string_lossy().replace('/', "\\").to_lowercase();
+    let pre_clean = pre_str.trim_end_matches('\\');
+    p_str == pre_clean || p_str.starts_with(&format!("{pre_clean}\\"))
+}
+
 /// 处理 Windows 资源管理器右键传参执行（Shell 扩展命令分发）。
 pub async fn handle_shell_command(
     app: &tauri::AppHandle,
@@ -171,9 +179,10 @@ pub async fn handle_shell_command(
     };
     let cfg = state.config.lock().await.clone();
 
+    // 采用 Windows 大小写不敏感与斜杠标准化前缀匹配
     let matched = cfg.folders.iter().find(|f| {
         let root = Path::new(&f.local_path);
-        target_path.starts_with(root)
+        path_starts_with_case_insensitive(&target_path, root)
     });
 
     let folder = match matched {
@@ -230,5 +239,13 @@ pub async fn handle_shell_command(
         }
     }
 
-    info!(folder = %folder.name, command, processed = count, "资源管理器右键操作执行完毕");
+    let target_name = target_path.file_name().and_then(|n| n.to_str()).unwrap_or("目标文件");
+    let notify_msg = match command {
+        "--keep-offline" => format!("已将「{target_name}」设为保持离线可用（恢复 {count} 项完整文件）"),
+        "--free-space" => format!("已将「{target_name}」设为不占用电脑空间（已释放 {count} 项本地磁盘占用）"),
+        _ => format!("操作已完成（处理 {count} 项）"),
+    };
+
+    info!(folder = %folder.name, command, processed = count, "{notify_msg}");
+    let _ = app.emit("synccloud://toast", notify_msg);
 }

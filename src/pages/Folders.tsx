@@ -5,6 +5,7 @@ import FolderSettingsModal from "../components/FolderSettingsModal";
 import PlanPreviewModal from "../components/PlanPreviewModal";
 import RecycleBinModal from "../components/RecycleBinModal";
 import ForcePushConfirmModal from "../components/ForcePushConfirmModal";
+import StorageModeModal from "../components/StorageModeModal";
 
 const BACKEND_LABEL: Record<string, string> = {
   s3: "S3 兼容",
@@ -67,6 +68,7 @@ export default function Folders({
   } | null>(null);
   const [recycleBinFolder, setRecycleBinFolder] = useState<FolderSummary | null>(null);
   const [forcePushFolder, setForcePushFolder] = useState<FolderSummary | null>(null);
+  const [storageModeFolder, setStorageModeFolder] = useState<FolderSummary | null>(null);
   const [healthMap, setHealthMap] = useState<
     Record<string, { status: "checking" | "ok" | "err"; msg?: string }>
   >({});
@@ -122,24 +124,8 @@ export default function Folders({
     setForcePushFolder(f);
   }
 
-  async function handleStorageMode(f: FolderSummary) {
-    const choice = prompt(
-      `【按需存储方式管理 · 坚果云同款云桥】\n\n` +
-      `任务名称：「${f.name}」\n` +
-      `本地目录：${f.localPath}\n\n` +
-      `请选择本地存储模式（输入序号）：\n` +
-      `1. ☁️ 释放本地空间 (不占电脑内存，文件转为脱机占位符)\n` +
-      `2. 📥 保持离线可用 (全量下载，完整保存在本地电脑上)\n\n` +
-      `提示：您也可随时在 Windows 资源管理器中右击文件选择`,
-      "1"
-    );
-    if (!choice) return;
-    const mode = choice.trim() === "2" ? "keep_offline" : "free_space";
-    const modeName = mode === "keep_offline" ? "保持离线可用" : "释放本地空间";
-    await act(async () => {
-      const count = await api.setFileStorageMode(f.id, "", mode);
-      alert(`已成功将「${f.name}」中的 ${count} 个文件设置为【${modeName}】！`);
-    }, f.id);
+  function handleStorageMode(f: FolderSummary) {
+    setStorageModeFolder(f);
   }
 
   const anyActive = folders.some((f) => f.status?.state !== "paused");
@@ -283,6 +269,22 @@ export default function Folders({
             const id = forcePushFolder.id;
             setForcePushFolder(null);
             await act(() => api.forcePushFolder(id), id);
+          }}
+        />
+      )}
+
+      {storageModeFolder && (
+        <StorageModeModal
+          folder={storageModeFolder}
+          onClose={() => setStorageModeFolder(null)}
+          onApply={async (mode) => {
+            const id = storageModeFolder.id;
+            const name = storageModeFolder.name;
+            const modeName = mode === "keep_offline" ? "保持离线可用" : "释放本地空间";
+            await act(async () => {
+              const count = await api.setFileStorageMode(id, "", mode);
+              alert(`已成功将「${name}」中的 ${count} 个文件设置为【${modeName}】！`);
+            }, id);
           }}
         />
       )}
@@ -559,7 +561,7 @@ function FolderCard({
         </button>
         <button
           className="btn btn-sm btn-ghost"
-          disabled={busy || analyzing || syncing}
+          disabled={busy || analyzing}
           onClick={onStorageMode}
           title="坚果云同款云桥：在「保持离线可用」与「释放空间不占电脑内存」之间切换"
         >

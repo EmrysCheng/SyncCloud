@@ -66,8 +66,12 @@ pub fn run() {
             while let Some(arg) = it.next() {
                 if arg == "--keep-offline" {
                     keep_target = it.next();
+                } else if let Some(p) = arg.strip_prefix("--keep-offline=") {
+                    keep_target = Some(p.to_string());
                 } else if arg == "--free-space" {
                     free_target = it.next();
+                } else if let Some(p) = arg.strip_prefix("--free-space=") {
+                    free_target = Some(p.to_string());
                 }
             }
             if let Some(path) = keep_target {
@@ -230,6 +234,37 @@ pub fn run() {
 
             // 同步/升级开机自启动命令行格式（若已开启，确保带 --autostart 参数）
             crate::autostart::ensure_autostart_command_updated();
+
+            // 确保 Windows 资源管理器右键快捷菜单已注册就绪（坚果云同款云桥功能）
+            crate::shell_menu::ensure_shell_menu_registered();
+
+            // 检查冷启动参数：是否由外部右键菜单直接唤起启动
+            let mut startup_args = std::env::args();
+            let mut cold_keep = None;
+            let mut cold_free = None;
+            while let Some(arg) = startup_args.next() {
+                if arg == "--keep-offline" {
+                    cold_keep = startup_args.next();
+                } else if let Some(p) = arg.strip_prefix("--keep-offline=") {
+                    cold_keep = Some(p.to_string());
+                } else if arg == "--free-space" {
+                    cold_free = startup_args.next();
+                } else if let Some(p) = arg.strip_prefix("--free-space=") {
+                    cold_free = Some(p.to_string());
+                }
+            }
+
+            if let Some(path) = cold_keep {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::sync::storage_mode::handle_shell_command(&handle, "--keep-offline", &path).await;
+                });
+            } else if let Some(path) = cold_free {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::sync::storage_mode::handle_shell_command(&handle, "--free-space", &path).await;
+                });
+            }
 
             // 检查启动参数：若由开机自启或 --minimized 启动，程序默认最小化/退到托盘
             let is_autostart_launch = crate::autostart::is_autostart_arg_present();

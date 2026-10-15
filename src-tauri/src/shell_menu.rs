@@ -1,11 +1,17 @@
 //! Windows 资源管理器右键上下文菜单注册（坚果云同款云桥功能）。
-//! 写入 HKCU\Software\Classes\*\shell\SyncCloud 与 Directory\shell\SyncCloud，
-//! 提供「保持离线可用」与「释放空间 (不占用电脑空间)」操作。
+//! 注册在 HKCU\Software\Classes 下的 *、Directory、Folder 及 Directory\Background，
+//! 严格对标坚果云实图样式：
+//!   SyncCloud >
+//!     ✓ 保持离线可用
+//!     ☁ 不占用电脑空间
 
 #[cfg(target_os = "windows")]
-const FILE_SHELL_KEY: &str = r"HKCU\Software\Classes\*\shell\SyncCloud";
-#[cfg(target_os = "windows")]
-const DIR_SHELL_KEY: &str = r"HKCU\Software\Classes\Directory\shell\SyncCloud";
+const SHELL_ROOTS: &[&str] = &[
+    r"HKCU\Software\Classes\*\shell\SyncCloud",
+    r"HKCU\Software\Classes\Directory\shell\SyncCloud",
+    r"HKCU\Software\Classes\Folder\shell\SyncCloud",
+    r"HKCU\Software\Classes\Directory\Background\shell\SyncCloud",
+];
 
 /// 检查当前是否已启用 Windows 资源管理器右键快捷菜单。
 pub fn is_shell_menu_enabled() -> bool {
@@ -14,7 +20,7 @@ pub fn is_shell_menu_enabled() -> bool {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         let output = std::process::Command::new("reg")
-            .args(["query", FILE_SHELL_KEY])
+            .args(["query", SHELL_ROOTS[1]])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
         if let Ok(out) = output {
@@ -39,8 +45,8 @@ pub fn set_shell_menu_enabled(enabled: bool) -> anyhow::Result<()> {
             let exe = std::env::current_exe()?;
             let exe_str = exe.to_string_lossy().to_string();
 
-            for root_key in [FILE_SHELL_KEY, DIR_SHELL_KEY] {
-                // 1. 主菜单项
+            for root_key in SHELL_ROOTS {
+                // 1. 主菜单项（SyncCloud + 图标）
                 let _ = std::process::Command::new("reg")
                     .args(["add", root_key, "/v", "MUIVerb", "/t", "REG_SZ", "/d", "SyncCloud", "/f"])
                     .creation_flags(CREATE_NO_WINDOW)
@@ -50,14 +56,18 @@ pub fn set_shell_menu_enabled(enabled: bool) -> anyhow::Result<()> {
                     .creation_flags(CREATE_NO_WINDOW)
                     .output()?;
                 let _ = std::process::Command::new("reg")
-                    .args(["add", root_key, "/v", "subcommands", "/t", "REG_SZ", "/d", "", "/f"])
+                    .args(["add", root_key, "/v", "SubCommands", "/t", "REG_SZ", "/d", "", "/f"])
                     .creation_flags(CREATE_NO_WINDOW)
                     .output()?;
 
-                // 2. 子菜单 1: 保持离线可用
-                let sub_keep = format!("{root_key}\\shell\\cmd_keep");
+                // 2. 子菜单 1: ✓ 保持离线可用（对标坚果云实图样式）
+                let sub_keep = format!("{root_key}\\Shell\\KeepOffline");
                 let _ = std::process::Command::new("reg")
-                    .args(["add", &sub_keep, "/ve", "/t", "REG_SZ", "/d", "保持离线可用", "/f"])
+                    .args(["add", &sub_keep, "/ve", "/t", "REG_SZ", "/d", "✓ 保持离线可用", "/f"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output()?;
+                let _ = std::process::Command::new("reg")
+                    .args(["add", &sub_keep, "/v", "Icon", "/t", "REG_SZ", "/d", &format!("\"{exe_str}\""), "/f"])
                     .creation_flags(CREATE_NO_WINDOW)
                     .output()?;
                 let sub_keep_cmd = format!("{sub_keep}\\command");
@@ -67,10 +77,14 @@ pub fn set_shell_menu_enabled(enabled: bool) -> anyhow::Result<()> {
                     .creation_flags(CREATE_NO_WINDOW)
                     .output()?;
 
-                // 3. 子菜单 2: 释放空间 (不占用电脑空间)
-                let sub_free = format!("{root_key}\\shell\\cmd_free");
+                // 3. 子菜单 2: ☁ 不占用电脑空间（对标坚果云实图样式）
+                let sub_free = format!("{root_key}\\Shell\\FreeSpace");
                 let _ = std::process::Command::new("reg")
-                    .args(["add", &sub_free, "/ve", "/t", "REG_SZ", "/d", "释放空间 (不占用电脑空间)", "/f"])
+                    .args(["add", &sub_free, "/ve", "/t", "REG_SZ", "/d", "☁ 不占用电脑空间", "/f"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output()?;
+                let _ = std::process::Command::new("reg")
+                    .args(["add", &sub_free, "/v", "Icon", "/t", "REG_SZ", "/d", &format!("\"{exe_str}\""), "/f"])
                     .creation_flags(CREATE_NO_WINDOW)
                     .output()?;
                 let sub_free_cmd = format!("{sub_free}\\command");
@@ -81,7 +95,7 @@ pub fn set_shell_menu_enabled(enabled: bool) -> anyhow::Result<()> {
                     .output()?;
             }
         } else {
-            for root_key in [FILE_SHELL_KEY, DIR_SHELL_KEY] {
+            for root_key in SHELL_ROOTS {
                 let _ = std::process::Command::new("reg")
                     .args(["delete", root_key, "/f"])
                     .creation_flags(CREATE_NO_WINDOW)
@@ -93,5 +107,14 @@ pub fn set_shell_menu_enabled(enabled: bool) -> anyhow::Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
         anyhow::bail!("当前操作系统暂不支持资源管理器右键扩展");
+    }
+}
+
+/// 启动时确保右键菜单已就绪（开箱即用，对齐坚果云体验）。
+pub fn ensure_shell_menu_registered() {
+    #[cfg(target_os = "windows")]
+    {
+        // 若尚未注册或 exe 路径有更新，默认予以注册
+        let _ = set_shell_menu_enabled(true);
     }
 }
