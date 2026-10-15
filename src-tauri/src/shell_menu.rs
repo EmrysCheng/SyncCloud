@@ -118,3 +118,30 @@ pub fn ensure_shell_menu_registered() {
         let _ = set_shell_menu_enabled(true);
     }
 }
+
+/// 将同步文件夹注册到 Windows 10/11 原生 SyncRootManager（坚果云同款，自动激活资源管理器「状态」列）。
+#[cfg(target_os = "windows")]
+pub fn register_sync_root(folder_id: &str, folder_name: &str, local_path: &str) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    if let Ok(exe) = std::env::current_exe() {
+        let exe_str = exe.to_string_lossy().to_string();
+        let key = format!(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\SyncCloud!{folder_id}");
+        let _ = std::process::Command::new("reg")
+            .args(["add", &key, "/v", "DisplayNameResource", "/t", "REG_SZ", "/d", &format!("SyncCloud ({folder_name})"), "/f"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let _ = std::process::Command::new("reg")
+            .args(["add", &key, "/v", "IconResource", "/t", "REG_SZ", "/d", &exe_str, "/f"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let user_key = format!("{key}\\UserSyncRoots");
+        let _ = std::process::Command::new("reg")
+            .args(["add", &user_key, "/ve", "/t", "REG_SZ", "/d", local_path, "/f"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn register_sync_root(_folder_id: &str, _folder_name: &str, _local_path: &str) {}

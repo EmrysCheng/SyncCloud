@@ -314,30 +314,46 @@ pub fn set_hidden_windows(path: &std::path::Path) {
 #[cfg(not(target_os = "windows"))]
 pub fn set_hidden_windows(_path: &std::path::Path) {}
 
-/// 在 Windows 平台上设置或清除脱机文件属性 FILE_ATTRIBUTE_OFFLINE（0x1000，坚果云同款云桥图标）。
+/// 在 Windows 平台上设置或清除存储模式对应的文件属性（严格对齐坚果云图例）：
+/// - "keep_offline"（保持离线可用）：添加 FILE_ATTRIBUTE_PINNED（0x80000），清除 OFFLINE 与 UNPINNED，
+///   在 Windows 资源管理器【状态】列渲染为「实心绿圈白勾（始终在此设备上可用）」！
+/// - "free_space"（不占用电脑空间）：添加 FILE_ATTRIBUTE_UNPINNED（0x100000）与 FILE_ATTRIBUTE_OFFLINE（0x1000），清除 PINNED，
+///   在 Windows 资源管理器【状态】列渲染为「空心绿圈白勾（联机可用 / 不占空间）」！
 #[cfg(target_os = "windows")]
-pub fn set_offline_windows(path: &std::path::Path, offline: bool) {
+pub fn set_storage_mode_attributes(path: &std::path::Path, mode: &str) {
     use std::os::windows::ffi::OsStrExt;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     extern "system" {
         fn GetFileAttributesW(lpFileName: *const u16) -> u32;
         fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
     }
-    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x00001000;
+    const FILE_ATTRIBUTE_PINNED: u32 = 0x00080000;
+    const FILE_ATTRIBUTE_UNPINNED: u32 = 0x00100000;
     const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
+
     unsafe {
         let attrs = GetFileAttributesW(wide.as_ptr());
         if attrs != INVALID_FILE_ATTRIBUTES {
-            let next = if offline {
-                attrs | FILE_ATTRIBUTE_OFFLINE
-            } else {
-                attrs & !FILE_ATTRIBUTE_OFFLINE
+            let next = match mode {
+                "keep_offline" => (attrs & !FILE_ATTRIBUTE_OFFLINE & !FILE_ATTRIBUTE_UNPINNED) | FILE_ATTRIBUTE_PINNED,
+                "free_space" => (attrs & !FILE_ATTRIBUTE_PINNED) | FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_UNPINNED,
+                _ => attrs,
             };
             if next != attrs {
                 let _ = SetFileAttributesW(wide.as_ptr(), next);
             }
         }
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_storage_mode_attributes(_path: &std::path::Path, _mode: &str) {}
+
+#[cfg(target_os = "windows")]
+pub fn set_offline_windows(path: &std::path::Path, offline: bool) {
+    let mode = if offline { "free_space" } else { "keep_offline" };
+    set_storage_mode_attributes(path, mode);
 }
 
 #[cfg(not(target_os = "windows"))]

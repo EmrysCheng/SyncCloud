@@ -83,6 +83,9 @@ impl FolderManager {
         std::fs::create_dir_all(&data_dir)?;
         let db = StateDb::open(&data_dir.join("state.db"))?;
 
+        // 注册到 Windows 原生 SyncRootManager（坚果云同款，激活资源管理器「状态」列）
+        crate::shell_menu::register_sync_root(&folder.id.to_string(), &folder.name, &folder.local_path);
+
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<FolderCmd>(16);
         let paused = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(FolderStatus {

@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::config::{folder_data_dir, FolderConfig};
 use crate::storage::build_store;
-use crate::sync::fslock::{set_offline_windows, replace_file};
+use crate::sync::fslock::{set_storage_mode_attributes, replace_file};
 use crate::sync::scanner::{abs_path, rel_path, hash_file};
 use crate::sync::state::StateDb;
 use crate::AppState;
@@ -25,8 +25,8 @@ pub async fn keep_offline_file(
     if !db.is_placeholder(rel) && target.is_file() {
         if let Ok(m) = std::fs::metadata(&target) {
             if m.len() > 0 {
-                // 已是完整离线文件，确保脱机属性已清除
-                set_offline_windows(&target, false);
+                // 已是完整离线文件，确保脱机属性已清除并保持实心绿圈白勾
+                set_storage_mode_attributes(&target, "keep_offline");
                 return Ok(false);
             }
         }
@@ -42,7 +42,7 @@ pub async fn keep_offline_file(
     }
 
     replace_file(&tmp, &target).await?;
-    set_offline_windows(&target, false);
+    set_storage_mode_attributes(&target, "keep_offline");
     db.remove_placeholder(rel);
 
     info!(folder = %folder.name, path = %rel, "已设为保持离线可用（完整下载恢复）");
@@ -83,7 +83,7 @@ pub async fn free_space_file(
     let meta = std::fs::metadata(&target)?;
     let local_size = meta.len();
     if local_size == 0 && db.is_placeholder(rel) {
-        set_offline_windows(&target, true);
+        set_storage_mode_attributes(&target, "free_space");
         return Ok(false);
     }
 
@@ -99,8 +99,8 @@ pub async fn free_space_file(
     // 2. 将本地文件清空截断为 0 字节，释放实际磁盘块
     tokio::fs::write(&target, b"").await?;
 
-    // 3. 赋予 Windows 原生脱机文件属性（FILE_ATTRIBUTE_OFFLINE，显示脱机云朵标记）
-    set_offline_windows(&target, true);
+    // 3. 赋予 Windows 原生脱机与云端状态属性（FILE_ATTRIBUTE_UNPINNED + FILE_ATTRIBUTE_OFFLINE）
+    set_storage_mode_attributes(&target, "free_space");
 
     info!(folder = %folder.name, path = %rel, freed_bytes = local_size, "已释放电脑本地空间");
     Ok(true)
@@ -148,6 +148,11 @@ pub async fn apply_storage_mode_path(
         if let Ok(true) = res {
             success_count += 1;
         }
+    }
+
+    // 若目标为目录，对目录本身也设置对应的 Windows 属性
+    if target.is_dir() {
+        set_storage_mode_attributes(&target, mode);
     }
     Ok(success_count)
 }

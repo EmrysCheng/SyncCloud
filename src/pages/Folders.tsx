@@ -5,7 +5,6 @@ import FolderSettingsModal from "../components/FolderSettingsModal";
 import PlanPreviewModal from "../components/PlanPreviewModal";
 import RecycleBinModal from "../components/RecycleBinModal";
 import ForcePushConfirmModal from "../components/ForcePushConfirmModal";
-import StorageModeModal from "../components/StorageModeModal";
 
 const BACKEND_LABEL: Record<string, string> = {
   s3: "S3 兼容",
@@ -68,7 +67,6 @@ export default function Folders({
   } | null>(null);
   const [recycleBinFolder, setRecycleBinFolder] = useState<FolderSummary | null>(null);
   const [forcePushFolder, setForcePushFolder] = useState<FolderSummary | null>(null);
-  const [storageModeFolder, setStorageModeFolder] = useState<FolderSummary | null>(null);
   const [healthMap, setHealthMap] = useState<
     Record<string, { status: "checking" | "ok" | "err"; msg?: string }>
   >({});
@@ -122,10 +120,6 @@ export default function Folders({
 
   function handleForcePush(f: FolderSummary) {
     setForcePushFolder(f);
-  }
-
-  function handleStorageMode(f: FolderSummary) {
-    setStorageModeFolder(f);
   }
 
   const anyActive = folders.some((f) => f.status?.state !== "paused");
@@ -224,7 +218,6 @@ export default function Folders({
             onToggle={() => setExpanded(expanded === f.id ? null : f.id)}
             onSync={() => act(() => api.syncNow(f.id), f.id)}
             onForcePush={() => handleForcePush(f)}
-            onStorageMode={() => handleStorageMode(f)}
             onAnalyze={() => handleAnalyze(f)}
             onPause={() => act(() => api.pauseFolder(f.id), f.id)}
             onResume={() => act(() => api.resumeFolder(f.id), f.id)}
@@ -269,22 +262,6 @@ export default function Folders({
             const id = forcePushFolder.id;
             setForcePushFolder(null);
             await act(() => api.forcePushFolder(id), id);
-          }}
-        />
-      )}
-
-      {storageModeFolder && (
-        <StorageModeModal
-          folder={storageModeFolder}
-          onClose={() => setStorageModeFolder(null)}
-          onApply={async (mode) => {
-            const id = storageModeFolder.id;
-            const name = storageModeFolder.name;
-            const modeName = mode === "keep_offline" ? "保持离线可用" : "释放本地空间";
-            await act(async () => {
-              const count = await api.setFileStorageMode(id, "", mode);
-              alert(`已成功将「${name}」中的 ${count} 个文件设置为【${modeName}】！`);
-            }, id);
           }}
         />
       )}
@@ -356,7 +333,6 @@ function FolderCard({
   onToggle,
   onSync,
   onForcePush,
-  onStorageMode,
   onAnalyze,
   onPause,
   onResume,
@@ -374,7 +350,6 @@ function FolderCard({
   onToggle: () => void;
   onSync: () => void;
   onForcePush: () => void;
-  onStorageMode: () => void;
   onAnalyze: () => void;
   onPause: () => void;
   onResume: () => void;
@@ -558,14 +533,6 @@ function FolderCard({
           onClick={() => api.openInExplorer(f.localPath, false)}
         >
           📁 打开目录
-        </button>
-        <button
-          className="btn btn-sm btn-ghost"
-          disabled={busy || analyzing}
-          onClick={onStorageMode}
-          title="坚果云同款云桥：在「保持离线可用」与「释放空间不占电脑内存」之间切换"
-        >
-          ☁️ 按需存储…
         </button>
         <button
           className="btn btn-sm btn-ghost"
