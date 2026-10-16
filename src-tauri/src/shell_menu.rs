@@ -6,10 +6,10 @@
 //!     ☁ 不占用电脑空间
 
 #[cfg(target_os = "windows")]
-const SHELL_ROOTS: &[(&str, &str)] = &[
-    (r"HKCU\Software\Classes\*\shell\SyncCloud", "*\\shell\\SyncCloud"),
-    (r"HKCU\Software\Classes\Directory\shell\SyncCloud", "Directory\\shell\\SyncCloud"),
-    (r"HKCU\Software\Classes\Directory\Background\shell\SyncCloud", "Directory\\Background\\shell\\SyncCloud"),
+const SHELL_ROOTS: &[&str] = &[
+    r"HKCU\Software\Classes\*\shell\SyncCloud",
+    r"HKCU\Software\Classes\Directory\shell\SyncCloud",
+    r"HKCU\Software\Classes\Directory\Background\shell\SyncCloud",
 ];
 
 /// 检查当前是否已启用 Windows 资源管理器右键快捷菜单。
@@ -19,7 +19,7 @@ pub fn is_shell_menu_enabled() -> bool {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         let output = std::process::Command::new("reg")
-            .args(["query", SHELL_ROOTS[1].0])
+            .args(["query", SHELL_ROOTS[1]])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
         if let Ok(out) = output {
@@ -50,8 +50,18 @@ pub fn set_shell_menu_enabled(enabled: bool) -> anyhow::Result<()> {
             let exe = std::env::current_exe()?;
             let exe_str = exe.to_string_lossy().to_string();
 
-            for (root_key, rel_key) in SHELL_ROOTS {
-                // 1. 主菜单项（SyncCloud + 图标）
+            for root_key in SHELL_ROOTS {
+                // 清理旧可能存在的 ExtendedSubCommandsKey（避免 Windows Explorer 重复枚举导致子菜单项翻倍）
+                let _ = std::process::Command::new("reg")
+                    .args(["delete", root_key, "/v", "ExtendedSubCommandsKey", "/f"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
+                let _ = std::process::Command::new("reg")
+                    .args(["delete", &format!("{root_key}\\Shell"), "/f"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
+
+                // 1. 主菜单项（SyncCloud + 图标，标准的纯静态级联子键规范）
                 let _ = std::process::Command::new("reg")
                     .args(["add", root_key, "/v", "MUIVerb", "/t", "REG_SZ", "/d", "SyncCloud", "/f"])
                     .creation_flags(CREATE_NO_WINDOW)
@@ -64,13 +74,9 @@ pub fn set_shell_menu_enabled(enabled: bool) -> anyhow::Result<()> {
                     .args(["add", root_key, "/v", "SubCommands", "/t", "REG_SZ", "/d", "", "/f"])
                     .creation_flags(CREATE_NO_WINDOW)
                     .output()?;
-                let _ = std::process::Command::new("reg")
-                    .args(["add", root_key, "/v", "ExtendedSubCommandsKey", "/t", "REG_SZ", "/d", rel_key, "/f"])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .output()?;
 
-                // 2. 子菜单 1: ✓ 保持离线可用（对标坚果云实图样式）
-                let sub_keep = format!("{root_key}\\Shell\\KeepOffline");
+                // 2. 子菜单 1: ✓ 保持离线可用（排第 1 项，坚果云实图同款）
+                let sub_keep = format!("{root_key}\\Shell\\01_KeepOffline");
                 let _ = std::process::Command::new("reg")
                     .args(["add", &sub_keep, "/ve", "/t", "REG_SZ", "/d", "✓ 保持离线可用", "/f"])
                     .creation_flags(CREATE_NO_WINDOW)
@@ -86,8 +92,8 @@ pub fn set_shell_menu_enabled(enabled: bool) -> anyhow::Result<()> {
                     .creation_flags(CREATE_NO_WINDOW)
                     .output()?;
 
-                // 3. 子菜单 2: ☁ 不占用电脑空间（对标坚果云实图样式）
-                let sub_free = format!("{root_key}\\Shell\\FreeSpace");
+                // 3. 子菜单 2: ☁ 不占用电脑空间（排第 2 项，坚果云实图同款）
+                let sub_free = format!("{root_key}\\Shell\\02_FreeSpace");
                 let _ = std::process::Command::new("reg")
                     .args(["add", &sub_free, "/ve", "/t", "REG_SZ", "/d", "☁ 不占用电脑空间", "/f"])
                     .creation_flags(CREATE_NO_WINDOW)
@@ -136,7 +142,7 @@ pub fn set_shell_menu_enabled(enabled: bool) -> anyhow::Result<()> {
                 .args(["delete", r"HKCU\Software\Classes\Folder\shell\SyncCloud", "/f"])
                 .creation_flags(CREATE_NO_WINDOW)
                 .output();
-            for (root_key, _) in SHELL_ROOTS {
+            for root_key in SHELL_ROOTS {
                 let _ = std::process::Command::new("reg")
                     .args(["delete", root_key, "/f"])
                     .creation_flags(CREATE_NO_WINDOW)
