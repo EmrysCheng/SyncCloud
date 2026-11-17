@@ -43,6 +43,66 @@ const KEYRING: &str = "aliyun:qr";
 /// 上传分块大小（10MB，与 aliyundrive-webdav 一致）。
 const CHUNK: usize = 10 * 1024 * 1024;
 
+const API_REQUEST_GAP: Duration = Duration::from_millis(100);
+const MAX_THROTTLE_RETRIES: u32 = 4;
+const THROTTLE_WAIT_BUDGET: Duration = Duration::from_secs(20);
+// None 表示服务器等待时长超出 Instant 范围，账户保持冷却并立即报错。
+type ApiScheduleState = tokio::sync::Mutex<Option<tokio::time::Instant>>;
+type ApiSchedule = std::sync::Arc<ApiScheduleState>;
+
+/// 同一账户的多个同步根共用控制请求预算，不影响 OSS 文件流量。
+fn account_api_schedule(auth_id: &str) -> ApiSchedule {
+    let auth_id = auth_id.trim();
+    use std::sync::{Mutex, OnceLock, Weak};
+    static SCHEDULES: OnceLock<Mutex<std::collections::HashMap<String, Weak<ApiScheduleState>>>> =
+        OnceLock::new();
+    let mut schedules = SCHEDULES
+        .get_or_init(|| Mutex::new(Default::default()))
+        .lock()
+        .unwrap();
+    schedules.retain(|_, schedule| schedule.strong_count() > 0);
+    if let Some(schedule) = schedules.get(auth_id).and_then(Weak::upgrade) {
+        return schedule;
+    }
+    let schedule = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tokio::time::Instant::now())));
+    schedules.insert(auth_id.to_owned(), std::sync::Arc::downgrade(&schedule));
+    schedule
+}
+
+fn throttle_delay(retry_after: Option<&str>, message: Option<&str>, attempt: u32) -> Duration {
+    let header_delay = retry_after.and_then(|value| {
+        value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
+            .or_else(|| {
+                chrono::DateTime::parse_from_rfc2822(value)
+                    .ok()
+                    .map(|when| {
+                        Duration::from_millis(
+                            (when.timestamp_millis() - chrono::Utc::now().timestamp_millis()).max(0)
+                                as u64,
+                        )
+                    })
+            })
+    });
+    let message_delay = message.and_then(|text| {
+        let (_, rest) = text.split_once("等待")?;
+        let rest = rest.trim_start();
+        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        let suffix = rest.strip_prefix(digits.as_str())?.trim_start();
+        if !suffix.starts_with("毫秒") {
+            return None;
+        }
+        digits.parse::<u64>().ok().map(Duration::from_millis)
+    });
+    let backoff = Duration::from_millis(250 * (1u64 << attempt.min(4)));
+    backoff
+        .max(header_delay.unwrap_or_default())
+        .max(message_delay.unwrap_or_default())
+}
+
 pub struct AliyunStore {
     auth_id: String,
     remote_dir: String,
@@ -58,6 +118,7 @@ pub struct AliyunStore {
     /// api_json 的 NotFound 检测自愈清空。
     dir_cache: tokio::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
     mkdir_lock: tokio::sync::Mutex<()>,
+    api_schedule: ApiSchedule,
     recovery_root: std::path::PathBuf,
 }
 
@@ -437,6 +498,364 @@ fn keyring_account(auth_id: &str) -> String {
 mod response_tests {
     use super::*;
     #[tokio::test]
+    async fn overflowing_retry_after_still_blocks_other_sync_roots() {
+        use crate::storage::test_http::{serve, Response};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let server = serve(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let mut response = Response::new(429, r#"{"code":"TooManyRequests"}"#);
+            response
+                .headers
+                .push(("Retry-After".into(), u64::MAX.to_string()));
+            response
+        })
+        .await;
+        let id = format!("test-overflow-{}", uuid::Uuid::new_v4());
+        let key = keyring_account(&id);
+        let mut first = AliyunStore::new(id.clone(), "/first".into());
+        let mut other = AliyunStore::new(id, "/other".into());
+        first.api_base = server.url.clone();
+        other.api_base = server.url.clone();
+        first
+            .save_token(&TokenState {
+                access_token: "fixture".into(),
+                refresh_token: "unused".into(),
+                expires_at: now_ts() + 3600,
+                oauth_base: server.url.clone(),
+            })
+            .await
+            .unwrap();
+        let result = first
+            .api_json("POST", "/list", &serde_json::json!({}))
+            .await;
+        let followup = tokio::time::timeout(
+            Duration::from_secs(1),
+            other.api_json("POST", "/list", &serde_json::json!({})),
+        )
+        .await;
+        crate::credential::delete_secret(&key).unwrap();
+        assert!(result.unwrap_err().to_string().contains("预算耗尽"));
+        assert!(followup
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("超出可表示范围"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn throttle_delay_respects_server_hints_and_exponential_backoff() {
+        assert_eq!(throttle_delay(Some("2"), None, 0), Duration::from_secs(2));
+        assert_eq!(
+            throttle_delay(None, Some("请求过快，请等待 294 毫秒后再请求"), 0),
+            Duration::from_millis(294)
+        );
+        assert_eq!(
+            throttle_delay(Some("invalid"), None, 2),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            throttle_delay(None, Some("请等待 184467440737095516150 毫秒后再请求"), 0),
+            Duration::from_millis(250)
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &account_api_schedule(" test-same "),
+            &account_api_schedule("test-same")
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_throttling_is_bounded_and_keeps_error_context() {
+        use crate::storage::test_http::{serve, Response};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let calls = attempts.clone();
+        let server = serve(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Response::new(
+                429,
+                r#"{"code":"TooManyRequests","message":"请等待 1 毫秒后再请求"}"#,
+            )
+        })
+        .await;
+        let id = format!("test-bounded-{}", uuid::Uuid::new_v4());
+        let key = keyring_account(&id);
+        let mut other = AliyunStore::new(id.clone(), "/other".into());
+        let mut store = AliyunStore::new(id, "/sandbox".into());
+        other.api_base = server.url.clone();
+        store.api_base = server.url.clone();
+        store
+            .save_token(&TokenState {
+                access_token: "fixture".into(),
+                refresh_token: "unused".into(),
+                expires_at: now_ts() + 3600,
+                oauth_base: server.url.clone(),
+            })
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.api_json("POST", "/lock-list", &serde_json::json!({})),
+        )
+        .await;
+        let error = result
+            .expect("throttling retried indefinitely")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("/lock-list") && error.contains("TooManyRequests"));
+        let followup = tokio::time::timeout(
+            Duration::from_millis(400),
+            other.api_json("POST", "/list", &serde_json::json!({})),
+        )
+        .await;
+        crate::credential::delete_secret(&key).unwrap();
+        assert!(
+            followup.is_err(),
+            "exhausted caller discarded shared cooldown"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            MAX_THROTTLE_RETRIES as usize + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_retries_only_once_after_throttling() {
+        use crate::storage::test_http::{serve, Response};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refreshed = Arc::new(AtomicUsize::new(0));
+        let (count, refreshes) = (calls.clone(), refreshed.clone());
+        let server=serve(move |request| {
+            if request.path.ends_with("/oauth/access_token") {
+                refreshes.fetch_add(1,Ordering::SeqCst);
+                return Response::json(serde_json::json!({"access_token":"rotated","refresh_token":"rotated-refresh","expires_in":3600}));
+            }
+            if count.fetch_add(1,Ordering::SeqCst)==0 {Response::new(429,r#"{"code":"TooManyRequests"}"#)}
+            else {Response::new(401,r#"{"code":"AccessTokenInvalid","message":"expired"}"#)}
+        }).await;
+        let id = format!("test-auth-bound-{}", uuid::Uuid::new_v4());
+        let key = keyring_account(&id);
+        let mut store = AliyunStore::new(id, "/sandbox".into());
+        store.api_base = server.url.clone();
+        store
+            .save_token(&TokenState {
+                access_token: "fixture".into(),
+                refresh_token: "fixture-refresh".into(),
+                expires_at: now_ts() + 3600,
+                oauth_base: server.url.clone(),
+            })
+            .await
+            .unwrap();
+        let result = store
+            .api_json("POST", "/list", &serde_json::json!({}))
+            .await;
+        crate::credential::delete_secret(&key).unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("AccessTokenInvalid"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(refreshed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn excessive_retry_after_does_not_outwait_the_lease() {
+        use crate::storage::test_http::{serve, Response};
+        let server = serve(move |_| {
+            let mut r = Response::new(429, r#"{"code":"TooManyRequests"}"#);
+            r.headers.push(("Retry-After".into(), "3600".into()));
+            r
+        })
+        .await;
+        let id = format!("test-long-wait-{}", uuid::Uuid::new_v4());
+        let key = keyring_account(&id);
+        let mut other = AliyunStore::new(id.clone(), "/other".into());
+        let mut store = AliyunStore::new(id, "/sandbox".into());
+        other.api_base = server.url.clone();
+        store.api_base = server.url.clone();
+        store
+            .save_token(&TokenState {
+                access_token: "fixture".into(),
+                refresh_token: "unused".into(),
+                expires_at: now_ts() + 3600,
+                oauth_base: server.url.clone(),
+            })
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.api_json("POST", "/list", &serde_json::json!({})),
+        )
+        .await;
+        let followup = tokio::time::timeout(
+            Duration::from_millis(400),
+            other.api_json("POST", "/list", &serde_json::json!({})),
+        )
+        .await;
+        crate::credential::delete_secret(&key).unwrap();
+        assert!(
+            followup.is_err(),
+            "long server cooldown was discarded for another sync root"
+        );
+        assert!(result
+            .expect("unbounded Retry-After wait")
+            .unwrap_err()
+            .to_string()
+            .contains("预算耗尽"));
+    }
+
+    #[tokio::test]
+    async fn expired_download_url_is_reissued_before_retry() {
+        use crate::storage::test_http::{serve, Response};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let count = lookups.clone();
+        let base = Arc::new(Mutex::new(String::new()));
+        let endpoint = base.clone();
+        let server=serve(move |request| {
+            if request.path.ends_with("getDownloadUrl") {
+                let n=count.fetch_add(1,Ordering::SeqCst);
+                return Response::json(serde_json::json!({"url":format!("{}/download/{}",endpoint.lock().unwrap(),if n==0 {"expired"} else {"fresh"})}));
+            }
+            if request.path.ends_with("/expired") {Response::new(403,"<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>")}
+            else {Response::new(200,"hello")}
+        }).await;
+        *base.lock().unwrap() = server.url.clone();
+        let id = format!("test-cdn-renew-{}", uuid::Uuid::new_v4());
+        let key = keyring_account(&id);
+        let mut store = AliyunStore::new(id, "/sandbox".into());
+        store.api_base = server.url.clone();
+        *store.drive_id.lock().await = Some("drive".into());
+        store
+            .save_token(&TokenState {
+                access_token: "fixture".into(),
+                refresh_token: "unused".into(),
+                expires_at: now_ts() + 3600,
+                oauth_base: server.url.clone(),
+            })
+            .await
+            .unwrap();
+        let dest = std::env::temp_dir().join(format!("synccloud-cdn-{}", uuid::Uuid::new_v4()));
+        let result = store.download_by_id("file", 5, &dest).await;
+        let bytes = tokio::fs::read(&dest).await.ok();
+        let _ = tokio::fs::remove_file(&dest).await;
+        crate::credential::delete_secret(&key).unwrap();
+        assert!(
+            result.is_ok(),
+            "a fresh download URL was never requested: {result:?}"
+        );
+        assert_eq!(bytes.as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(lookups.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_lock_listing_retries_without_losing_the_lease() {
+        use crate::storage::test_http::{serve, Response};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let calls = attempts.clone();
+        let timestamps = Arc::new(Mutex::new(Vec::new()));
+        let seen = timestamps.clone();
+        let server = serve(move |_| {
+            seen.lock().unwrap().push(std::time::Instant::now());
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut response = Response::new(
+                    429,
+                    r#"{"code":"TooManyRequests","message":"请求过快，请等待 84 毫秒后再请求"}"#,
+                );
+                response.headers.push(("Retry-After".into(), "1".into()));
+                response
+            } else {
+                Response::json(serde_json::json!({"items":[],"next_marker":""}))
+            }
+        })
+        .await;
+        let id = format!("test-throttle-{}", uuid::Uuid::new_v4());
+        let key = keyring_account(&id);
+        let mut store = AliyunStore::new(id, "/sandbox".into());
+        store.api_base = server.url.clone();
+        *store.drive_id.lock().await = Some("drive".into());
+        store
+            .save_token(&TokenState {
+                access_token: "fixture".into(),
+                refresh_token: "unused".into(),
+                expires_at: now_ts() + 3600,
+                oauth_base: server.url.clone(),
+            })
+            .await
+            .unwrap();
+        let result = store.list_children("lock-directory").await;
+        crate::credential::delete_secret(&key).unwrap();
+        assert!(result.is_ok(), "temporary Aliyun throttling was treated as a permanent lock listing failure: {result:?}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let seen = timestamps.lock().unwrap();
+        assert!(
+            seen[1].duration_since(seen[0]) >= Duration::from_millis(950),
+            "Retry-After was ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_control_requests_share_an_account_rate_budget() {
+        use crate::storage::test_http::{serve, Response};
+        use std::sync::{Arc, Mutex};
+        let timestamps = Arc::new(Mutex::new(Vec::new()));
+        let seen = timestamps.clone();
+        let server = serve(move |_| {
+            seen.lock().unwrap().push(std::time::Instant::now());
+            Response::json(serde_json::json!({"items":[],"next_marker":""}))
+        })
+        .await;
+        let id = format!("test-rate-{}", uuid::Uuid::new_v4());
+        let key = keyring_account(&id);
+        let mut first = AliyunStore::new(id.clone(), "/one".into());
+        let mut second = AliyunStore::new(id, "/two".into());
+        first.api_base = server.url.clone();
+        second.api_base = server.url.clone();
+        first
+            .save_token(&TokenState {
+                access_token: "fixture".into(),
+                refresh_token: "unused".into(),
+                expires_at: now_ts() + 3600,
+                oauth_base: server.url.clone(),
+            })
+            .await
+            .unwrap();
+        let body = serde_json::json!({});
+        let (a, b, c, d) = tokio::join!(
+            first.api_json("POST", "/list", &body),
+            second.api_json("POST", "/list", &body),
+            first.api_json("POST", "/list", &body),
+            second.api_json("POST", "/list", &body)
+        );
+        crate::credential::delete_secret(&key).unwrap();
+        assert!(a.is_ok() && b.is_ok() && c.is_ok() && d.is_ok());
+        let seen = timestamps.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert!(
+            seen[3].duration_since(seen[0]) >= Duration::from_millis(250),
+            "parallel sync roots exceeded the shared account API rate budget"
+        );
+    }
+
+    #[tokio::test]
     async fn upload_recovery_preserves_old_until_publish_is_verified() {
         use crate::storage::test_http::{serve, Response};
         use std::sync::{
@@ -652,6 +1071,7 @@ impl AliyunStore {
             drive_id: tokio::sync::Mutex::new(None),
             dir_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             mkdir_lock: tokio::sync::Mutex::new(()),
+            api_schedule: account_api_schedule(&auth_id),
             recovery_root: {
                 use sha2::Digest;
                 crate::config::app_data_dir()
@@ -786,8 +1206,28 @@ impl AliyunStore {
         body: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let mut rejected = None;
-        for attempt in 0..2 {
+        let mut auth_retried = false;
+        let mut throttle_retries = 0;
+        let started = tokio::time::Instant::now();
+        loop {
             let token = self.refresh_access_token(rejected.as_deref()).await?;
+            loop {
+                let mut next = self.api_schedule.lock().await;
+                let now = tokio::time::Instant::now();
+                anyhow::ensure!(
+                    now < started + THROTTLE_WAIT_BUDGET,
+                    "阿里云盘 API {path} 请求排队/重试等待预算耗尽"
+                );
+                let due = (*next).ok_or_else(|| {
+                    anyhow::anyhow!("阿里云盘 API {path} 账户限流等待超出可表示范围")
+                })?;
+                if due <= now {
+                    *next = Some(now + API_REQUEST_GAP);
+                    break;
+                }
+                drop(next);
+                tokio::time::sleep_until(due.min(started + THROTTLE_WAIT_BUDGET)).await;
+            }
             let url = format!("{}{path}", self.api_base);
             let client = self.http.clone();
             let req = match method {
@@ -803,13 +1243,55 @@ impl AliyunStore {
                 .await
                 .map_err(|e| e.without_url())?;
             let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_owned);
             let text = resp.text().await?;
-            if attempt == 0
+            if !auth_retried
                 && (status == reqwest::StatusCode::UNAUTHORIZED
                     || text.contains("AccessTokenInvalid")
                     || text.contains("AccessTokenExpired"))
             {
                 rejected = Some(token);
+                auth_retried = true;
+                continue;
+            }
+            let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+            let error_code = parsed
+                .as_ref()
+                .and_then(|v| v.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || error_code == "TooManyRequests" {
+                let delay = throttle_delay(
+                    retry_after.as_deref(),
+                    parsed
+                        .as_ref()
+                        .and_then(|v| v.get("message"))
+                        .and_then(|v| v.as_str()),
+                    throttle_retries,
+                );
+                // 即使本操作没有重试预算，也必须让其它同步根遵守服务器冷却。
+                let mut next = self.api_schedule.lock().await;
+                *next = match (*next, tokio::time::Instant::now().checked_add(delay)) {
+                    (Some(previous), Some(until)) => Some(previous.max(until)),
+                    _ => None,
+                };
+                drop(next);
+                anyhow::ensure!(
+                    throttle_retries < MAX_THROTTLE_RETRIES
+                        && started.elapsed().saturating_add(delay) <= THROTTLE_WAIT_BUDGET,
+                    "阿里云盘 API {path} 限流重试预算耗尽 (TooManyRequests, HTTP {status})"
+                );
+                throttle_retries += 1;
+                tracing::warn!(
+                    operation = path,
+                    retry = throttle_retries,
+                    wait_ms = delay.as_millis() as u64,
+                    "阿里云盘请求限流，等待后重试"
+                );
                 continue;
             }
             if !status.is_success() {
@@ -835,7 +1317,6 @@ impl AliyunStore {
             return Ok(serde_json::from_str(&text)
                 .map_err(|e| anyhow::anyhow!("阿里云盘 {path} 响应解析失败: {e}"))?);
         }
-        anyhow::bail!("阿里云盘身份验证失败，请重新授权")
     }
 
     /// 分页列出目录孩子。
@@ -1049,21 +1530,6 @@ impl AliyunStore {
         expected: u64,
         dest: &Path,
     ) -> anyhow::Result<()> {
-        let v = self
-            .api_json(
-                "POST",
-                "/adrive/v1.0/openFile/getDownloadUrl",
-                &serde_json::json!({
-                    "drive_id": self.drive_id().await?,
-                    "file_id": file_id,
-                    "expire_sec": 14400,
-                }),
-            )
-            .await?;
-        let r: DownloadUrlResp = serde_json::from_value(v)?;
-        if r.url.is_empty() {
-            anyhow::bail!("获取下载链接失败（url 为空）");
-        }
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -1072,6 +1538,18 @@ impl AliyunStore {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(1500)).await;
             }
+            // URL 可能过期或被 CDN 拒绝；每次传输重试重新签发，不能复用失效链接。
+            let v = self
+                .api_json(
+                    "POST",
+                    "/adrive/v1.0/openFile/getDownloadUrl",
+                    &serde_json::json!({
+                        "drive_id": self.drive_id().await?, "file_id": file_id, "expire_sec": 14400,
+                    }),
+                )
+                .await?;
+            let r: DownloadUrlResp = serde_json::from_value(v)?;
+            anyhow::ensure!(!r.url.is_empty(), "获取下载链接失败（url 为空）");
             let resp = match self.http.get(&r.url).send().await {
                 Ok(x) => x,
                 Err(e) => {
@@ -1079,13 +1557,25 @@ impl AliyunStore {
                     continue;
                 }
             };
-            let resp = match resp.error_for_status() {
-                Ok(x) => x,
-                Err(e) => {
-                    last_err = Some(e.without_url().into());
-                    continue;
-                }
-            };
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                let code = body
+                    .split_once("<Code>")
+                    .and_then(|(_, rest)| rest.split_once("</Code>"))
+                    .map(|(code, _)| code)
+                    .filter(|code| {
+                        code.len() <= 64
+                            && code.bytes().all(|ch| {
+                                ch.is_ascii_alphanumeric() || matches!(ch, b'_' | b'-' | b'.')
+                            })
+                    })
+                    .unwrap_or("Unknown");
+                last_err = Some(anyhow::anyhow!(
+                    "阿里云盘文件下载失败: HTTP {status}, code={code}"
+                ));
+                continue;
+            }
             use futures::StreamExt;
             use tokio::io::AsyncWriteExt;
             let mut file = match tokio::fs::File::create(dest).await {
@@ -1113,6 +1603,14 @@ impl AliyunStore {
                     }
                 }
             }
+            // Tokio File 的 write_all 可在后台写入完成前返回；读取锁内容或校验
+            // 文件之前必须 flush，并在重试覆盖目标前等待旧句柄的写入结束。
+            if let Err(e) = file.flush().await {
+                if err.is_none() {
+                    err = Some(e.into());
+                }
+            }
+            drop(file);
             match err {
                 Some(e) => {
                     last_err = Some(e);

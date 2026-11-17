@@ -247,6 +247,44 @@ pub trait RawIo: Send + Sync {
 mod tests {
     use super::sibling_meta;
 
+    struct LockIo(std::sync::Mutex<String>);
+    #[async_trait::async_trait]
+    impl super::RawIo for LockIo {
+        async fn put_text(&self, _: &str, text: &str) -> anyhow::Result<()> {
+            *self.0.lock().unwrap() = text.into();
+            Ok(())
+        }
+        async fn read_text(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(Some(self.0.lock().unwrap().clone()))
+        }
+        async fn delete(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_prefix(&self, _: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec!["locks/mine".into()])
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_changed_or_lost_lease_still_blocks_commit() {
+        let io = LockIo(std::sync::Mutex::new(super::lock_content(
+            "mine",
+            std::time::Duration::from_secs(90),
+        )));
+        let lease = super::RemoteLock {
+            store_lock_key: "locks/mine".into(),
+            lost: std::sync::atomic::AtomicBool::new(false),
+        };
+        lease.verify(&io).await.unwrap();
+        *io.0.lock().unwrap() = super::lock_content("another", std::time::Duration::from_secs(90));
+        assert!(lease.verify(&io).await.is_err());
+        *io.0.lock().unwrap() = "mine|1".into();
+        assert!(lease.verify(&io).await.is_err());
+        *io.0.lock().unwrap() = super::lock_content("mine", std::time::Duration::from_secs(90));
+        lease.lost.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(lease.verify(&io).await.is_err());
+    }
+
     #[test]
     fn sibling_meta_paths() {
         assert_eq!(sibling_meta("/Sync"), ".synccloud/Sync");
