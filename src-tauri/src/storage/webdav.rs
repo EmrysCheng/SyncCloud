@@ -18,7 +18,7 @@ pub struct WebDavStore {
     http: Client,
     /// 仓库根 URL，例如 `https://dav.jianguoyun.com/dav/synccloud/docs/`
     base: Url,
-    /// 元数据区 URL：仓库根的兄弟目录 `<base>/../.synccloud/synccloud/`
+    /// 元数据区 URL：仓库根内部的 .synccloud。
     meta: Url,
     auth: Option<(String, String)>,
 }
@@ -56,9 +56,13 @@ impl WebDavStore {
         }
         // 严格位于用户指定的同步目录内部（.synccloud/），绝不向指定目录外部上传任何文件
         let meta = base.join(".synccloud/").expect("join meta path");
-        let auth = (!username.is_empty() || !password.is_empty())
-            .then(|| (username, password));
-        Self { http, base, meta, auth }
+        let auth = (!username.is_empty() || !password.is_empty()).then(|| (username, password));
+        Self {
+            http,
+            base,
+            meta,
+            auth,
+        }
     }
 
     fn url_of(&self, rel: &str) -> Url {
@@ -66,7 +70,12 @@ impl WebDavStore {
         if rel.is_empty() {
             return self.base.clone();
         }
-        self.base.join(rel).expect("join path")
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .expect("hierarchical WebDAV URL")
+            .pop_if_empty()
+            .extend(rel.split('/'));
+        url
     }
 
     fn meta_url_of(&self, rel: &str) -> Url {
@@ -74,7 +83,12 @@ impl WebDavStore {
         if rel.is_empty() {
             return self.meta.clone();
         }
-        self.meta.join(rel).expect("join path")
+        let mut url = self.meta.clone();
+        url.path_segments_mut()
+            .expect("hierarchical WebDAV URL")
+            .pop_if_empty()
+            .extend(rel.split('/'));
+        url
     }
 
     fn request(&self, method: Method, rel: &str) -> reqwest::RequestBuilder {
@@ -82,7 +96,12 @@ impl WebDavStore {
     }
 
     fn request_url(&self, method: Method, url: Url) -> reqwest::RequestBuilder {
+        let control = !(method == Method::GET || method == Method::PUT)
+            || url.path().contains("/.synccloud/");
         let mut rb = self.http.request(method, url);
+        if control {
+            rb = rb.timeout(Duration::from_secs(30));
+        }
         if let Some((user, pass)) = &self.auth {
             rb = rb.basic_auth(user, Some(pass));
         }
@@ -95,7 +114,8 @@ impl WebDavStore {
         let status = self
             .request_url(Method::from_bytes(b"MKCOL")?, u)
             .send()
-            .await?
+            .await
+            .map_err(|e| e.without_url())?
             .status();
         let ok = status.is_success()
             || status == StatusCode::METHOD_NOT_ALLOWED
@@ -119,7 +139,8 @@ impl WebDavStore {
             .header("Content-Type", "application/xml")
             .body(PROPFIND_BODY)
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
         let status = resp.status();
         if status == StatusCode::NOT_FOUND {
             return Ok(Vec::new());
@@ -145,9 +166,12 @@ impl WebDavStore {
             let status = self
                 .request(Method::from_bytes(b"MKCOL")?, &cur)
                 .send()
-                .await?
+                .await
+                .map_err(|e| e.without_url())?
                 .status();
-            let ok = status.is_success() || status == StatusCode::METHOD_NOT_ALLOWED || status == StatusCode::CONFLICT;
+            let ok = status.is_success()
+                || status == StatusCode::METHOD_NOT_ALLOWED
+                || status == StatusCode::CONFLICT;
             if !ok {
                 anyhow::bail!("MKCOL {cur} 失败: HTTP {status}");
             }
@@ -283,18 +307,23 @@ impl RemoteStore for WebDavStore {
             .header("Content-Type", "application/xml")
             .body(PROPFIND_BODY)
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
         let status = resp.status();
         if status.as_u16() != 207 && !status.is_success() {
             anyhow::bail!("WebDAV 连接失败: HTTP {status}（检查地址、账号与应用密码）");
         }
         // 写验证：幂等创建元数据目录（同步目录外）
         self.ensure_meta_dir().await?;
-        Ok(())
+        super::probe_text_io(self).await
     }
 
     async fn read_manifest(&self) -> anyhow::Result<Option<Manifest>> {
-        let resp = self.request_url(Method::GET, self.meta_url_of("manifest.json")).send().await?;
+        let resp = self
+            .request_url(Method::GET, self.meta_url_of("manifest.json"))
+            .send()
+            .await
+            .map_err(|e| e.without_url())?;
         match resp.status() {
             StatusCode::OK => {
                 let raw = resp.text().await?;
@@ -313,7 +342,8 @@ impl RemoteStore for WebDavStore {
             .header("Content-Type", "application/json")
             .body(raw)
             .send()
-            .await?
+            .await
+            .map_err(|e| e.without_url())?
             .status();
         if !status.is_success() {
             anyhow::bail!("写入 manifest 失败: HTTP {status}");
@@ -324,11 +354,16 @@ impl RemoteStore for WebDavStore {
     /// PROPFIND Depth:1 元数据目录，取 manifest.json 的 etag/修改时间/大小
     /// 作为增量快路径的廉价变更戳（一次请求代替整个 manifest 下载）。
     async fn manifest_stamp(&self) -> anyhow::Result<Option<String>> {
-        let items = self
-            .propfind_url(&self.meta_url_of(""), &self.meta)
-            .await?;
+        let items = self.propfind_url(&self.meta_url_of(""), &self.meta).await?;
         for it in items {
             if !it.is_dir && it.href == "manifest.json" {
+                if it.etag.as_deref().is_none_or(str::is_empty) {
+                    return Ok(self
+                        .read_manifest()
+                        .await?
+                        .as_ref()
+                        .map(super::manifest_stamp_of));
+                }
                 return Ok(Some(format!(
                     "etag{}|lm{}|len{}",
                     it.etag.as_deref().unwrap_or(""),
@@ -341,34 +376,43 @@ impl RemoteStore for WebDavStore {
     }
 
     async fn read_legacy_manifest(&self) -> anyhow::Result<Option<Manifest>> {
-        let resp = self.request(Method::GET, ".synccloud/manifest.json").send().await?;
-        match resp.status() {
-            StatusCode::OK => {
-                let raw = resp.text().await?;
-                Ok(Some(serde_json::from_str(&raw)?))
-            }
-            StatusCode::NOT_FOUND => Ok(None),
-            s => anyhow::bail!("读取旧版 manifest 失败: HTTP {s}"),
+        let mut legacy = self.base.clone();
+        legacy.set_path(&format!(
+            "/{}/manifest.json",
+            super::sibling_meta(self.base.path())
+        ));
+        let response = self
+            .request_url(Method::GET, legacy)
+            .send()
+            .await
+            .map_err(|e| e.without_url())?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
         }
+        let response = response.error_for_status().map_err(|e| e.without_url())?;
+        Ok(Some(response.json().await?))
     }
-
     async fn cleanup_legacy_meta(&self) -> anyhow::Result<()> {
-        if self.meta.path() == format!("{}/.synccloud/", self.base.path()) {
-            return Ok(()); // 结构上不可能同位，防御性保留
-        }
-        let _ = self.delete_file(".synccloud/manifest.json").await;
-        for item in self.propfind1(".synccloud/locks").await? {
-            if !item.is_dir {
-                let _ = self.delete_file(&format!(".synccloud/locks/{}", item.href)).await;
-            }
-        }
-        // 空目录清理（尽力而为）
-        let _ = self.request(Method::DELETE, ".synccloud/locks").send().await;
-        let _ = self.request(Method::DELETE, ".synccloud").send().await;
+        let mut legacy = self.base.clone();
+        legacy.set_path(&format!(
+            "/{}/manifest.json",
+            super::sibling_meta(self.base.path())
+        ));
+        let response = self
+            .request_url(Method::DELETE, legacy)
+            .send()
+            .await
+            .map_err(|e| e.without_url())?;
+        anyhow::ensure!(
+            response.status().is_success() || response.status() == StatusCode::NOT_FOUND,
+            "清理旧清单失败 HTTP {}",
+            response.status()
+        );
         Ok(())
     }
 
     async fn put_file(&self, path: &str, src: &Path) -> anyhow::Result<()> {
+        super::validate_key(path)?;
         if let Some(parent) = Path::new(path).parent() {
             let parent_str = parent.to_string_lossy().replace('\\', "/");
             let parent_str = parent_str.trim_start_matches('/').to_string();
@@ -377,17 +421,26 @@ impl RemoteStore for WebDavStore {
             }
         }
         // 共享模式打开：文件被编辑器/杀毒等占用时仍可读取上传
-        let file = crate::sync::fslock::open_read_shared_async(src).await
+        let file = crate::sync::fslock::open_read_shared_async(src)
+            .await
             .map_err(|e| anyhow::anyhow!("打开本地文件失败 {}: {e}", src.display()))?;
         let len = file.metadata().await?.len();
-        let stream = tokio_util::io::ReaderStream::new(file);
+        let stream = tokio_util::io::ReaderStream::new(file).then(|chunk| async move {
+            if let Ok(bytes) = &chunk {
+                crate::sync::transfer::upload_limiter()
+                    .consume(bytes.len())
+                    .await;
+            }
+            chunk
+        });
         let body = reqwest::Body::wrap_stream(stream);
         let status = self
             .request(Method::PUT, path)
             .header("Content-Length", len)
             .body(body)
             .send()
-            .await?
+            .await
+            .map_err(|e| e.without_url())?
             .status();
         if !status.is_success() {
             anyhow::bail!("上传 WebDAV:{path} 失败: HTTP {status}");
@@ -396,7 +449,12 @@ impl RemoteStore for WebDavStore {
     }
 
     async fn get_file(&self, path: &str, dest: &Path) -> anyhow::Result<()> {
-        let resp = self.request(Method::GET, path).send().await?;
+        super::validate_key(path)?;
+        let resp = self
+            .request(Method::GET, path)
+            .send()
+            .await
+            .map_err(|e| e.without_url())?;
         let status = resp.status();
         if !status.is_success() {
             anyhow::bail!("下载 WebDAV:{path} 失败: HTTP {status}");
@@ -408,6 +466,9 @@ impl RemoteStore for WebDavStore {
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk?;
+            crate::sync::transfer::download_limiter()
+                .consume(bytes.len())
+                .await;
             tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
         }
         tokio::io::AsyncWriteExt::flush(&mut file).await?;
@@ -415,7 +476,13 @@ impl RemoteStore for WebDavStore {
     }
 
     async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
-        let status = self.request(Method::DELETE, path).send().await?.status();
+        super::validate_key(path)?;
+        let status = self
+            .request(Method::DELETE, path)
+            .send()
+            .await
+            .map_err(|e| e.without_url())?
+            .status();
         if status.is_success() || status == StatusCode::NOT_FOUND {
             Ok(())
         } else {
@@ -424,6 +491,8 @@ impl RemoteStore for WebDavStore {
     }
 
     async fn move_file(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        super::validate_key(from)?;
+        super::validate_key(to)?;
         if let Some(parent) = Path::new(to).parent() {
             let parent_str = parent.to_string_lossy().replace('\\', "/");
             let parent_str = parent_str.trim_start_matches('/').to_string();
@@ -438,9 +507,11 @@ impl RemoteStore for WebDavStore {
             .header("Destination", dest_url)
             .header("Overwrite", "T")
             .send()
-            .await?
+            .await
+            .map_err(|e| e.without_url())?
             .status();
-        if status.is_success() || status == StatusCode::CREATED || status == StatusCode::NO_CONTENT {
+        if status.is_success() || status == StatusCode::CREATED || status == StatusCode::NO_CONTENT
+        {
             Ok(())
         } else {
             anyhow::bail!("WebDAV MOVE {from} -> {to} 失败: HTTP {status}");
@@ -480,6 +551,7 @@ impl RemoteStore for WebDavStore {
 #[async_trait]
 impl super::RawIo for WebDavStore {
     async fn put_text(&self, key: &str, content: &str) -> anyhow::Result<()> {
+        super::validate_key(key)?;
         self.ensure_meta_dir().await?;
         if let Some(parent) = Path::new(key).parent() {
             let p = parent.to_string_lossy().replace('\\', "/");
@@ -488,7 +560,8 @@ impl super::RawIo for WebDavStore {
                 let status = self
                     .request_url(Method::from_bytes(b"MKCOL")?, self.meta_url_of(&p))
                     .send()
-                    .await?
+                    .await
+                    .map_err(|e| e.without_url())?
                     .status();
                 let ok = status.is_success()
                     || status == StatusCode::METHOD_NOT_ALLOWED
@@ -502,7 +575,8 @@ impl super::RawIo for WebDavStore {
             .request_url(Method::PUT, self.meta_url_of(key))
             .body(content.to_string())
             .send()
-            .await?
+            .await
+            .map_err(|e| e.without_url())?
             .status();
         if !status.is_success() {
             anyhow::bail!("PUT 元数据 {key} 失败: HTTP {status}");
@@ -511,7 +585,12 @@ impl super::RawIo for WebDavStore {
     }
 
     async fn read_text(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let resp = self.request_url(Method::GET, self.meta_url_of(key)).send().await?;
+        super::validate_key(key)?;
+        let resp = self
+            .request_url(Method::GET, self.meta_url_of(key))
+            .send()
+            .await
+            .map_err(|e| e.without_url())?;
         match resp.status() {
             StatusCode::OK => Ok(Some(resp.text().await?)),
             StatusCode::NOT_FOUND => Ok(None),
@@ -520,10 +599,12 @@ impl super::RawIo for WebDavStore {
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        super::validate_key(key)?;
         let status = self
             .request_url(Method::DELETE, self.meta_url_of(key))
             .send()
-            .await?
+            .await
+            .map_err(|e| e.without_url())?
             .status();
         if status.is_success() || status == StatusCode::NOT_FOUND {
             Ok(())
@@ -533,10 +614,15 @@ impl super::RawIo for WebDavStore {
     }
 
     async fn list_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        super::validate_key(prefix.trim_end_matches('/'))?;
         let items = self
             .propfind_url(&self.meta_url_of(prefix.trim_end_matches('/')), &self.meta)
             .await?;
-        Ok(items.into_iter().filter(|i| !i.is_dir).map(|i| i.href).collect())
+        Ok(items
+            .into_iter()
+            .filter(|i| !i.is_dir)
+            .map(|i| i.href)
+            .collect())
     }
 }
 
@@ -587,7 +673,8 @@ mod tests {
   <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat>
  </d:response>
 </d:multistatus>"#;
-        let base = Url::parse("https://cloud.example.com/remote.php/dav/files/user/synccloud").unwrap();
+        let base =
+            Url::parse("https://cloud.example.com/remote.php/dav/files/user/synccloud").unwrap();
         let items = parse_propfind(xml, &base).unwrap();
         assert_eq!(items.len(), 1);
         assert!(items[0].is_dir);

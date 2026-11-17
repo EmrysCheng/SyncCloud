@@ -2,23 +2,19 @@
 //!
 //! ## 仓库布局（远端）
 //!
-//! 引擎的元数据放在同步目录**之外**，同步目录内只出现用户自己的文件：
-//!
-//! ```text
-//! <父目录>/
-//! ├── .synccloud/<同步目录名>/   # 元数据区（同步目录的兄弟目录；Git 后端为独立
-//! │   ├── manifest.json          # synccloud-meta/<分支> ref；S3 根前缀为 .synccloud/<前缀>）
-//! │   └── locks/<device_id>      # 分布式锁（TTL 心跳），防止多机同时写 manifest
-//! └── <同步目录>/                # 纯用户文件（明文模式 = 镜像布局）
-//! ```
-//! 同步根本身位于存储顶层（如云盘根目录）时退化为根下 `.synccloud/`（此时该目录
-//! 会被列举过滤，永不进入同步树）。
+//! 非 Git 后端元数据位于所选同步根内的 `.synccloud/`，扫描和对象列举排除该目录。
+//! Git 通过独立 `synccloud-meta/<branch>` ref 保存清单与锁。
+//! 历史兄弟目录布局只用于迁移，回读验证新清单后才清理旧清单文件。
 
-pub mod s3;
-pub mod webdav;
-pub mod git_backend;
-pub mod baidu;
 pub mod aliyun;
+pub mod baidu;
+#[cfg(test)]
+mod contract_tests;
+pub mod git_backend;
+pub mod s3;
+#[cfg(test)]
+pub(crate) mod test_http;
+pub mod webdav;
 
 use async_trait::async_trait;
 use std::path::Path;
@@ -50,6 +46,9 @@ pub fn sibling_meta(root: &str) -> String {
 /// 存储后端统一接口。所有差异（认证、布局、版本语义）封装在实现内部。
 #[async_trait]
 pub trait RemoteStore: Send + Sync {
+    async fn begin_cycle(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn kind(&self) -> &'static str;
 
     /// 锁机制所需的最小读写原语视图。
@@ -107,6 +106,7 @@ pub trait RemoteStore: Send + Sync {
 /// 崩溃的持锁者其锁会在 TTL 后被视为过期，可被抢占。
 pub struct RemoteLock {
     store_lock_key: String,
+    lost: std::sync::atomic::AtomicBool,
 }
 
 /// 锁文件内容：`<device_id>|<expiry_unix_ms>`
@@ -116,7 +116,11 @@ fn lock_content(device_id: &str, ttl: Duration) -> String {
 }
 
 fn is_expired(content: &str) -> bool {
-    match content.split('|').nth(1).and_then(|s| s.parse::<i64>().ok()) {
+    match content
+        .split('|')
+        .nth(1)
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(expiry) => chrono::Utc::now().timestamp_millis() >= expiry,
         None => true, // 格式异常视为过期，可抢占
     }
@@ -137,10 +141,10 @@ pub async fn acquire_remote_lock(
 
     loop {
         // 清理过期锁（尽力而为）
-        let existing = raw_io.list_prefix(lock_dir).await.unwrap_or_default();
+        let existing = raw_io.list_prefix(lock_dir).await?;
         let mut held_by_other = false;
         for key in existing {
-            if let Some(content) = raw_io.read_text(&key).await.unwrap_or(None) {
+            if let Some(content) = raw_io.read_text(&key).await? {
                 let owner = content.split('|').next().unwrap_or("").to_string();
                 if is_expired(&content) {
                     let _ = raw_io.delete(&key).await;
@@ -155,7 +159,10 @@ pub async fn acquire_remote_lock(
             raw_io.put_text(&lock_key, &content).await?;
             if let Some(readback) = raw_io.read_text(&lock_key).await? {
                 if read_back_mine(&readback, device_id) {
-                    return Ok(RemoteLock { store_lock_key: lock_key });
+                    return Ok(RemoteLock {
+                        store_lock_key: lock_key,
+                        lost: std::sync::atomic::AtomicBool::new(false),
+                    });
                 }
             }
         }
@@ -171,8 +178,55 @@ fn read_back_mine(content: &str, device_id: &str) -> bool {
 }
 
 impl RemoteLock {
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub async fn verify(&self, io: &dyn RawIo) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.is_lost(), "远端锁续租失败，禁止提交清单");
+        let mine = io
+            .read_text(&self.store_lock_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("远端锁已丢失"))?;
+        let owner = self.store_lock_key.strip_prefix("locks/").unwrap_or("");
+        anyhow::ensure!(
+            read_back_mine(&mine, owner) && !is_expired(&mine),
+            "远端锁已过期或所有权改变"
+        );
+        for key in io.list_prefix("locks").await? {
+            if key != self.store_lock_key {
+                if let Some(content) = io.read_text(&key).await? {
+                    anyhow::ensure!(is_expired(&content), "发现其他设备持锁，停止写入");
+                }
+            }
+        }
+        Ok(())
+    }
+    pub async fn heartbeat(&self, io: &dyn RawIo, device: &str) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            let result = async {
+                self.verify(io).await?;
+                io.put_text(
+                    &self.store_lock_key,
+                    &lock_content(device, Duration::from_secs(90)),
+                )
+                .await
+            }
+            .await;
+            if let Err(e) = result {
+                self.lost.store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::error!(error=%e,"远端锁续租失败");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
     /// 释放锁（删除锁文件）。失败仅记录：TTL 会兜底。
     pub async fn release(&self, raw_io: &dyn RawIo) {
+        let owner = self.store_lock_key.strip_prefix("locks/").unwrap_or("");
+        match raw_io.read_text(&self.store_lock_key).await {
+            Ok(Some(content)) if read_back_mine(&content, owner) => {}
+            _ => return,
+        }
         if let Err(e) = raw_io.delete(&self.store_lock_key).await {
             tracing::warn!(error = %e, "释放远端锁失败（将依赖 TTL 过期）");
         }
@@ -180,7 +234,7 @@ impl RemoteLock {
 }
 
 /// 后端的最小文本读写原语，锁机制在其上构建。
-/// **键相对元数据区根**（同步目录之外），各后端自行映射到自己的地址空间。
+/// **键相对元数据区根**，各后端自行映射到自己的地址空间。
 #[async_trait]
 pub trait RawIo: Send + Sync {
     async fn put_text(&self, key: &str, content: &str) -> anyhow::Result<()>;
@@ -196,7 +250,10 @@ mod tests {
     #[test]
     fn sibling_meta_paths() {
         assert_eq!(sibling_meta("/Sync"), ".synccloud/Sync");
-        assert_eq!(sibling_meta("/apps/synccloud/"), "apps/.synccloud/synccloud");
+        assert_eq!(
+            sibling_meta("/apps/synccloud/"),
+            "apps/.synccloud/synccloud"
+        );
         assert_eq!(sibling_meta("/a/b/Sync"), "a/b/.synccloud/Sync");
         // 根级目录
         assert_eq!(sibling_meta("docs"), ".synccloud/docs");
@@ -209,48 +266,159 @@ mod tests {
 /// 从 manifest 内容派生变更戳（版本 + 序号 + 文件数 + 更新时间）。
 /// 任何一次 manifest 写入都会至少改变 seq 与 updated_at。
 pub fn manifest_stamp_of(m: &Manifest) -> String {
-    format!("v{}|seq{}|n{}|{}", m.version, m.seq, m.files.len(), m.updated_at)
+    format!(
+        "v{}|seq{}|n{}|{}",
+        m.version,
+        m.seq,
+        m.files.len(),
+        m.updated_at
+    )
 }
 
 /// 根据配置构造后端实例。敏感字段已由上层从系统凭据管理器取出填入。
-pub async fn build_store(backend: &crate::config::BackendConfig) -> anyhow::Result<Box<dyn RemoteStore>> {
+pub async fn build_store(
+    backend: &crate::config::BackendConfig,
+) -> anyhow::Result<Box<dyn RemoteStore>> {
+    backend.validate()?;
+    let mut backend = backend.clone();
+    backend.resolve_credentials()?;
+    build_store_resolved(&backend).await
+}
+
+async fn build_store_resolved(
+    backend: &crate::config::BackendConfig,
+) -> anyhow::Result<Box<dyn RemoteStore>> {
     use crate::config::BackendConfig as B;
     match backend {
-        B::S3 { endpoint, region, bucket, access_key_id, secret_access_key, path_style, root_prefix } => {
-            Ok(Box::new(
-                s3::S3Store::new(
-                    endpoint.clone(),
-                    region.clone(),
-                    bucket.clone(),
-                    access_key_id.clone(),
-                    secret_access_key.clone(),
-                    *path_style,
-                    root_prefix.clone(),
-                )
-                .await,
-            ))
-        }
-        B::WebDav { url, username, password, root_path } => Ok(Box::new(webdav::WebDavStore::new(
+        B::S3 {
+            endpoint,
+            region,
+            bucket,
+            access_key_id,
+            secret_access_key,
+            path_style,
+            root_prefix,
+        } => Ok(Box::new(
+            s3::S3Store::new(
+                endpoint.clone(),
+                region.clone(),
+                bucket.clone(),
+                access_key_id.clone(),
+                secret_access_key.clone(),
+                *path_style,
+                root_prefix.clone(),
+            )
+            .await,
+        )),
+        B::WebDav {
+            url,
+            username,
+            password,
+            root_path,
+        } => Ok(Box::new(webdav::WebDavStore::new(
             url.clone(),
             username.clone(),
             password.clone(),
             root_path.clone(),
         ))),
-        B::Git { remote_url, branch, username, password } => Ok(Box::new(git_backend::GitStore::new(
+        B::Git {
+            remote_url,
+            branch,
+            username,
+            password,
+        } => Ok(Box::new(git_backend::GitStore::new(
             remote_url.clone(),
             branch.clone(),
             username.clone(),
             password.clone(),
         ))),
-        B::BaiduPan { auth_id, app_key, secret_key, remote_dir, .. } => Ok(Box::new(baidu::BaiduStore::new(
+        B::BaiduPan {
+            auth_id,
+            app_key,
+            secret_key,
+            remote_dir,
+            ..
+        } => Ok(Box::new(baidu::BaiduStore::new(
             auth_id.clone(),
             app_key.clone(),
             secret_key.clone(),
             remote_dir.clone(),
         ))),
-        B::AliyunDrive { auth_id, remote_dir, .. } => Ok(Box::new(aliyun::AliyunStore::new(
+        B::AliyunDrive {
+            auth_id,
+            remote_dir,
+            ..
+        } => Ok(Box::new(aliyun::AliyunStore::new(
             auth_id.clone(),
             remote_dir.clone(),
         ))),
     }
+}
+
+/// Relative storage keys never contain navigation components or Windows aliases.
+pub fn validate_key(key: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !key.is_empty()
+            && !key.contains(['\\', ':', '\0'])
+            && key
+                .split('/')
+                .all(|p| !p.is_empty() && p != "." && p != ".."),
+        "无效存储相对路径"
+    );
+    for part in key.split('/') {
+        anyhow::ensure!(!part.ends_with(['.', ' ']), "存储路径包含 Windows 路径别名");
+        let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+        anyhow::ensure!(
+            !matches!(
+                stem.as_str(),
+                "CON"
+                    | "PRN"
+                    | "AUX"
+                    | "NUL"
+                    | "COM1"
+                    | "COM2"
+                    | "COM3"
+                    | "COM4"
+                    | "COM5"
+                    | "COM6"
+                    | "COM7"
+                    | "COM8"
+                    | "COM9"
+                    | "LPT1"
+                    | "LPT2"
+                    | "LPT3"
+                    | "LPT4"
+                    | "LPT5"
+                    | "LPT6"
+                    | "LPT7"
+                    | "LPT8"
+                    | "LPT9"
+            ),
+            "存储路径包含 Windows 设备名"
+        );
+    }
+    Ok(())
+}
+
+/// A connection test checks actual read, write, and delete permissions.
+pub async fn probe_text_io(io: &dyn RawIo) -> anyhow::Result<()> {
+    let key = format!(".probe-{}", uuid::Uuid::new_v4());
+    io.put_text(&key, "SyncCloud permission probe").await?;
+    let result = async {
+        anyhow::ensure!(
+            io.read_text(&key).await?.as_deref() == Some("SyncCloud permission probe"),
+            "权限测试回读不一致"
+        );
+        io.delete(&key).await?;
+        anyhow::ensure!(
+            io.read_text(&key).await?.is_none(),
+            "权限测试删除后仍然存在"
+        );
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = io.delete(&key).await;
+    }
+    result
 }

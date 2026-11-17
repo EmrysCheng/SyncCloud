@@ -10,17 +10,21 @@ fn main() {
     // bin 与测试二进制（内容为 Common-Controls v6 + PerMonitorV2 DPI 感知，
     // 是 tauri 默认 manifest 的超集）。
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("manifest");
+        let manifest_dir =
+            std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("manifest");
         let manifest_rc = manifest_dir.join("app.rc");
-        let manifest_o = manifest_dir.join("manifest.o");
+        let manifest_o =
+            std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("manifest.o");
         if manifest_rc.exists() {
-            let _ = std::process::Command::new("windres")
+            let status = std::process::Command::new("windres")
                 .arg("-i")
                 .arg(&manifest_rc)
                 .arg("-o")
                 .arg(&manifest_o)
                 .current_dir(&manifest_dir)
-                .status();
+                .status()
+                .expect("GNU 构建需要 windres，请使用 npm run test:rust 或 npm run build:app");
+            assert!(status.success(), "Windows manifest 编译失败");
         }
         if manifest_o.exists() {
             println!("cargo:rustc-link-arg={}", manifest_o.display());

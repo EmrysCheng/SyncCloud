@@ -1,11 +1,11 @@
 //! 传输历史与事件持久化数据库（基于应用数据目录的 history.db）
 //! 支持自定义保留周期（3天/7天/14天/30天/永久），自动清理过期数据。
 
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use crate::sync::engine::SyncEvent;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use crate::sync::engine::SyncEvent;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 static DB_CONN: OnceLock<Mutex<Connection>> = OnceLock::new();
 
@@ -38,7 +38,8 @@ fn get_conn() -> anyhow::Result<&'static Mutex<Connection>> {
         let _ = std::fs::create_dir_all(parent);
     }
     let conn = Connection::open(&p)?;
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
         CREATE TABLE IF NOT EXISTS activity_history (
@@ -56,18 +57,14 @@ fn get_conn() -> anyhow::Result<&'static Mutex<Connection>> {
         );
         CREATE INDEX IF NOT EXISTS idx_activity_time ON activity_history(timestamp);
         CREATE INDEX IF NOT EXISTS idx_activity_folder ON activity_history(folder_id);
-    ")?;
+    ",
+    )?;
     let _ = DB_CONN.set(Mutex::new(conn));
     Ok(DB_CONN.get().unwrap())
 }
 
 /// 将同步事件转化为传输历史记录并持久化
-pub fn record_event(
-    folder_id: &str,
-    folder_name: &str,
-    folder_local_path: &str,
-    ev: &SyncEvent,
-) {
+pub fn record_event(folder_id: &str, folder_name: &str, folder_local_path: &str, ev: &SyncEvent) {
     let now = chrono::Utc::now().timestamp_millis();
     let conn_mutex = match get_conn() {
         Ok(c) => c,
@@ -75,6 +72,11 @@ pub fn record_event(
     };
 
     match ev {
+        SyncEvent::Error{message,..}=>{
+            if let Err(e)=conn_mutex.lock().unwrap().execute(
+                "INSERT INTO activity_history(folder_id,folder_name,folder_local_path,event_type,error,timestamp) VALUES(?1,?2,?3,'error',?4,?5)",
+                params![folder_id,folder_name,folder_local_path,message,now]) {tracing::error!(error=%e,"保存同步错误历史失败");}
+        }
         SyncEvent::FileDone { path, action, .. } => {
             // 节约存储空间：内容一致无需传输的 identical 状态不占用历史记录
             if action == "identical" {
@@ -162,7 +164,9 @@ fn build_history_filter(
     if let Some(kw) = keyword {
         let trimmed = kw.trim();
         if !trimmed.is_empty() {
-            clause.push_str(" AND (path LIKE ? OR folder_name LIKE ? OR error LIKE ? OR reason LIKE ?)");
+            clause.push_str(
+                " AND (path LIKE ? OR folder_name LIKE ? OR error LIKE ? OR reason LIKE ?)",
+            );
             let like = format!("%{trimmed}%");
             params.push(Box::new(like.clone()));
             params.push(Box::new(like.clone()));
@@ -226,11 +230,7 @@ pub fn query_history(
 }
 
 /// 统计筛选条件下的记录总数（用于分页）
-pub fn count_history(
-    folder_id: Option<&str>,
-    action: Option<&str>,
-    keyword: Option<&str>,
-) -> u64 {
+pub fn count_history(folder_id: Option<&str>, action: Option<&str>, keyword: Option<&str>) -> u64 {
     let conn_mutex = match get_conn() {
         Ok(c) => c,
         Err(_) => return 0,
@@ -257,11 +257,12 @@ pub fn clean_expired_history(retention_days: u32) -> usize {
     };
     let cutoff = chrono::Utc::now().timestamp_millis() - (retention_days as i64 * 86400 * 1000);
     let conn = conn_mutex.lock().unwrap();
-    let n = conn.execute(
-        "DELETE FROM activity_history WHERE timestamp < ?1",
-        params![cutoff],
-    )
-    .unwrap_or(0);
+    let n = conn
+        .execute(
+            "DELETE FROM activity_history WHERE timestamp < ?1",
+            params![cutoff],
+        )
+        .unwrap_or(0);
     if n > 0 {
         // 清理后主动释放空间，避免 history.db 膨胀
         let _ = conn.execute("VACUUM", []);
@@ -278,13 +279,18 @@ pub fn clear_all_history(folder_id: Option<&str>) -> usize {
     let conn = conn_mutex.lock().unwrap();
     let n = if let Some(fid) = folder_id {
         if !fid.is_empty() && fid != "all" {
-            conn.execute("DELETE FROM activity_history WHERE folder_id = ?1", params![fid])
-                .unwrap_or(0)
+            conn.execute(
+                "DELETE FROM activity_history WHERE folder_id = ?1",
+                params![fid],
+            )
+            .unwrap_or(0)
         } else {
-            conn.execute("DELETE FROM activity_history", []).unwrap_or(0)
+            conn.execute("DELETE FROM activity_history", [])
+                .unwrap_or(0)
         }
     } else {
-        conn.execute("DELETE FROM activity_history", []).unwrap_or(0)
+        conn.execute("DELETE FROM activity_history", [])
+            .unwrap_or(0)
     };
     if n > 0 {
         let _ = conn.execute("VACUUM", []);

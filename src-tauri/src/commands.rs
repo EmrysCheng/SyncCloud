@@ -1,7 +1,7 @@
 //! Tauri IPC 命令层：前端 ⇄ 后端的全部接口。
 
-use std::path::PathBuf;
 use serde::Serialize;
+use std::path::PathBuf;
 use tauri::State;
 use uuid::Uuid;
 
@@ -34,7 +34,9 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
         device_id: cfg.device_id.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
         data_dir: app_data_dir().to_string_lossy().to_string(),
-        default_data_dir: crate::config::default_data_dir().to_string_lossy().to_string(),
+        default_data_dir: crate::config::default_data_dir()
+            .to_string_lossy()
+            .to_string(),
     })
 }
 
@@ -44,15 +46,32 @@ pub async fn save_settings(
     device_name: String,
     settings: GlobalSettings,
 ) -> Result<(), String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    if crate::sync::MAINTENANCE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("迁移后请重启程序再修改配置".into());
+    }
     let mut cfg = state.config.lock().await;
+    settings.validate().map_err(err)?;
+    let old = cfg.clone();
     cfg.device_name = device_name.trim().to_string();
     if cfg.device_name.is_empty() {
         cfg.device_name = "Device".into();
     }
-    cfg.settings = settings;
-    cfg.save(&app_data_dir()).map_err(err)?;
+    cfg.settings = settings.clone();
+    if let Err(e) = cfg.protect_credentials() {
+        *cfg = old;
+        return Err(err(e));
+    }
+    if let Err(e) = cfg.save(&app_data_dir()) {
+        *cfg = old;
+        return Err(err(e));
+    }
+    state.manager.apply_settings(&settings).await;
     // 关窗到托盘的开关在窗口事件（同步上下文）里读取，用原子变量即时生效
-    crate::CLOSE_TO_TRAY.store(cfg.settings.close_to_tray, std::sync::atomic::Ordering::Relaxed);
+    crate::CLOSE_TO_TRAY.store(
+        cfg.settings.close_to_tray,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // 网络带宽限速即刻热生效
     crate::sync::transfer::apply_bandwidth_limits(
         cfg.settings.max_upload_kbps,
@@ -69,7 +88,10 @@ pub async fn save_settings(
 
 #[tauri::command]
 pub async fn get_settings(state: State<'_, AppState>) -> Result<GlobalSettings, String> {
-    Ok(state.config.lock().await.settings.clone())
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    let mut cfg = state.config.lock().await;
+    cfg.protect_credentials().map_err(err)?;
+    Ok(cfg.settings.clone())
 }
 
 /// 在系统默认浏览器打开外部链接（设置页的开放平台注册入口等）。
@@ -91,7 +113,9 @@ pub struct FolderSummary {
 
 #[tauri::command]
 pub async fn list_folders(state: State<'_, AppState>) -> Result<Vec<FolderSummary>, String> {
-    let cfg = state.config.lock().await;
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    let mut cfg = state.config.lock().await;
+    cfg.protect_credentials().map_err(err)?;
     let statuses = state.manager.statuses().await;
     let out = cfg
         .folders
@@ -105,7 +129,15 @@ pub async fn list_folders(state: State<'_, AppState>) -> Result<Vec<FolderSummar
 }
 
 #[tauri::command]
-pub async fn add_folder(state: State<'_, AppState>, folder: FolderConfig) -> Result<String, String> {
+pub async fn add_folder(
+    state: State<'_, AppState>,
+    folder: FolderConfig,
+) -> Result<String, String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    if crate::sync::MAINTENANCE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("迁移后请重启程序再修改配置".into());
+    }
+    folder.validate().map_err(err)?;
     // 合法性检查
     if folder.name.trim().is_empty() {
         return Err("名称不能为空".into());
@@ -115,58 +147,101 @@ pub async fn add_folder(state: State<'_, AppState>, folder: FolderConfig) -> Res
         return Err(format!("本地路径不存在或不是目录: {}", folder.local_path));
     }
     let mut cfg = state.config.lock().await;
-    if cfg.folders.iter().any(|f| f.local_path == folder.local_path) {
+    if cfg
+        .folders
+        .iter()
+        .any(|f| f.local_path == folder.local_path)
+    {
         return Err("该本地目录已被其他同步任务使用".into());
     }
     let settings = cfg.settings.clone();
-    let folder = FolderConfig { id: Uuid::new_v4(), ..folder };
+    let folder = FolderConfig {
+        id: Uuid::new_v4(),
+        ..folder
+    };
     let id = folder.id.to_string();
-    cfg.folders.push(folder.clone());
-    cfg.save(&app_data_dir()).map_err(err)?;
-    drop(cfg);
-    state.manager.start_folder(&folder, &settings).await.map_err(err)?;
+    let mut next = cfg.clone();
+    next.folders.push(folder.clone());
+    next.protect_credentials().map_err(err)?;
+    next.save(&app_data_dir()).map_err(err)?;
+    *cfg = next;
+    if folder.enabled {
+        state
+            .manager
+            .start_folder(&folder, &settings)
+            .await
+            .map_err(err)?;
+    }
     Ok(id)
 }
 
 #[tauri::command]
 pub async fn update_folder(state: State<'_, AppState>, folder: FolderConfig) -> Result<(), String> {
-    let mut cfg = state.config.lock().await;
-    match cfg.folders.iter_mut().find(|f| f.id == folder.id) {
-        Some(slot) => *slot = folder.clone(),
-        None => return Err("同步文件夹不存在".into()),
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    if crate::sync::MAINTENANCE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("迁移后请重启程序再修改配置".into());
     }
-    let settings = cfg.settings.clone();
-    cfg.save(&app_data_dir()).map_err(err)?;
-    drop(cfg);
+    let mut cfg = state.config.lock().await;
+    folder.validate().map_err(err)?;
+    let mut next = cfg.clone();
+    let slot = next
+        .folders
+        .iter_mut()
+        .find(|f| f.id == folder.id)
+        .ok_or("同步文件夹不存在")?;
+    *slot = folder.clone();
+    let settings = next.settings.clone();
+    next.protect_credentials().map_err(err)?;
+    next.save(&app_data_dir()).map_err(err)?;
+    *cfg = next;
     // 重启任务使配置生效
     state.manager.stop_folder(&folder.id).await;
     if folder.enabled {
-        state.manager.start_folder(&folder, &settings).await.map_err(err)?;
+        state
+            .manager
+            .start_folder(&folder, &settings)
+            .await
+            .map_err(err)?;
     }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn remove_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), String> {
+    remove_folder_inner(&state, folder_id).await
+}
+async fn remove_folder_inner(state: &AppState, folder_id: String) -> Result<(), String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    if crate::sync::MAINTENANCE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("迁移后请重启程序再修改配置".into());
+    }
     let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
-    state.manager.stop_folder(&id).await;
     let mut cfg = state.config.lock().await;
-    cfg.folders.retain(|f| f.id != id);
-    cfg.save(&app_data_dir()).map_err(err)?;
+    let mut next = cfg.clone();
+    next.folders.retain(|f| f.id != id);
+    next.save(&app_data_dir()).map_err(err)?;
+    *cfg = next;
+    state.manager.stop_folder(&id).await;
     // 状态库保留，便于用户反悔后恢复
     Ok(())
 }
 
 #[tauri::command]
-pub async fn sync_now(state: State<'_, AppState>, folder_id: String) -> Result<bool, String> {
+pub async fn sync_now(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<crate::sync::manager::SyncReceipt, String> {
     let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
-    Ok(state.manager.sync_now(&id).await)
+    state.manager.sync_now(&id).await
 }
 
 #[tauri::command]
-pub async fn force_push_folder(state: State<'_, AppState>, folder_id: String) -> Result<bool, String> {
+pub async fn force_push_folder(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<crate::sync::manager::SyncReceipt, String> {
     let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
-    Ok(state.manager.force_push(&id).await)
+    state.manager.force_push(&id).await
 }
 
 #[tauri::command]
@@ -179,13 +254,13 @@ pub async fn pause_folder(state: State<'_, AppState>, folder_id: String) -> Resu
 #[tauri::command]
 pub async fn resume_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), String> {
     let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
-    state.manager.resume_folder(&id).await;
-    Ok(())
+    state.manager.resume_folder(&id).await
 }
 
 /// 后端连通性测试（添加向导中调用）。
 #[tauri::command]
 pub async fn test_backend(backend: BackendConfig) -> Result<String, String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
     let store = crate::storage::build_store(&backend).await.map_err(err)?;
     store.test().await.map_err(err)?;
     Ok("连接成功，读写权限正常".into())
@@ -197,8 +272,10 @@ pub async fn list_conflicts(
     folder_id: String,
     include_resolved: bool,
 ) -> Result<Vec<ConflictRecord>, String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
     let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
-    let db = crate::sync::state::StateDb::open(&config::folder_data_dir(&id).join("state.db")).map_err(err)?;
+    let db = crate::sync::state::StateDb::open(&config::folder_data_dir(&id).join("state.db"))
+        .map_err(err)?;
     db.list_conflicts(include_resolved).map_err(err)
 }
 
@@ -209,46 +286,66 @@ pub async fn resolve_conflict(
     conflict_id: i64,
     resolution: String,
 ) -> Result<(), String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
     let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
-    let db = crate::sync::state::StateDb::open(&config::folder_data_dir(&id).join("state.db")).map_err(err)?;
-    
-    if let Ok(Some(record)) = db.get_conflict(conflict_id) {
-        let cfg = state.config.lock().await;
-        let folder = cfg.folders.iter().find(|f| f.id == id).cloned();
-        drop(cfg);
+    let db = crate::sync::state::StateDb::open(&config::folder_data_dir(&id).join("state.db"))
+        .map_err(err)?;
 
-        if let Some(folder) = folder {
-            let root = std::path::PathBuf::from(&folder.local_path);
-            let orig_path = root.join(&record.path);
-            let copy_path = record.conflict_copy.as_ref().map(|c| root.join(c));
-
-            match resolution.as_str() {
-                "keep_local" => {
-                    if let Some(cp) = copy_path {
-                        let _ = std::fs::remove_file(cp);
-                    }
-                    db.resolve_conflict(conflict_id, "保留本地原版（已清理冲突副本）").map_err(err)?;
-                }
-                "keep_copy" => {
-                    if let Some(cp) = copy_path {
-                        if cp.exists() {
-                            let _ = std::fs::copy(&cp, &orig_path);
-                            let _ = std::fs::remove_file(&cp);
-                        }
-                    }
-                    db.resolve_conflict(conflict_id, "保留冲突副本（已覆盖原版）").map_err(err)?;
-                }
-                _ => {
-                    db.resolve_conflict(conflict_id, "保留双方版本").map_err(err)?;
-                }
+    let folder = state
+        .config
+        .lock()
+        .await
+        .folders
+        .iter()
+        .find(|f| f.id == id)
+        .cloned()
+        .ok_or("文件夹不存在")?;
+    let _operation = crate::sync::operation_lock(&id).await.map_err(err)?;
+    let record = db
+        .get_conflict(conflict_id)
+        .map_err(err)?
+        .ok_or("冲突记录不存在")?;
+    let root = std::path::Path::new(&folder.local_path);
+    let orig = crate::sync::scanner::safe_path(root, &record.path).map_err(err)?;
+    let copy = record
+        .conflict_copy
+        .as_ref()
+        .map(|p| crate::sync::scanner::safe_path(root, p))
+        .transpose()
+        .map_err(err)?;
+    match resolution.as_str() {
+        "keep_local" => {
+            if let Some(p) = copy {
+                crate::sync::recycle::archive_file(&id, &p, &record.path, "conflict")
+                    .await
+                    .map_err(err)?;
+                tokio::fs::remove_file(p).await.map_err(|e| e.to_string())?;
             }
-        } else {
-            db.resolve_conflict(conflict_id, &resolution).map_err(err)?;
         }
-    } else {
-        db.resolve_conflict(conflict_id, &resolution).map_err(err)?;
+        "keep_copy" => {
+            let copy = copy.ok_or("冲突副本路径缺失")?;
+            if orig.exists() {
+                crate::sync::recycle::archive_file(&id, &orig, &record.path, "overwritten")
+                    .await
+                    .map_err(err)?;
+            }
+            // Keep the conflict copy available until the database commit succeeds.
+            let staged = orig.with_extension(format!("sc-stage-{}", Uuid::new_v4()));
+            let result = async {
+                tokio::fs::copy(copy, &staged).await?;
+                crate::sync::fslock::replace_file(&staged, &orig).await
+            }
+            .await;
+            if let Err(e) = result {
+                let _ = tokio::fs::remove_file(staged).await;
+                return Err(e.to_string());
+            }
+        }
+        "keep_both" => {}
+        _ => return Err("未知冲突处理方式".into()),
     }
-
+    db.resolve_conflict(conflict_id, &resolution).map_err(err)?;
+    drop(_operation);
     // 标记后触发一轮同步（清理或重新上传按需进行）
     let _ = state.manager.sync_now(&id).await;
     Ok(())
@@ -277,8 +374,17 @@ pub struct BaiduLoginInfo {
 }
 
 #[tauri::command]
-pub async fn baidu_login_start(app_key: String, secret_key: String) -> Result<BaiduLoginInfo, String> {
-    let store = crate::storage::baidu::BaiduStore::new(String::new(), app_key, secret_key, "/apps/synccloud".into());
+pub async fn baidu_login_start(
+    app_key: String,
+    secret_key: String,
+) -> Result<BaiduLoginInfo, String> {
+    let secret_key = crate::credential::resolve(&secret_key).map_err(err)?;
+    let store = crate::storage::baidu::BaiduStore::new(
+        String::new(),
+        app_key,
+        secret_key,
+        "/apps/synccloud".into(),
+    );
     let resp = store.start_device_login().await.map_err(err)?;
     Ok(BaiduLoginInfo {
         user_code: resp.user_code,
@@ -297,13 +403,27 @@ pub async fn baidu_login_poll(
     auth_id: Option<String>,
     account_name: Option<String>,
 ) -> Result<Option<crate::config::CloudAccount>, String> {
-    let id = auth_id.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let store = crate::storage::baidu::BaiduStore::new(id.clone(), app_key.clone(), secret_key.clone(), "/apps/synccloud".into());
-    let done = store.poll_device_login(&device_code).await.map_err(err)?;
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    let id = auth_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let secret_key = crate::credential::resolve(&secret_key).map_err(err)?;
+    let store = crate::storage::baidu::BaiduStore::new(
+        id.clone(),
+        app_key.clone(),
+        secret_key.clone(),
+        "/apps/synccloud".into(),
+    );
+    let account_lock = crate::credential::account_lock(&format!("baidu:account:{id}"));
+    let _account = account_lock.lock().await;
+    let done = store
+        .poll_device_login_unlocked(&device_code)
+        .await
+        .map_err(err)?;
     if done {
         let name = account_name
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| format!("百度账号-{}", &id[..6]));
+            .unwrap_or_else(|| format!("百度账号-{}", id.chars().take(6).collect::<String>()));
         let account = crate::config::CloudAccount {
             id: id.clone(),
             provider: "baidu".into(),
@@ -312,11 +432,9 @@ pub async fn baidu_login_poll(
             secret_key: Some(secret_key),
             created_at: chrono::Local::now().to_rfc3339(),
         };
-        let mut list = crate::config::load_cloud_accounts(&app_data_dir());
-        list.retain(|a| a.id != account.id);
-        list.push(account.clone());
-        let _ = crate::config::save_cloud_accounts(&app_data_dir(), &list);
-        Ok(Some(account))
+        let persisted =
+            crate::config::upsert_cloud_account(&app_data_dir(), account).map_err(err)?;
+        Ok(Some(persisted))
     } else {
         Ok(None)
     }
@@ -334,7 +452,9 @@ pub struct AliyunQrInfo {
 
 #[tauri::command]
 pub async fn aliyun_qr_start() -> Result<AliyunQrInfo, String> {
-    let (qr, link, sid) = crate::storage::aliyun::start_qr_login().await.map_err(err)?;
+    let (qr, link, sid) = crate::storage::aliyun::start_qr_login()
+        .await
+        .map_err(err)?;
     Ok(AliyunQrInfo {
         qr_url: qr,
         link_url: link,
@@ -348,12 +468,19 @@ pub async fn aliyun_qr_poll(
     auth_id: Option<String>,
     account_name: Option<String>,
 ) -> Result<Option<crate::config::CloudAccount>, String> {
-    let id = auth_id.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let done = crate::storage::aliyun::poll_qr_login(&sid, Some(&id)).await.map_err(err)?;
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    let id = auth_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let account_lock = crate::credential::account_lock(&format!("aliyun:account:{id}"));
+    let _account = account_lock.lock().await;
+    let done = crate::storage::aliyun::poll_qr_login_unlocked(&sid, Some(&id))
+        .await
+        .map_err(err)?;
     if done {
         let name = account_name
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| format!("阿里云盘-{}", &id[..6]));
+            .unwrap_or_else(|| format!("阿里云盘-{}", id.chars().take(6).collect::<String>()));
         let account = crate::config::CloudAccount {
             id: id.clone(),
             provider: "aliyun".into(),
@@ -362,11 +489,9 @@ pub async fn aliyun_qr_poll(
             secret_key: None,
             created_at: chrono::Local::now().to_rfc3339(),
         };
-        let mut list = crate::config::load_cloud_accounts(&app_data_dir());
-        list.retain(|a| a.id != account.id);
-        list.push(account.clone());
-        let _ = crate::config::save_cloud_accounts(&app_data_dir(), &list);
-        Ok(Some(account))
+        let persisted =
+            crate::config::upsert_cloud_account(&app_data_dir(), account).map_err(err)?;
+        Ok(Some(persisted))
     } else {
         Ok(None)
     }
@@ -375,8 +500,11 @@ pub async fn aliyun_qr_poll(
 // ---- 云盘授权状态与账号管理 ----
 
 #[tauri::command]
-pub async fn list_cloud_accounts(provider: Option<String>) -> Result<Vec<crate::config::CloudAccount>, String> {
-    let list = crate::config::load_cloud_accounts(&app_data_dir());
+pub async fn list_cloud_accounts(
+    provider: Option<String>,
+) -> Result<Vec<crate::config::CloudAccount>, String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    let list = crate::config::load_cloud_accounts(&app_data_dir()).map_err(err)?;
     if let Some(p) = provider {
         Ok(list.into_iter().filter(|a| a.provider == p).collect())
     } else {
@@ -386,34 +514,29 @@ pub async fn list_cloud_accounts(provider: Option<String>) -> Result<Vec<crate::
 
 #[tauri::command]
 pub async fn delete_cloud_account(id: String) -> Result<(), String> {
-    let mut list = crate::config::load_cloud_accounts(&app_data_dir());
-    if let Some(acc) = list.iter().find(|a| a.id == id).cloned() {
-        // 真正删除系统凭据管理器中的令牌（旧版写空串会残留条目）
-        let key = match acc.provider.as_str() {
-            "baidu" => Some(format!("baidu:account:{}", acc.id)),
-            "aliyun" => Some(format!("aliyun:account:{}", acc.id)),
-            _ => None,
-        };
-        if let Some(k) = key {
-            if let Err(e) = crate::credential::delete_secret(&k) {
-                tracing::warn!(error = %e, account = %acc.id, "清理凭据条目失败");
-            }
-        }
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    let account = crate::config::load_cloud_accounts(&app_data_dir())
+        .map_err(err)?
+        .into_iter()
+        .find(|a| a.id == id);
+    if let Some(acc) = account {
+        let key = format!("{}:account:{}", acc.provider, acc.id);
+        let lock = crate::credential::account_lock(&key);
+        let _guard = lock.lock().await;
+        crate::config::remove_cloud_account(&app_data_dir(), &id).map_err(err)?;
+        crate::credential::delete_secret(&key).map_err(err)?;
     }
-    list.retain(|a| a.id != id);
-    crate::config::save_cloud_accounts(&app_data_dir(), &list).map_err(err)?;
+
     Ok(())
 }
 
 #[tauri::command]
 pub async fn save_cloud_account(account: crate::config::CloudAccount) -> Result<(), String> {
-    let mut list = crate::config::load_cloud_accounts(&app_data_dir());
-    if let Some(slot) = list.iter_mut().find(|a| a.id == account.id) {
-        *slot = account;
-    } else {
-        list.push(account);
-    }
-    crate::config::save_cloud_accounts(&app_data_dir(), &list).map_err(err)?;
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    let lock =
+        crate::credential::account_lock(&format!("{}:account:{}", account.provider, account.id));
+    let _account = lock.lock().await;
+    crate::config::upsert_cloud_account(&app_data_dir(), account).map_err(err)?;
     Ok(())
 }
 
@@ -424,7 +547,10 @@ pub async fn aliyun_authorized(auth_id: Option<String>) -> Result<bool, String> 
 }
 
 #[tauri::command]
-pub async fn baidu_authorized(auth_id: Option<String>, app_key: Option<String>) -> Result<bool, String> {
+pub async fn baidu_authorized(
+    auth_id: Option<String>,
+    app_key: Option<String>,
+) -> Result<bool, String> {
     let id = auth_id.unwrap_or_default();
     let ak = app_key.unwrap_or_default();
     Ok(crate::storage::baidu::BaiduStore::authorized(&id, &ak))
@@ -463,9 +589,15 @@ pub async fn set_file_storage_mode(
     path: String,
     mode: String,
 ) -> Result<usize, String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
     let id: Uuid = folder_id.parse().map_err(|_| "ID 非法".to_string())?;
     let cfg = state.config.lock().await;
-    let folder = cfg.folders.iter().find(|f| f.id == id).cloned().ok_or_else(|| "文件夹不存在".to_string())?;
+    let folder = cfg
+        .folders
+        .iter()
+        .find(|f| f.id == id)
+        .cloned()
+        .ok_or_else(|| "文件夹不存在".to_string())?;
     drop(cfg);
 
     let data_dir = crate::config::folder_data_dir(&folder.id);
@@ -479,13 +611,44 @@ pub async fn set_file_storage_mode(
 // ---- 数据目录管理 ----
 
 #[tauri::command]
-pub async fn change_data_dir(new_path: String, copy_existing: bool) -> Result<String, String> {
+pub async fn change_data_dir(
+    state: State<'_, AppState>,
+    new_path: String,
+    copy_existing: bool,
+) -> Result<String, String> {
+    let _migration = crate::sync::data_migration_guard().await;
     let p = std::path::PathBuf::from(new_path.trim());
     if p.as_os_str().is_empty() {
         return Err("数据目录路径不能为空".into());
     }
-    crate::config::set_app_data_dir(p.clone(), copy_existing).map_err(err)?;
-    Ok(crate::config::app_data_dir().to_string_lossy().to_string())
+    let cfg = state.config.lock().await;
+    if crate::sync::MAINTENANCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("数据目录正在迁移，请重启程序".into());
+    }
+    for folder in &cfg.folders {
+        state.manager.stop_folder(&folder.id).await;
+    }
+    // Drain shell/hydration/restore operations that started before maintenance.
+    let mut guards = Vec::new();
+    for folder in &cfg.folders {
+        guards.push(crate::sync::drain_operation_lock(&folder.id).await);
+    }
+    let target = p.clone();
+    let result = match tokio::task::spawn_blocking(move || {
+        crate::config::set_app_data_dir(target, copy_existing)
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => Err(e.into()),
+    };
+    if let Err(e) = result {
+        crate::sync::MAINTENANCE.store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(guards);
+        state.manager.start_all(&cfg).await;
+        return Err(err(e));
+    }
+    Ok(p.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -502,8 +665,8 @@ pub async fn open_path_in_explorer(path: String, select: bool) -> Result<(), Str
     }
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
         use std::os::windows::process::CommandExt;
+        use std::process::Command;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
         let s = canonical.to_string_lossy().replace("\\\\?\\", "");
@@ -543,11 +706,22 @@ pub async fn open_data_dir() -> Result<(), String> {
 
 /// 立即同步全部启用的文件夹
 #[tauri::command]
-pub async fn sync_all_folders(state: State<'_, AppState>) -> Result<(), String> {
-    for s in state.manager.statuses().await {
-        let _ = state.manager.sync_now(&s.folder_id).await;
+pub async fn sync_all_folders(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::sync::manager::SyncReceipt>, String> {
+    let mut receipts = Vec::new();
+    let cfg = state.config.lock().await;
+    for folder in cfg.folders.iter().filter(|f| f.enabled) {
+        receipts.push(match state.manager.sync_now(&folder.id).await {
+            Ok(receipt) => receipt,
+            Err(error) => crate::sync::manager::SyncReceipt {
+                folder_id: folder.id,
+                disposition: "rejected",
+                error: Some(error),
+            },
+        });
     }
-    Ok(())
+    Ok(receipts)
 }
 
 /// 分析并预览指定文件夹的同步差异计划（对标 GoodSync / EchoSync）。
@@ -567,11 +741,7 @@ pub async fn analyze_folder(
     let settings = cfg.settings.clone();
     drop(cfg);
 
-    state
-        .manager
-        .analyze(&folder, &settings)
-        .await
-        .map_err(err)
+    state.manager.analyze(&folder, &settings).await.map_err(err)
 }
 
 /// 打开防误删保护回收站目录（对标 Syncthing / GoodSync）。
@@ -605,7 +775,9 @@ pub struct CloudAccountStatus {
 /// 探测授权账户的实时可用性：令牌存在性 + 一次轻量远端调用。
 #[tauri::command]
 pub async fn cloud_account_status(account_id: String) -> Result<CloudAccountStatus, String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
     let acc = crate::config::load_cloud_accounts(&app_data_dir())
+        .map_err(err)?
         .into_iter()
         .find(|a| a.id == account_id)
         .ok_or_else(|| "账户不存在".to_string())?;
@@ -614,7 +786,9 @@ pub async fn cloud_account_status(account_id: String) -> Result<CloudAccountStat
     let (authorized, probe) = match acc.provider.as_str() {
         "baidu" => {
             let app_key = acc.app_key.clone().unwrap_or_default();
-            let secret_key = acc.secret_key.clone().unwrap_or_default();
+            let secret_key =
+                crate::credential::resolve(&acc.secret_key.clone().unwrap_or_default())
+                    .map_err(err)?;
             let authorized = crate::storage::baidu::BaiduStore::authorized(&acc.id, &app_key);
             if !authorized {
                 (false, Err(anyhow::anyhow!("授权令牌缺失，请重新扫码授权")))
@@ -633,7 +807,10 @@ pub async fn cloud_account_status(account_id: String) -> Result<CloudAccountStat
             if !authorized {
                 (false, Err(anyhow::anyhow!("授权令牌缺失，请重新扫码授权")))
             } else {
-                let store = crate::storage::aliyun::AliyunStore::new(acc.id.clone(), "/apps/synccloud".into());
+                let store = crate::storage::aliyun::AliyunStore::new(
+                    acc.id.clone(),
+                    "/apps/synccloud".into(),
+                );
                 (true, store.test().await)
             }
         }
@@ -679,7 +856,6 @@ pub async fn open_log_dir() -> Result<(), String> {
     open_path_in_explorer(dir.to_string_lossy().to_string(), false).await
 }
 
-
 /// 恢复所有文件夹的同步
 #[tauri::command]
 pub async fn resume_all_folders(state: State<'_, AppState>) -> Result<(), String> {
@@ -704,9 +880,14 @@ pub async fn is_all_paused(state: State<'_, AppState>) -> Result<bool, String> {
 
 /// 获取指定文件夹的安全回收站归档列表
 #[tauri::command]
-pub async fn list_recycle_bin(folder_id: String) -> Result<Vec<crate::sync::recycle::RecycleItem>, String> {
-    let id: Uuid = folder_id.parse().map_err(|_| "Folder ID 非法".to_string())?;
-    Ok(crate::sync::recycle::list_items(&id))
+pub async fn list_recycle_bin(
+    folder_id: String,
+) -> Result<Vec<crate::sync::recycle::RecycleItem>, String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    let id: Uuid = folder_id
+        .parse()
+        .map_err(|_| "Folder ID 非法".to_string())?;
+    crate::sync::recycle::list_items(&id).map_err(err)
 }
 
 /// 从安全回收站一键还原指定文件到原工作路径
@@ -716,7 +897,10 @@ pub async fn restore_recycle_file(
     folder_id: String,
     item_id: String,
 ) -> Result<String, String> {
-    let id: Uuid = folder_id.parse().map_err(|_| "Folder ID 非法".to_string())?;
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    let id: Uuid = folder_id
+        .parse()
+        .map_err(|_| "Folder ID 非法".to_string())?;
     let cfg = state.config.lock().await;
     let folder = cfg
         .folders
@@ -727,6 +911,7 @@ pub async fn restore_recycle_file(
     drop(cfg);
 
     let local_root = std::path::PathBuf::from(&folder.local_path);
+    let _operation = crate::sync::operation_lock(&id).await.map_err(err)?;
     crate::sync::recycle::restore_item(&id, &item_id, &local_root)
         .await
         .map_err(err)
@@ -735,21 +920,31 @@ pub async fn restore_recycle_file(
 /// 清空指定文件夹的安全回收站
 #[tauri::command]
 pub async fn clean_recycle_bin(folder_id: String) -> Result<usize, String> {
-    let id: Uuid = folder_id.parse().map_err(|_| "Folder ID 非法".to_string())?;
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    let id: Uuid = folder_id
+        .parse()
+        .map_err(|_| "Folder ID 非法".to_string())?;
     crate::sync::recycle::clean_all(&id).await.map_err(err)
 }
 
 /// 删除指定回收站条目
 #[tauri::command]
 pub async fn delete_recycle_item(folder_id: String, item_id: String) -> Result<(), String> {
-    let id: Uuid = folder_id.parse().map_err(|_| "Folder ID 非法".to_string())?;
-    crate::sync::recycle::delete_item(&id, &item_id).await.map_err(err)
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    let id: Uuid = folder_id
+        .parse()
+        .map_err(|_| "Folder ID 非法".to_string())?;
+    crate::sync::recycle::delete_item(&id, &item_id)
+        .await
+        .map_err(err)
 }
 
 /// 在 Windows 资源管理器中打开安全回收站目录
 #[tauri::command]
 pub async fn open_recycle_bin_dir(folder_id: String) -> Result<(), String> {
-    let id: Uuid = folder_id.parse().map_err(|_| "Folder ID 非法".to_string())?;
+    let id: Uuid = folder_id
+        .parse()
+        .map_err(|_| "Folder ID 非法".to_string())?;
     let dir = crate::sync::recycle::recycle_dir(&id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建回收站目录失败: {e}"))?;
     open_path_in_explorer(dir.to_string_lossy().to_string(), false).await
@@ -765,6 +960,7 @@ pub async fn get_activity_history(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<crate::sync::history::ActivityPage, String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
     let limit = limit.unwrap_or(50).clamp(1, 200);
     let offset = offset.unwrap_or(0);
     Ok(crate::sync::history::ActivityPage {
@@ -785,6 +981,7 @@ pub async fn get_activity_history(
 
 #[tauri::command]
 pub async fn clean_expired_activity(state: State<'_, AppState>) -> Result<usize, String> {
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
     let days = {
         let guard = state.config.lock().await;
         guard.settings.activity_retention_days
@@ -794,7 +991,10 @@ pub async fn clean_expired_activity(state: State<'_, AppState>) -> Result<usize,
 
 #[tauri::command]
 pub async fn clear_activity_history(folder_id: Option<String>) -> Result<usize, String> {
-    Ok(crate::sync::history::clear_all_history(folder_id.as_deref()))
+    let _data_write = crate::sync::data_write_guard().await.map_err(err)?;
+    Ok(crate::sync::history::clear_all_history(
+        folder_id.as_deref(),
+    ))
 }
 
 // ---- 内部工具 ----
@@ -812,5 +1012,43 @@ impl AppState {
             }),
             recent_events: tokio::sync::Mutex::new(Vec::new()),
         }
+    }
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::*;
+    #[tokio::test]
+    async fn removal_waits_for_config_transaction_and_stops_restarted_task() {
+        let root = std::env::temp_dir().join(format!("synccloud-lifecycle-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("local")).unwrap();
+        crate::config::set_app_data_dir_in_memory(root.clone());
+        let state = AppState::new();
+        let id = Uuid::new_v4();
+        let folder:FolderConfig=serde_json::from_value(serde_json::json!({"id":id,"name":"fixture","localPath":root.join("local").to_string_lossy(),"syncMode":"manual","backend":{"type":"webdav","url":"http://127.0.0.1:1","username":"","password":"","rootPath":""}})).unwrap();
+        let mut cfg = state.config.lock().await;
+        cfg.device_id = "fixture".into();
+        cfg.folders.push(folder.clone());
+        cfg.save(&root).unwrap();
+        state
+            .manager
+            .start_folder(&folder, &cfg.settings)
+            .await
+            .unwrap();
+        // Poll a deletion while update owns the config transaction, then perform
+        // update's stop/start before releasing that transaction.
+        let mut removal = Box::pin(remove_folder_inner(&state, id.to_string()));
+        assert!(futures::poll!(removal.as_mut()).is_pending());
+        state.manager.stop_folder(&id).await;
+        state
+            .manager
+            .start_folder(&folder, &cfg.settings)
+            .await
+            .unwrap();
+        drop(cfg);
+        removal.await.unwrap();
+        assert!(state.config.lock().await.folders.is_empty());
+        assert!(state.manager.statuses().await.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -7,8 +7,8 @@ use tracing::{info, warn};
 
 use crate::config::{folder_data_dir, FolderConfig};
 use crate::storage::build_store;
-use crate::sync::fslock::{set_storage_mode_attributes, replace_file};
-use crate::sync::scanner::{abs_path, rel_path, hash_file};
+use crate::sync::fslock::{replace_file, set_storage_mode_attributes};
+use crate::sync::scanner::{hash_file, rel_path, safe_path as abs_path};
 use crate::sync::state::StateDb;
 use crate::AppState;
 
@@ -18,29 +18,50 @@ pub async fn keep_offline_file(
     db: &StateDb,
     rel: &str,
 ) -> anyhow::Result<bool> {
+    let _operation = crate::sync::operation_lock(&folder.id).await?;
     let root = PathBuf::from(&folder.local_path);
     // 兼容可能存在的 .synccloud 占位后缀
     let clean_rel = rel.strip_suffix(".synccloud").unwrap_or(rel);
-    let target = abs_path(&root, clean_rel);
-    let placeholder_path = abs_path(&root, &format!("{clean_rel}.synccloud"));
+    let target = abs_path(&root, clean_rel)?;
+    let placeholder_path = abs_path(&root, &format!("{clean_rel}.synccloud"))?;
 
+    if !db.is_placeholder(clean_rel)? && target.is_file() {
+        return Ok(false);
+    }
     // 从存储后端下载真实内容
     let store = build_store(&folder.backend).await?;
     let tmp = std::env::temp_dir().join(format!("synccloud-hydrate-{}", uuid::Uuid::new_v4()));
     store.get_file(clean_rel, &tmp).await?;
+    let manifest = store
+        .read_manifest()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("远端清单缺失，停止恢复"))?;
+    let expected = manifest
+        .files
+        .get(clean_rel)
+        .ok_or_else(|| anyhow::anyhow!("远端文件未登记，停止恢复"))?;
+    let check = tmp.clone();
+    let hash = tokio::task::spawn_blocking(move || hash_file(&check)).await??;
+    anyhow::ensure!(
+        tokio::fs::metadata(&tmp).await?.len() == expected.size && hash == expected.hash,
+        "恢复文件完整性校验失败，保留占位文件"
+    );
+    if target.exists() {
+        crate::sync::recycle::archive_file(&folder.id, &target, clean_rel, "overwritten").await?;
+    }
 
     if let Some(parent) = target.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+        tokio::fs::create_dir_all(parent).await?;
     }
 
     // 写入真实文件并移除可能存在的占位文件
     replace_file(&tmp, &target).await?;
     if placeholder_path.exists() && placeholder_path != target {
-        let _ = tokio::fs::remove_file(&placeholder_path).await;
+        tokio::fs::remove_file(&placeholder_path).await?;
     }
 
     set_storage_mode_attributes(&target, "keep_offline");
-    db.remove_placeholder(clean_rel);
+    db.remove_placeholder(clean_rel)?;
 
     info!(folder = %folder.name, path = %clean_rel, "已设为保持离线可用（完整下载恢复）");
     Ok(true)
@@ -53,10 +74,11 @@ pub async fn free_space_file(
     db: &StateDb,
     rel: &str,
 ) -> anyhow::Result<bool> {
+    let _operation = crate::sync::operation_lock(&folder.id).await?;
     let root = PathBuf::from(&folder.local_path);
     let clean_rel = rel.strip_suffix(".synccloud").unwrap_or(rel);
-    let target = abs_path(&root, clean_rel);
-    let placeholder_path = abs_path(&root, &format!("{clean_rel}.synccloud"));
+    let target = abs_path(&root, clean_rel)?;
+    let placeholder_path = abs_path(&root, &format!("{clean_rel}.synccloud"))?;
 
     // 安全前置校验：必须确认该文件在云端已经成功上传且哈希一致！
     let store = build_store(&folder.backend).await?;
@@ -74,26 +96,39 @@ pub async fn free_space_file(
         }
     };
 
-    // 检查本地真实文件
-    if target.is_file() {
-        let meta = std::fs::metadata(&target)?;
-        let local_size = meta.len();
-        if local_size > 0 {
-            let local_hash = hash_file(&target)?;
-            if local_hash != remote_meta.hash {
-                anyhow::bail!("本地内容与云端不一致，请先同步上传后再释放空间");
-            }
-        }
+    if !target.exists() && placeholder_path.exists() && db.is_placeholder(clean_rel)? {
+        return Ok(false);
     }
-
-    // 1. 记录真实元数据到数据库占位符表
-    db.add_placeholder(clean_rel, remote_meta.size, remote_meta.mtime_ms, &remote_meta.hash);
-
-    // 2. 如果存在普通文件，转换为带有 .synccloud 关联的 0 字节占位文件（资源管理器中通过 NeverShowExt 仍显示原名）
-    if target.exists() && target != placeholder_path {
-        let _ = tokio::fs::remove_file(&target).await;
+    anyhow::ensure!(target.is_file(), "本地文件不存在，不能释放空间");
+    let check = target.clone();
+    let hash = tokio::task::spawn_blocking(move || hash_file(&check)).await??;
+    anyhow::ensure!(
+        tokio::fs::metadata(&target).await?.len() == remote_meta.size && hash == remote_meta.hash,
+        "本地内容与云端不一致，请先同步上传后再释放空间"
+    );
+    // Full recovery copy must exist before converting to a placeholder.
+    crate::sync::recycle::archive_file(&folder.id, &target, clean_rel, "released").await?;
+    let check = target.clone();
+    let hash = tokio::task::spawn_blocking(move || hash_file(&check)).await??;
+    anyhow::ensure!(
+        tokio::fs::metadata(&target).await?.len() == remote_meta.size && hash == remote_meta.hash,
+        "归档期间本地内容已变化，停止释放空间，请先同步"
+    );
+    db.add_placeholder(
+        clean_rel,
+        remote_meta.size,
+        remote_meta.mtime_ms,
+        &remote_meta.hash,
+    )?;
+    if let Err(e) = tokio::fs::write(&placeholder_path, b"").await {
+        db.remove_placeholder(clean_rel)?;
+        return Err(e.into());
     }
-    tokio::fs::write(&placeholder_path, b"").await?;
+    if let Err(e) = tokio::fs::remove_file(&target).await {
+        tokio::fs::remove_file(&placeholder_path).await?;
+        db.remove_placeholder(clean_rel)?;
+        return Err(e.into());
+    }
 
     // 3. 赋予 Windows 原生脱机属性（空心绿圈白勾）
     set_storage_mode_attributes(&placeholder_path, "free_space");
@@ -113,7 +148,7 @@ pub async fn apply_storage_mode_path(
     let target = if rel_path.trim().is_empty() || rel_path == "." || rel_path == "/" {
         root.clone()
     } else {
-        abs_path(&root, rel_path)
+        abs_path(&root, rel_path)?
     };
 
     let mut files = Vec::new();
@@ -123,8 +158,8 @@ pub async fn apply_storage_mode_path(
         for entry in walkdir::WalkDir::new(&target)
             .follow_links(false)
             .into_iter()
-            .flatten()
         {
+            let entry = entry?;
             if entry.file_type().is_file() {
                 let r = crate::sync::scanner::rel_path(&root, entry.path());
                 files.push(r);
@@ -141,7 +176,7 @@ pub async fn apply_storage_mode_path(
             "free_space" => free_space_file(folder, db, &rel).await,
             _ => anyhow::bail!("未知的存储模式: {mode}"),
         };
-        if let Ok(true) = res {
+        if res? {
             success_count += 1;
         }
     }
@@ -164,7 +199,11 @@ fn path_starts_with_case_insensitive(path: &Path, prefix: &Path) -> bool {
 /// 双击脱机占位文件时：自动从云端下载恢复为「保持离线可用」，并使用系统默认程序正常打开该文件！
 pub async fn handle_open_hydrate(app: &tauri::AppHandle, target_path_str: &str) {
     let target_path = PathBuf::from(target_path_str.trim().trim_matches('"'));
-    let clean_str = target_path_str.trim().trim_matches('"').strip_suffix(".synccloud").unwrap_or(target_path_str.trim().trim_matches('"'));
+    let clean_str = target_path_str
+        .trim()
+        .trim_matches('"')
+        .strip_suffix(".synccloud")
+        .unwrap_or(target_path_str.trim().trim_matches('"'));
     let real_file_path = PathBuf::from(clean_str);
 
     let state = match app.try_state::<AppState>() {
@@ -193,12 +232,18 @@ pub async fn handle_open_hydrate(app: &tauri::AppHandle, target_path_str: &str) 
     let rel = rel_path(&root, &real_file_path);
 
     // 1. 自动转为保持离线可用（从云端完整拉取恢复真实内容）
-    let _ = keep_offline_file(&folder, &db, &rel).await;
+    if let Err(e) = keep_offline_file(&folder, &db, &rel).await {
+        let _ = app.emit("synccloud://toast", format!("恢复失败：{e:#}"));
+        return;
+    }
 
     // 2. 立即调用系统原生默认关联程序打开恢复后的文件
     shell_open_file(&real_file_path);
 
-    let file_name = real_file_path.file_name().and_then(|n| n.to_str()).unwrap_or("文件");
+    let file_name = real_file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("文件");
     let notify_msg = format!("已自动转为保持离线可用并打开「{file_name}」");
     info!(path = %real_file_path.display(), "{notify_msg}");
     let _ = app.emit("synccloud://toast", notify_msg);
@@ -239,11 +284,7 @@ pub fn shell_open_file(path: &Path) {
 }
 
 /// 处理 Windows 资源管理器右键传参执行（Shell 扩展命令分发）。
-pub async fn handle_shell_command(
-    app: &tauri::AppHandle,
-    command: &str,
-    target_path_str: &str,
-) {
+pub async fn handle_shell_command(app: &tauri::AppHandle, command: &str, target_path_str: &str) {
     let target_path = PathBuf::from(target_path_str.trim().trim_matches('"'));
     if !target_path.exists() && !target_path.with_extension("synccloud").exists() {
         warn!(path = %target_path.display(), "目标路径不存在");
@@ -316,14 +357,25 @@ pub async fn handle_shell_command(
 
     // 若是对目录操作，对目录本身也打标
     if target_path.is_dir() {
-        let mode = if command == "--free-space" { "free_space" } else { "keep_offline" };
+        let mode = if command == "--free-space" {
+            "free_space"
+        } else {
+            "keep_offline"
+        };
         set_storage_mode_attributes(&target_path, mode);
     }
 
-    let target_name = target_path.file_name().and_then(|n| n.to_str()).unwrap_or("目标文件");
+    let target_name = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("目标文件");
     let notify_msg = match command {
-        "--keep-offline" => format!("已将「{target_name}」设为保持离线可用（恢复 {count} 项完整文件）"),
-        "--free-space" => format!("已将「{target_name}」设为不占用电脑空间（已释放 {count} 项本地磁盘占用）"),
+        "--keep-offline" => {
+            format!("已将「{target_name}」设为保持离线可用（恢复 {count} 项完整文件）")
+        }
+        "--free-space" => {
+            format!("已将「{target_name}」设为不占用电脑空间（已释放 {count} 项本地磁盘占用）")
+        }
         _ => format!("操作已完成（处理 {count} 项）"),
     };
 

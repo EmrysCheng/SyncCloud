@@ -5,7 +5,7 @@
 //! - manifest 与锁存放在独立 `synccloud-meta/<分支>` ref 上（不进同步分支，
 //!   用户在仓库文件列表里看不到任何引擎文件）
 //! - 版本历史 = 提交历史；push 被拒（他机新提交）时本轮报错，下轮 fetch 后重试
-//! 依赖系统 git 命令行；https 远端将用户名+令牌嵌入 URL，SSH 使用用户已有密钥。
+//! 依赖系统 git 命令行；HTTPS 凭据通过进程环境传入，SSH 使用用户已有密钥。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -28,7 +28,10 @@ pub struct GitStore {
     /// 元数据暂存目录：待写入 meta ref 的锁文件副本
     meta_stage_dir: PathBuf,
     /// 暂存的删除清单
-    pending_deletes: tokio::sync::Mutex<HashSet<String>>,
+    delete_dir: PathBuf,
+    commit_lock: tokio::sync::Mutex<()>,
+    init_lock: tokio::sync::Mutex<()>,
+    fetch_lock: tokio::sync::Mutex<()>,
     /// 待从 meta ref 移除的键（锁删除）
     pending_meta_deletes: tokio::sync::Mutex<HashSet<String>>,
 }
@@ -44,7 +47,10 @@ impl GitStore {
             cache_dir: base.join("cache"),
             stage_dir: base.join("stage"),
             meta_stage_dir: base.join("meta-stage"),
-            pending_deletes: Default::default(),
+            delete_dir: base.join("delete-stage"),
+            commit_lock: Default::default(),
+            init_lock: Default::default(),
+            fetch_lock: Default::default(),
             pending_meta_deletes: Default::default(),
         }
     }
@@ -54,19 +60,32 @@ impl GitStore {
         self.stage_dir = dir.join("git-stage");
         self.cache_dir = dir.join("git-cache");
         self.meta_stage_dir = dir.join("git-meta-stage");
+        self.delete_dir = dir.join("git-delete-stage");
         self
     }
 
-    /// https 远端且提供了凭证时，将凭证嵌入 URL。
+    /// URL 不含程序附加的凭据。
     fn authed_url(&self) -> String {
-        if !self.remote_url.starts_with("http") || self.username.is_empty() || self.password.is_empty() {
-            return self.remote_url.clone();
+        self.remote_url.clone()
+    }
+    fn command(&self) -> Command {
+        let mut command = Command::new("git");
+        command.env("GIT_TERMINAL_PROMPT", "0").kill_on_drop(true);
+        command.env("LC_ALL", "C");
+        command.env(
+            "GIT_CONFIG_PARAMETERS",
+            "'http.lowSpeedLimit=1' 'http.lowSpeedTime=30'",
+        );
+        if !self.username.is_empty() || !self.password.is_empty() {
+            use base64::Engine;
+            let auth = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", self.username, self.password));
+            command
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+                .env("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {auth}"));
         }
-        let user = percent_encoding::utf8_percent_encode(&self.username, percent_encoding::NON_ALPHANUMERIC);
-        let pass = percent_encoding::utf8_percent_encode(&self.password, percent_encoding::NON_ALPHANUMERIC);
-        self.remote_url
-            .replacen("https://", &format!("https://{user}:{pass}@"), 1)
-            .replacen("http://", &format!("http://{user}:{pass}@"), 1)
+        command
     }
 
     fn ref_of(&self) -> String {
@@ -83,14 +102,19 @@ impl GitStore {
     }
 
     async fn git(&self, args: &[&str]) -> anyhow::Result<String> {
-        let output = Command::new("git")
+        let output = self
+            .command()
             .args(["-C"])
             .arg(&self.cache_dir)
             .args([
-                "-c", "core.autocrlf=false",
-                "-c", "core.safecrlf=false",
-                "-c", "user.name=SyncCloud",
-                "-c", "user.email=synccloud@device",
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "core.safecrlf=false",
+                "-c",
+                "user.name=SyncCloud",
+                "-c",
+                "user.email=synccloud@device",
             ])
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -108,7 +132,10 @@ impl GitStore {
     }
 
     async fn ensure_cache(&self) -> anyhow::Result<()> {
+        let _init = self.init_lock.lock().await;
         if self.cache_dir.join(".git").exists() {
+            self.git(&["remote", "set-url", "origin", &self.remote_url])
+                .await?;
             return Ok(());
         }
         if let Some(parent) = self.cache_dir.parent() {
@@ -116,7 +143,8 @@ impl GitStore {
         }
         let url = self.authed_url();
         // 尝试克隆指定分支；远端为空仓库或分支不存在时退化为全量克隆后建分支
-        let clone = Command::new("git")
+        let clone = self
+            .command()
             .args(["clone", "--no-checkout", "--branch", &self.branch, &url])
             .arg(&self.cache_dir)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -129,7 +157,8 @@ impl GitStore {
             }
             _ => {
                 let _ = tokio::fs::remove_dir_all(&self.cache_dir).await;
-                let out = Command::new("git")
+                let out = self
+                    .command()
                     .args(["clone", "--no-checkout", &url])
                     .arg(&self.cache_dir)
                     .env("GIT_TERMINAL_PROMPT", "0")
@@ -137,7 +166,10 @@ impl GitStore {
                     .await
                     .map_err(|e| anyhow::anyhow!("无法启动 git: {e}"))?;
                 if !out.status.success() {
-                    anyhow::bail!("克隆仓库失败: {}", String::from_utf8_lossy(&out.stderr).trim());
+                    anyhow::bail!(
+                        "克隆仓库失败: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
                 }
                 self.git(&["checkout", "-B", &self.branch]).await?;
                 Ok(())
@@ -147,12 +179,19 @@ impl GitStore {
 
     /// fetch 远端分支到 refs/remotes/origin/<branch>。
     async fn fetch(&self) -> anyhow::Result<()> {
+        let _fetch = self.fetch_lock.lock().await;
         self.ensure_cache().await?;
         let url = self.authed_url();
-        let out = Command::new("git")
+        let out = self
+            .command()
             .args(["-C"])
             .arg(&self.cache_dir)
-            .args(["fetch", "--force", &url, &format!("{}:{}", self.branch, self.ref_of())])
+            .args([
+                "fetch",
+                "--force",
+                &url,
+                &format!("{}:{}", self.branch, self.ref_of()),
+            ])
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .await
@@ -163,18 +202,26 @@ impl GitStore {
             if !err.contains("couldn't find remote ref") {
                 anyhow::bail!("git fetch 失败: {}", err.trim());
             }
+            self.git(&["update-ref", "-d", &self.ref_of()]).await?;
         }
         Ok(())
     }
 
     /// fetch 元数据分支。分支不存在（首次使用）不是错误。
     async fn fetch_meta(&self) -> anyhow::Result<()> {
+        let _fetch = self.fetch_lock.lock().await;
         self.ensure_cache().await?;
         let url = self.authed_url();
-        let out = Command::new("git")
+        let out = self
+            .command()
             .args(["-C"])
             .arg(&self.cache_dir)
-            .args(["fetch", "--force", &url, &format!("{}:{}", self.meta_branch(), self.meta_ref_of())])
+            .args([
+                "fetch",
+                "--force",
+                &url,
+                &format!("{}:{}", self.meta_branch(), self.meta_ref_of()),
+            ])
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .await
@@ -184,25 +231,37 @@ impl GitStore {
             if !err.contains("couldn't find remote ref") {
                 anyhow::bail!("git fetch 元数据分支失败: {}", err.trim());
             }
+            self.git(&["update-ref", "-d", &self.meta_ref_of()]).await?;
         }
         Ok(())
     }
 
     /// meta ref 是否存在（远端）。
     async fn has_meta_ref(&self) -> anyhow::Result<bool> {
-        let out = Command::new("git")
+        self.has_ref(&self.meta_ref_of()).await
+    }
+    async fn has_ref(&self, git_ref: &str) -> anyhow::Result<bool> {
+        let out = self
+            .command()
             .args(["-C"])
             .arg(&self.cache_dir)
-            .args(["rev-parse", "--verify", &self.meta_ref_of()])
+            .args(["show-ref", "--verify", "--quiet", git_ref])
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .await?;
-        Ok(out.status.success())
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => anyhow::bail!(
+                "读取 Git 引用失败: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        }
     }
 
     /// 用索引管线（read-tree/update-index/write-tree/commit-tree）构建并推送
     /// 元数据分支：manifest.json + 暂存的锁文件，不触碰同步分支的工作区。
-    async fn push_meta(&self, manifest: &Manifest) -> anyhow::Result<()> {
+    async fn push_meta(&self, manifest: Option<&Manifest>) -> anyhow::Result<()> {
         self.fetch_meta().await?;
         let has_meta = self.has_meta_ref().await?;
         let meta_ref = self.meta_ref_of();
@@ -211,16 +270,23 @@ impl GitStore {
         } else {
             self.git(&["read-tree", "--empty"]).await?;
         }
-        // manifest blob
-        let tmp = std::env::temp_dir()
-            .join(format!("synccloud-git-meta-{}.json", uuid::Uuid::new_v4()));
-        tokio::fs::write(&tmp, serde_json::to_vec_pretty(manifest)?).await?;
-        let tmp_str = tmp.to_string_lossy().to_string();
-        let hash = self.git(&["hash-object", "-w", &tmp_str]).await?;
-        let _ = tokio::fs::remove_file(&tmp).await;
-        let hash = hash.trim();
-        self.git(&["update-index", "--add", "--cacheinfo", &format!("100644,{hash},manifest.json")])
+        if let Some(manifest) = manifest {
+            // manifest blob
+            let tmp = std::env::temp_dir()
+                .join(format!("synccloud-git-meta-{}.json", uuid::Uuid::new_v4()));
+            tokio::fs::write(&tmp, serde_json::to_vec_pretty(manifest)?).await?;
+            let tmp_str = tmp.to_string_lossy().to_string();
+            let hash = self.git(&["hash-object", "-w", &tmp_str]).await?;
+            let _ = tokio::fs::remove_file(&tmp).await;
+            let hash = hash.trim();
+            self.git(&[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{hash},manifest.json"),
+            ])
             .await?;
+        }
         // 应用暂存的锁文件
         if self.meta_stage_dir.exists() {
             let mut stack = vec![self.meta_stage_dir.clone()];
@@ -234,35 +300,46 @@ impl GitStore {
                         let rel_key = rel.to_string_lossy().replace('\\', "/");
                         let ps = p.to_string_lossy().to_string();
                         let h = self.git(&["hash-object", "-w", &ps]).await?;
-                        self.git(&["update-index", "--add", "--cacheinfo", &format!("100644,{},{}", h.trim(), rel_key)])
-                            .await?;
+                        self.git(&[
+                            "update-index",
+                            "--add",
+                            "--cacheinfo",
+                            &format!("100644,{},{}", h.trim(), rel_key),
+                        ])
+                        .await?;
                     }
                 }
             }
-            let _ = tokio::fs::remove_dir_all(&self.meta_stage_dir).await;
         }
         // 应用待删除的锁
         {
-            let mut dels = self.pending_meta_deletes.lock().await;
+            let dels = self.pending_meta_deletes.lock().await;
             for rel in dels.iter() {
-                let _ = self.git(&["update-index", "--force-remove", rel]).await;
+                self.git(&["update-index", "--force-remove", rel]).await?;
             }
-            dels.clear();
         }
         let tree = self.git(&["write-tree"]).await?;
         let tree = tree.trim();
-        let msg = format!("meta: {} [{}] files={} seq={}", manifest.device, manifest.updated_at, manifest.files.len(), manifest.seq);
+        let msg = manifest
+            .map(|m| format!("meta: {} seq={}", m.device, m.seq))
+            .unwrap_or_else(|| "lease update".into());
         let commit = if has_meta {
             let parent = self.git(&["rev-parse", &meta_ref]).await?;
-            self.git(&["commit-tree", tree, "-p", parent.trim(), "-m", &msg]).await?
+            self.git(&["commit-tree", tree, "-p", parent.trim(), "-m", &msg])
+                .await?
         } else {
             self.git(&["commit-tree", tree, "-m", &msg]).await?
         };
         let url = self.authed_url();
-        let out = Command::new("git")
+        let out = self
+            .command()
             .args(["-C"])
             .arg(&self.cache_dir)
-            .args(["push", &url, &format!("{}:refs/heads/{}", commit.trim(), self.meta_branch())])
+            .args([
+                "push",
+                &url,
+                &format!("{}:refs/heads/{}", commit.trim(), self.meta_branch()),
+            ])
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .await?;
@@ -273,19 +350,31 @@ impl GitStore {
             }
             anyhow::bail!("git push 元数据分支失败: {}", err.trim());
         }
+        if self.meta_stage_dir.exists() {
+            tokio::fs::remove_dir_all(&self.meta_stage_dir).await?;
+        }
+        self.pending_meta_deletes.lock().await.clear();
         Ok(())
     }
 
     async fn show_to_file(&self, git_path: &str, dest: &Path) -> anyhow::Result<()> {
-        let out = Command::new("git")
+        let out = self
+            .command()
             .args(["-C"])
             .arg(&self.cache_dir)
-            .args(["cat-file", "blob", &format!("{}:{}", self.ref_of(), git_path)])
+            .args([
+                "cat-file",
+                "blob",
+                &format!("{}:{}", self.ref_of(), git_path),
+            ])
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .await?;
         if !out.status.success() {
-            anyhow::bail!("读取 {git_path} 失败: {}", String::from_utf8_lossy(&out.stderr).trim());
+            anyhow::bail!(
+                "读取 {git_path} 失败: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -303,7 +392,12 @@ impl GitStore {
     }
 
     async fn show_ref_path(&self, git_ref: &str, git_path: &str) -> anyhow::Result<Option<String>> {
-        let out = Command::new("git")
+        super::validate_key(git_path)?;
+        if !self.has_ref(git_ref).await? {
+            return Ok(None);
+        }
+        let out = self
+            .command()
             .args(["-C"])
             .arg(&self.cache_dir)
             .args(["show", &format!("{}:{}", git_ref, git_path)])
@@ -311,16 +405,23 @@ impl GitStore {
             .output()
             .await?;
         if out.status.success() {
-            Ok(Some(String::from_utf8_lossy(&out.stdout).to_string()))
+            Ok(Some(String::from_utf8(out.stdout)?))
         } else {
-            // 分支未创建 / 路径缺失等一律视为不存在
-            Ok(None)
+            let message = String::from_utf8_lossy(&out.stderr);
+            if message.contains("does not exist in")
+                || message.contains("exists on disk, but not in")
+            {
+                Ok(None)
+            } else {
+                anyhow::bail!("读取 Git 元数据失败: {}", message.trim())
+            }
         }
     }
 
     /// 工作区强制对齐到远端分支最新（丢弃本地未提交修改，untracked 保留）。
     async fn align_worktree(&self) -> anyhow::Result<()> {
-        let has_remote = Command::new("git")
+        let has_remote = self
+            .command()
             .args(["-C"])
             .arg(&self.cache_dir)
             .args(["rev-parse", "--verify", &self.ref_of()])
@@ -330,7 +431,8 @@ impl GitStore {
             .status
             .success();
         if has_remote {
-            self.git(&["checkout", "-f", "-B", &self.branch, &self.ref_of()]).await?;
+            self.git(&["checkout", "-f", "-B", &self.branch, &self.ref_of()])
+                .await?;
         } else {
             self.git(&["checkout", "-B", &self.branch]).await?;
         }
@@ -340,14 +442,21 @@ impl GitStore {
     async fn commit_and_push(&self, manifest: &Manifest) -> anyhow::Result<()> {
         self.git(&["add", "-A"]).await?;
         let status = self.git(&["status", "--porcelain"]).await?;
-        let msg = format!("sync: {} [{}] files={} seq={}", manifest.device, manifest.updated_at, manifest.files.len(), manifest.seq);
+        let msg = format!(
+            "sync: {} [{}] files={} seq={}",
+            manifest.device,
+            manifest.updated_at,
+            manifest.files.len(),
+            manifest.seq
+        );
         if !status.trim().is_empty() {
             self.git(&["commit", "-m", &msg]).await?;
-        } else {
-            return Ok(()); // 无变更无需推送
+        } else if self.git(&["rev-parse", "--verify", "HEAD"]).await.is_err() {
+            return Ok(()); // Empty repository, no content commit yet.
         }
         let url = self.authed_url();
-        let out = Command::new("git")
+        let out = self
+            .command()
             .args(["-C"])
             .arg(&self.cache_dir)
             .args(["push", &url, &format!("{}:{}", self.branch, self.branch)])
@@ -385,7 +494,8 @@ impl RemoteStore for GitStore {
 
     async fn test(&self) -> anyhow::Result<()> {
         let url = self.authed_url();
-        let out = Command::new("git")
+        let out = self
+            .command()
             .args(["ls-remote", "--heads", &url])
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
@@ -397,7 +507,7 @@ impl RemoteStore for GitStore {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        Ok(())
+        super::probe_text_io(self).await
     }
 
     async fn read_manifest(&self) -> anyhow::Result<Option<Manifest>> {
@@ -417,12 +527,12 @@ impl RemoteStore for GitStore {
     }
 
     async fn cleanup_legacy_meta(&self) -> anyhow::Result<()> {
-        // 从工作区删除旧版元数据；随下次提交从同步分支移除
-        let _ = tokio::fs::remove_dir_all(cache_rel(&self.cache_dir, ".synccloud")).await;
-        Ok(())
+        // Stage only the verified legacy manifest, never remove an entire directory.
+        self.delete_file(".synccloud/manifest.json").await
     }
 
     async fn write_manifest(&self, manifest: &Manifest) -> anyhow::Result<()> {
+        let _commit = self.commit_lock.lock().await;
         self.fetch().await?;
         self.align_worktree().await?;
 
@@ -447,28 +557,49 @@ impl RemoteStore for GitStore {
                     }
                 }
             }
-            let _ = tokio::fs::remove_dir_all(&self.stage_dir).await;
         }
-        // 应用暂存的删除
-        {
-            let mut dels = self.pending_deletes.lock().await;
-            for rel in dels.iter() {
-                let target = cache_rel(&self.cache_dir, rel);
-                let _ = tokio::fs::remove_file(&target).await;
+        if self.delete_dir.exists() {
+            let mut stack = vec![self.delete_dir.clone()];
+            while let Some(dir) = stack.pop() {
+                let mut entries = tokio::fs::read_dir(dir).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    if entry.file_type().await?.is_dir() {
+                        stack.push(entry.path());
+                    } else {
+                        let path = entry.path();
+                        let rel = path.strip_prefix(&self.delete_dir)?;
+                        let target = self.cache_dir.join(rel);
+                        match tokio::fs::remove_file(target).await {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
             }
-            dels.clear();
         }
         // 清掉工作区可能遗留的旧版元数据目录（随本次提交从同步分支移除）
-        let _ = tokio::fs::remove_dir_all(cache_rel(&self.cache_dir, ".synccloud")).await;
 
         self.commit_and_push(manifest).await?;
         // manifest 本体写入独立元数据分支
-        self.push_meta(manifest).await?;
+        self.push_meta(Some(manifest)).await?;
+        for dir in [&self.stage_dir, &self.delete_dir] {
+            if dir.exists() {
+                tokio::fs::remove_dir_all(dir).await?;
+            }
+        }
         let _ = applied;
         Ok(())
     }
 
     async fn put_file(&self, path: &str, src: &Path) -> anyhow::Result<()> {
+        super::validate_key(path)?;
+        let marker = cache_rel(&self.delete_dir, path);
+        match tokio::fs::remove_file(marker).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let dest = cache_rel(&self.stage_dir, path);
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -479,24 +610,42 @@ impl RemoteStore for GitStore {
     }
 
     async fn get_file(&self, path: &str, dest: &Path) -> anyhow::Result<()> {
+        super::validate_key(path)?;
         self.fetch().await?;
         self.show_to_file(path, dest).await
     }
 
     async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
-        self.pending_deletes.lock().await.insert(path.to_string());
+        super::validate_key(path)?;
+        let marker = cache_rel(&self.delete_dir, path);
+        tokio::fs::create_dir_all(marker.parent().unwrap()).await?;
+        tokio::fs::write(marker, b"").await?;
         Ok(())
     }
 
     async fn list_objects(&self) -> anyhow::Result<Vec<RemoteEntry>> {
         self.fetch().await?;
-        let out = Command::new("git")
+        if !self.has_ref(&self.ref_of()).await? {
+            return Ok(Vec::new());
+        }
+        let out = self
+            .command()
             .args(["-C"])
             .arg(&self.cache_dir)
-            .args(["ls-tree", "-r", "--format=%(objectsize)%09%(path)", &self.ref_of()])
+            .args([
+                "ls-tree",
+                "-r",
+                "--format=%(objectsize)%09%(path)",
+                &self.ref_of(),
+            ])
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "列举 Git 文件失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let mut items = Vec::new();
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             if let Some((size, path)) = line.split_once('\t') {
@@ -518,34 +667,56 @@ impl RemoteStore for GitStore {
 #[async_trait]
 impl super::RawIo for GitStore {
     async fn put_text(&self, key: &str, content: &str) -> anyhow::Result<()> {
+        super::validate_key(key)?;
+        let _commit = self.commit_lock.lock().await;
         self.ensure_cache().await?;
         let p = cache_rel(&self.meta_stage_dir, key);
         if let Some(parent) = p.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::write(&p, content).await?;
+        let manifest = self.read_manifest().await?;
+        self.push_meta(manifest.as_ref()).await?;
         Ok(())
     }
 
     async fn read_text(&self, key: &str) -> anyhow::Result<Option<String>> {
+        super::validate_key(key)?;
         self.fetch_meta().await?;
         self.show_to_string_meta(key).await
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        self.pending_meta_deletes.lock().await.insert(key.to_string());
+        super::validate_key(key)?;
+        let _commit = self.commit_lock.lock().await;
+        self.pending_meta_deletes
+            .lock()
+            .await
+            .insert(key.to_string());
+        let manifest = self.read_manifest().await?;
+        self.push_meta(manifest.as_ref()).await?;
         Ok(())
     }
 
     async fn list_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        super::validate_key(prefix)?;
         self.fetch_meta().await?;
-        let out = Command::new("git")
+        if !self.has_meta_ref().await? {
+            return Ok(Vec::new());
+        }
+        let out = self
+            .command()
             .args(["-C"])
             .arg(&self.cache_dir)
             .args(["ls-tree", "-r", "--name-only", &self.meta_ref_of()])
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "列举 Git 元数据失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         Ok(String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter(|l| l.starts_with(prefix))

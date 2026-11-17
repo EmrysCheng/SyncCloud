@@ -1,9 +1,9 @@
 //! 本地文件扫描：递归遍历 + 排除规则 + xxh3-128 内容哈希（mtime/size 命中缓存则复用）。
 
+use globset::{GlobSet, GlobSetBuilder};
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
-use globset::{GlobSet, GlobSetBuilder};
 use twox_hash::xxhash3_128::Hasher as XxHash128;
 use walkdir::WalkDir;
 
@@ -97,7 +97,13 @@ impl<'a> Scanner<'a> {
         Ok(Self {
             ignore: ignore_builder.build()?,
             whitelist,
-            max_file_size_bytes: max_file_size_mb.and_then(|mb| if mb > 0 { Some(mb * 1024 * 1024) } else { None }),
+            max_file_size_bytes: max_file_size_mb.and_then(|mb| {
+                if mb > 0 {
+                    Some(mb * 1024 * 1024)
+                } else {
+                    None
+                }
+            }),
             ignore_hidden,
             db,
         })
@@ -135,6 +141,11 @@ impl<'a> Scanner<'a> {
 
     /// 扫描目录，返回相对路径（`/` 分隔）→ 元数据。
     pub fn scan(&self, root: &Path) -> anyhow::Result<(FileTree, ScanStats)> {
+        anyhow::ensure!(
+            root.is_dir(),
+            "同步根目录不存在或不可访问: {}",
+            root.display()
+        );
         let mut tree = FileTree::new();
         let mut stats = ScanStats::default();
         let ignored_cell = std::cell::Cell::new(0usize);
@@ -181,10 +192,7 @@ impl<'a> Scanner<'a> {
         {
             let entry = match entry {
                 Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(error = %e, "walkdir 条目读取失败，跳过");
-                    continue;
-                }
+                Err(e) => return Err(anyhow::anyhow!("目录扫描不完整，停止本轮同步: {e}")),
             };
             if entry.file_type().is_dir() {
                 stats.dirs += 1;
@@ -201,15 +209,29 @@ impl<'a> Scanner<'a> {
 
             // 坚果云同款云桥按需存储：若该文件已释放本地空间（占位符），复用记录的远端真实大小与哈希，
             // 避免误判修改或删除，且无需读取 0 字节文件
-            if let Some(placeholder) = self.db.and_then(|db| db.get_placeholder(clean_rel)) {
+            if rel.ends_with(".synccloud") && abs_path(root, clean_rel).is_file() {
+                continue;
+            }
+            if let Some(placeholder) = match self.db {
+                Some(db) => db.get_placeholder(clean_rel)?,
+                None => None,
+            }
+            .filter(|_| {
+                rel.ends_with(".synccloud")
+                    || std::fs::metadata(entry.path()).is_ok_and(|m| m.len() == 0)
+            }) {
                 stats.files += 1;
                 tree.insert(clean_rel.to_string(), placeholder);
                 continue;
             }
 
+            anyhow::ensure!(
+                !rel.ends_with(".synccloud"),
+                "占位文件缺少有效元数据，停止扫描: {rel}"
+            );
             let meta = match std::fs::metadata(entry.path()) {
                 Ok(m) => m,
-                Err(_) => continue, // 竞态：扫描期间文件被删除
+                Err(e) => return Err(anyhow::anyhow!("读取文件元数据失败，停止本轮同步: {e}")),
             };
 
             // 单文件体积上限过滤（对标 FreeFileSync 与 GoodSync）
@@ -230,21 +252,20 @@ impl<'a> Scanner<'a> {
             let hash = self
                 .db
                 .and_then(|db| db.cached_hash(&rel, meta.len(), mtime_ms))
+                .filter(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit()))
                 .map(|h| {
                     stats.hash_cache_hits += 1;
                     h
                 })
+                .map(Ok)
                 .unwrap_or_else(|| {
                     stats.hashed += 1;
-                    let h = hash_file(entry.path()).unwrap_or_else(|e| {
-                        tracing::warn!(path = %entry.path().display(), error = %e, "哈希计算失败（独占锁定，极罕见），使用占位哈希待下轮重试");
-                        format!("unreadable-{}-{}", meta.len(), mtime_ms)
-                    });
+                    let h = hash_file(entry.path())?;
                     if let Some(db) = self.db {
                         db.put_hash_cache(&rel, meta.len(), mtime_ms, &h);
                     }
-                    h
-                });
+                    Ok::<_, std::io::Error>(h)
+                })?;
 
             stats.files += 1;
             tree.insert(
@@ -295,9 +316,41 @@ pub fn abs_path(root: &Path, rel: &str) -> std::path::PathBuf {
     p
 }
 
+/// 校验远端/数据库路径与现有重解析点，禁止越出同步根。
+pub fn safe_path(root: &Path, rel: &str) -> anyhow::Result<std::path::PathBuf> {
+    crate::storage::validate_key(rel)?;
+    anyhow::ensure!(
+        !rel.is_empty()
+            && !rel.contains(['\\', ':', '\0'])
+            && rel
+                .split('/')
+                .all(|p| !p.is_empty() && p != "." && p != ".."),
+        "无效同步相对路径: {rel}"
+    );
+    let base = root.canonicalize()?;
+    let result = abs_path(root, rel);
+    let mut ancestor = result.as_path();
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("无效路径: {rel}"))?;
+    }
+    anyhow::ensure!(
+        ancestor.canonicalize()?.starts_with(&base),
+        "同步路径越出根目录: {rel}"
+    );
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_root_is_not_an_empty_tree() {
+        let missing = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        assert!(Scanner::new(&[], None).unwrap().scan(&missing).is_err());
+    }
 
     #[test]
     fn test_builtin_ignore() {
@@ -371,7 +424,8 @@ mod tests {
 
     #[test]
     fn test_placeholder_preserves_meta_in_scanner() {
-        let root = std::env::temp_dir().join(format!("synccloud-test-ph-scan-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("synccloud-test-ph-scan-{}", uuid::Uuid::new_v4()));
         let dir = root.join("workspace");
         let dir_db = root.join("db");
         let _ = std::fs::remove_dir_all(&root);
@@ -381,7 +435,8 @@ mod tests {
         std::fs::write(dir.join("cloud_doc.pdf"), b"").unwrap();
 
         let db = StateDb::open(&dir_db.join("state.db")).unwrap();
-        db.add_placeholder("cloud_doc.pdf", 999999, 5000, "original_hash_value");
+        db.add_placeholder("cloud_doc.pdf", 999999, 5000, "original_hash_value")
+            .unwrap();
 
         let s = Scanner::new(&[], Some(&db)).unwrap();
         let (tree, stats) = s.scan(&dir).unwrap();
@@ -389,6 +444,9 @@ mod tests {
         assert_eq!(stats.files, 1);
         let m = tree.get("cloud_doc.pdf").unwrap();
         assert_eq!(m.size, 999999, "占位文件扫描时应保持远端记录的真实逻辑大小");
-        assert_eq!(m.hash, "original_hash_value", "占位文件扫描时应保持远端记录的真实哈希");
+        assert_eq!(
+            m.hash, "original_hash_value",
+            "占位文件扫描时应保持远端记录的真实哈希"
+        );
     }
 }

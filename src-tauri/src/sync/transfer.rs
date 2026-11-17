@@ -34,30 +34,31 @@ impl BandwidthLimiter {
     /// 动态热更新限速速率（KB/s，0 为不限速，实时生效）
     pub fn set_limit_kbps(&self, kbps: u32) {
         let bytes_per_sec = (kbps as u64) * 1024;
-        self.rate_bytes_per_sec.store(bytes_per_sec, Ordering::Relaxed);
+        self.rate_bytes_per_sec
+            .store(bytes_per_sec, Ordering::Relaxed);
     }
 
     /// 消费指定字节。如果超出速率则平滑异步休眠等待，0 限速时零开销直通。
     pub async fn consume(&self, bytes: usize) {
-        let rate = self.rate_bytes_per_sec.load(Ordering::Relaxed);
-        if rate == 0 || bytes == 0 {
-            return;
-        }
-        let rate_f = rate as f64;
-        let mut st = self.state.lock().await;
-        let now = Instant::now();
-        let elapsed = now.duration_since(st.last_check).as_secs_f64();
-        st.last_check = now;
-        st.tokens = (st.tokens + elapsed * rate_f).min(rate_f * 2.0);
-
-        if st.tokens >= bytes as f64 {
-            st.tokens -= bytes as f64;
-        } else {
-            let deficit = (bytes as f64) - st.tokens;
-            st.tokens = 0.0;
+        let mut remaining = bytes as f64;
+        while remaining > 0.0 {
+            let rate = self.rate_bytes_per_sec.load(Ordering::Relaxed);
+            if rate == 0 {
+                return;
+            }
+            let mut st = self.state.lock().await;
+            let now = Instant::now();
+            st.tokens = (st.tokens + now.duration_since(st.last_check).as_secs_f64() * rate as f64)
+                .min(rate as f64);
+            st.last_check = now;
+            let taken = remaining.min(st.tokens);
+            remaining -= taken;
+            st.tokens -= taken;
             drop(st);
-            let wait_secs = (deficit / rate_f).clamp(0.001, 10.0);
-            tokio::time::sleep(Duration::from_secs_f64(wait_secs)).await;
+            if remaining > 0.0 {
+                tokio::time::sleep(Duration::from_secs_f64((remaining / rate as f64).min(0.1)))
+                    .await;
+            }
         }
     }
 }
@@ -98,11 +99,32 @@ where
                 if attempt >= max_retries {
                     return Err(e);
                 }
-                let delay = Duration::from_secs(1u64.saturating_pow(attempt + 1).min(60));
+                let delay = retry_delay(attempt);
                 on_fail(&e, attempt + 1, delay);
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
         }
+    }
+}
+
+pub fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(1u64.checked_shl(attempt).unwrap_or(60).min(60))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retries_back_off_exponentially() {
+        let mut delays = Vec::new();
+        let _ = with_retry(
+            2,
+            || async { Err::<(), _>(anyhow::anyhow!("transient")) },
+            |_, _, delay| delays.push(delay.as_secs()),
+        )
+        .await;
+        assert_eq!(delays, vec![1, 2]);
     }
 }

@@ -1,7 +1,7 @@
 //! 同步引擎核心类型定义。
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// 统一相对路径表示：始终使用 `/` 分隔，跨平台一致。
 pub type RelPath = String;
@@ -112,6 +112,8 @@ pub struct CycleReport {
     pub conflicts: u32,
     pub conflicts_resolved_content_identical: u32,
     pub failed: u32,
+    #[serde(default)]
+    pub pending: u32,
     pub skipped: u32,
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,

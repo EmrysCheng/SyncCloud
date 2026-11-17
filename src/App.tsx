@@ -29,6 +29,7 @@ export default function App() {
   // 订阅后端事件（全局事件流）
   useEffect(() => {
     let unlisten: (() => void) | null = null;
+    let disposed = false;
     listen<SyncEvent>("synccloud://event", (e) => {
       const payload: SyncEvent = { ...e.payload, timestamp: Date.now() };
       setEvents((prev) => {
@@ -38,7 +39,7 @@ export default function App() {
       if (e.payload.type === "error") {
         showToast(`${e.payload.folder}: ${e.payload.message}`);
       }
-    }).then((fn) => (unlisten = fn));
+    }).then((fn) => { if (disposed) fn(); else unlisten = fn; });
     // 补拉历史事件
     api
       .getRecentEvents(200)
@@ -47,11 +48,13 @@ export default function App() {
           ...ev,
           timestamp: ev.timestamp ?? Date.now(),
         }));
-        setEvents(enriched);
+        setEvents(prev => [...enriched, ...prev].slice(-500));
       })
       .catch(() => {});
     return () => {
+      disposed = true;
       unlisten?.();
+      if (toastTimer.current) window.clearTimeout(toastTimer.current);
     };
   }, []);
 

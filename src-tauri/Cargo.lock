@@ -4824,6 +4824,8 @@ dependencies = [
  "generic-array",
  "globset",
  "hex",
+ "http-body 1.1.0",
+ "http-body-util",
  "keyring",
  "md-5 0.10.6",
  "notify",

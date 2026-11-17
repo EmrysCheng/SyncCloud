@@ -1,8 +1,8 @@
 //! 应用配置：全局设置 + 同步文件夹列表，持久化到 `%APPDATA%/SyncCloud/config.json`。
 //! 敏感字段（密码/密钥）不落盘，存入系统凭据管理器（见 credential.rs）。
 
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::sync::types::{ConflictPolicy, Direction, SyncMode, TransferPriority};
@@ -78,6 +78,59 @@ fn default_deletion_guard_threshold() -> u32 {
 
 fn default_log_level() -> String {
     "info".into()
+}
+
+impl GlobalSettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!((1..=32).contains(&self.concurrency), "并发数应为 1 到 32");
+        anyhow::ensure!(self.max_retries <= 20, "重试次数不能超过 20");
+        anyhow::ensure!(
+            (1..=10080).contains(&self.full_scan_interval_min),
+            "扫描间隔应为 1 到 10080 分钟"
+        );
+        Ok(())
+    }
+}
+impl FolderConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.backend.validate()?;
+        anyhow::ensure!(
+            !self.name.trim().is_empty() && Path::new(&self.local_path).is_dir(),
+            "文件夹名称或本地路径无效"
+        );
+        anyhow::ensure!(
+            matches!(self.encryption, EncryptionConfig::Off),
+            "加密功能尚未集成，请保持关闭"
+        );
+        let remote = match &self.backend {
+            BackendConfig::S3 { root_prefix, .. } => root_prefix,
+            BackendConfig::WebDav { root_path, .. } => root_path,
+            BackendConfig::AliyunDrive { remote_dir, .. }
+            | BackendConfig::BaiduPan { remote_dir, .. } => remote_dir,
+            BackendConfig::Git {
+                remote_url, branch, ..
+            } => {
+                if let Ok(url) = url::Url::parse(remote_url) {
+                    anyhow::ensure!(
+                        url.username().is_empty() && url.password().is_none(),
+                        "请将 Git 凭据填写到独立的用户名和密码字段"
+                    );
+                }
+                anyhow::ensure!(
+                    !branch.starts_with('-')
+                        && !branch.contains(['\\', ' ', ':', '~', '^', '?', '*', '['])
+                        && !branch.contains(".."),
+                    "Git 分支名称无效"
+                );
+                return Ok(());
+            }
+        };
+        anyhow::ensure!(
+            !remote.contains(['\\', '\0']) && remote.split('/').all(|p| p != ".." && p != "."),
+            "远端根目录无效"
+        );
+        Ok(())
+    }
 }
 
 impl Default for GlobalSettings {
@@ -223,6 +276,81 @@ fn default_remote_dir() -> String {
 }
 
 impl BackendConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::WebDav { url, root_path, .. } => {
+                let endpoint = url::Url::parse(url)?;
+                anyhow::ensure!(
+                    matches!(endpoint.scheme(), "https" | "http") && endpoint.host_str().is_some(),
+                    "WebDAV 地址必须为 HTTP(S) URL"
+                );
+                anyhow::ensure!(
+                    !root_path.contains('\\')
+                        && root_path.split('/').all(|p| p != ".." && p != "."),
+                    "WebDAV 根路径无效"
+                );
+            }
+            Self::S3 {
+                endpoint,
+                root_prefix,
+                ..
+            } => {
+                let endpoint = url::Url::parse(endpoint)?;
+                anyhow::ensure!(
+                    matches!(endpoint.scheme(), "https" | "http"),
+                    "S3 地址必须为 HTTP(S) URL"
+                );
+                anyhow::ensure!(
+                    !root_prefix.contains('\\')
+                        && root_prefix.split('/').all(|p| p != ".." && p != "."),
+                    "S3 前缀无效"
+                );
+            }
+            Self::Git {
+                remote_url, branch, ..
+            } => {
+                anyhow::ensure!(
+                    !remote_url.starts_with('-')
+                        && !branch.is_empty()
+                        && !branch.starts_with('-')
+                        && !branch.contains("..")
+                        && !branch.contains([' ', ':', '~', '^', '?', '*', '[', '\\']),
+                    "Git 地址或分支无效"
+                );
+                if let Ok(url) = url::Url::parse(remote_url) {
+                    if matches!(url.scheme(), "http" | "https") {
+                        anyhow::ensure!(
+                            url.username().is_empty() && url.password().is_none(),
+                            "请将 Git 凭据填写到独立用户名和密码字段"
+                        );
+                    }
+                }
+            }
+            Self::BaiduPan { remote_dir, .. } | Self::AliyunDrive { remote_dir, .. } => {
+                anyhow::ensure!(
+                    !remote_dir.contains(['\\', '\0'])
+                        && remote_dir.split('/').all(|p| p != ".." && p != "."),
+                    "云盘根路径无效"
+                );
+            }
+        }
+        Ok(())
+    }
+    pub fn secret_mut(&mut self) -> &mut String {
+        match self {
+            Self::S3 {
+                secret_access_key, ..
+            } => secret_access_key,
+            Self::WebDav { password, .. } | Self::Git { password, .. } => password,
+            Self::BaiduPan { secret_key, .. } => secret_key,
+            Self::AliyunDrive { app_secret, .. } => app_secret,
+        }
+    }
+    pub fn resolve_credentials(&mut self) -> anyhow::Result<()> {
+        let secret = self.secret_mut();
+        *secret = crate::credential::resolve(secret)?;
+        Ok(())
+    }
     pub fn kind(&self) -> &'static str {
         match self {
             BackendConfig::S3 { .. } => "s3",
@@ -236,7 +364,12 @@ impl BackendConfig {
     /// 序列化给前端展示（脱敏）。
     pub fn display(&self) -> String {
         match self {
-            BackendConfig::S3 { endpoint, bucket, root_prefix, .. } => {
+            BackendConfig::S3 {
+                endpoint,
+                bucket,
+                root_prefix,
+                ..
+            } => {
                 if root_prefix.is_empty() {
                     format!("S3://{bucket}@{endpoint}")
                 } else {
@@ -250,7 +383,9 @@ impl BackendConfig {
                     format!("WebDAV://{url}/{root_path}")
                 }
             }
-            BackendConfig::Git { remote_url, branch, .. } => format!("Git://{remote_url}#{branch}"),
+            BackendConfig::Git {
+                remote_url, branch, ..
+            } => format!("Git://{remote_url}#{branch}"),
             BackendConfig::BaiduPan { remote_dir, .. } => format!("百度网盘://{remote_dir}"),
             BackendConfig::AliyunDrive { remote_dir, .. } => format!("阿里云盘://{remote_dir}"),
         }
@@ -276,6 +411,11 @@ impl AppConfig {
             if cfg.device_id.is_empty() {
                 cfg.device_id = Uuid::new_v4().to_string();
             }
+            // 完成凭据写入及回读后才替换原明文配置。
+            cfg.protect_credentials()?;
+            if serde_json::to_value(&cfg)? != serde_json::from_str::<serde_json::Value>(&raw)? {
+                cfg.save(dir)?;
+            }
             return Ok(cfg);
         }
         let hostname = std::env::var("COMPUTERNAME")
@@ -294,11 +434,31 @@ impl AppConfig {
     pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("config.json");
-        let raw = serde_json::to_string_pretty(self)?;
+        let mut protected = self.clone();
+        protected.protect_credentials()?;
+        let raw = serde_json::to_string_pretty(&protected)?;
         // 先写临时文件再原子替换，避免崩溃损坏配置
         let tmp = dir.join("config.json.tmp");
         std::fs::write(&tmp, raw)?;
         std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    pub fn protect_credentials(&mut self) -> anyhow::Result<()> {
+        for folder in &mut self.folders {
+            crate::credential::protect(
+                folder.backend.secret_mut(),
+                &format!("folder:{}:backend", folder.id),
+            )?;
+        }
+        crate::credential::protect(
+            &mut self.settings.baidu_secret_key,
+            "settings:baidu_secret_key",
+        )?;
+        crate::credential::protect(
+            &mut self.settings.aliyun_app_secret,
+            "settings:aliyun_app_secret",
+        )?;
         Ok(())
     }
 }
@@ -354,52 +514,119 @@ pub fn set_app_data_dir_in_memory(dir: PathBuf) {
 
 /// 设置并迁移应用数据目录。
 pub fn set_app_data_dir(new_dir: PathBuf, copy_existing: bool) -> anyhow::Result<()> {
-    let current_dir = app_data_dir();
-    let default_dir = default_data_dir();
-
-    if current_dir == new_dir {
+    let current = app_data_dir().canonicalize()?;
+    anyhow::ensure!(new_dir.is_absolute(), "数据目录必须为绝对路径");
+    std::fs::create_dir_all(
+        new_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("目标目录无父目录"))?,
+    )?;
+    let parent = new_dir.parent().unwrap().canonicalize()?;
+    let destination = parent.join(
+        new_dir
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("不能使用磁盘根目录"))?,
+    );
+    let resolved = if destination.exists() {
+        destination.canonicalize()?
+    } else {
+        destination.clone()
+    };
+    if resolved == current {
         return Ok(());
     }
-
-    std::fs::create_dir_all(&new_dir)?;
-
-    if copy_existing && current_dir.exists() {
-        copy_dir_recursive(&current_dir, &new_dir)?;
+    anyhow::ensure!(
+        !resolved.starts_with(&current) && !current.starts_with(&resolved),
+        "新旧数据目录不能互相包含"
+    );
+    anyhow::ensure!(copy_existing, "为保留账户和基线，请勾选迁移现有数据");
+    if destination.exists() {
+        anyhow::ensure!(
+            std::fs::read_dir(&destination)?.next().is_none(),
+            "目标数据目录必须为空，以免覆盖已有数据"
+        );
     }
-
-    std::fs::create_dir_all(&default_dir)?;
-    let location_file = default_dir.join("storage_location.txt");
-
-    if new_dir == default_dir {
-        if location_file.exists() {
-            let _ = std::fs::remove_file(&location_file);
-        }
-    } else {
-        std::fs::write(&location_file, new_dir.to_string_lossy().as_bytes())?;
+    let staging = parent.join(format!(".synccloud-migrate-{}", Uuid::new_v4()));
+    copy_dir_recursive(&current, &staging)?;
+    let config: AppConfig = serde_json::from_slice(&std::fs::read(staging.join("config.json"))?)?;
+    let original: AppConfig = serde_json::from_slice(&std::fs::read(current.join("config.json"))?)?;
+    anyhow::ensure!(
+        serde_json::to_value(config)? == serde_json::to_value(original)?,
+        "迁移配置校验失败"
+    );
+    if destination.exists() {
+        std::fs::remove_dir(&destination)?;
     }
-
-    if let Ok(mut guard) = CURRENT_DATA_DIR.write() {
-        *guard = Some(new_dir);
-    }
+    std::fs::rename(&staging, &destination)?;
+    let default = default_data_dir();
+    std::fs::create_dir_all(&default)?;
+    let pointer = default.join("storage_location.txt");
+    let temp = default.join("storage_location.txt.tmp");
+    std::fs::write(&temp, destination.to_string_lossy().as_bytes())?;
+    std::fs::rename(temp, pointer)?;
+    // Existing database handles keep the original directory until app restart.
+    // The manager remains stopped in maintenance mode; source is retained for rollback.
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    copy_data_tree(src, src, dst)
+}
+fn is_state_database(root: &Path, path: &Path) -> bool {
+    path == root.join("history.db")
+        || (path.file_name().is_some_and(|n| n == "state.db")
+            && path.parent().and_then(|p| p.parent()) == Some(root.join("data").as_path()))
+}
+fn copy_data_tree(root: &Path, src: &Path, dst: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
-        let file_type = entry.file_type()?;
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-        if name_str == "temp" || name_str == "storage_location.txt" {
+        let kind = entry.file_type()?;
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        if src == root && (text == "temp" || text == "storage_location.txt") {
             continue;
         }
-        let src_path = entry.path();
-        let dst_path = dst.join(&file_name);
-        if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+        if let Some(db) = text
+            .strip_suffix("-wal")
+            .or_else(|| text.strip_suffix("-shm"))
+        {
+            if is_state_database(root, &src.join(db)) {
+                continue;
+            }
+        }
+        anyhow::ensure!(
+            !kind.is_symlink(),
+            "数据目录包含链接，停止迁移: {}",
+            entry.path().display()
+        );
+        let target = dst.join(&name);
+        if kind.is_dir() {
+            anyhow::ensure!(
+                entry
+                    .path()
+                    .canonicalize()?
+                    .starts_with(src.canonicalize()?),
+                "数据目录包含越界链接"
+            );
+            copy_data_tree(root, &entry.path(), &target)?;
+        } else if is_state_database(root, &entry.path()) {
+            let db = rusqlite::Connection::open_with_flags(
+                entry.path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )?;
+            db.busy_timeout(std::time::Duration::from_secs(15))?;
+            db.execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])?;
+            let backup = rusqlite::Connection::open(&target)?;
+            let check: String = backup.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+            anyhow::ensure!(check == "ok", "迁移数据库校验失败: {text}");
         } else {
-            let _ = std::fs::copy(&src_path, &dst_path);
+            std::fs::copy(entry.path(), &target)?;
+            anyhow::ensure!(
+                crate::sync::scanner::hash_file(&entry.path())?
+                    == crate::sync::scanner::hash_file(&target)?,
+                "迁移文件校验失败: {text}"
+            );
         }
     }
     Ok(())
@@ -424,29 +651,167 @@ pub struct CloudAccount {
     pub created_at: String,
 }
 
-pub fn load_cloud_accounts(base_dir: &Path) -> Vec<CloudAccount> {
-    let p = base_dir.join("accounts.json");
-    if let Ok(bytes) = std::fs::read(&p) {
-        if let Ok(list) = serde_json::from_slice(&bytes) {
-            return list;
-        }
+static ACCOUNTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub fn load_cloud_accounts(base_dir: &Path) -> anyhow::Result<Vec<CloudAccount>> {
+    let _guard = ACCOUNTS_LOCK.lock().unwrap();
+    load_cloud_accounts_inner(base_dir)
+}
+pub fn save_cloud_accounts(base_dir: &Path, accounts: &[CloudAccount]) -> anyhow::Result<()> {
+    let _guard = ACCOUNTS_LOCK.lock().unwrap();
+    save_cloud_accounts_inner(base_dir, accounts)
+}
+pub fn upsert_cloud_account(
+    base_dir: &Path,
+    mut account: CloudAccount,
+) -> anyhow::Result<CloudAccount> {
+    let _guard = ACCOUNTS_LOCK.lock().unwrap();
+    if let Some(secret) = account.secret_key.as_mut() {
+        crate::credential::protect(secret, &format!("account:{}:app_secret", account.id))?;
     }
-    Vec::new()
+    let mut list = load_cloud_accounts_inner(base_dir)?;
+    list.retain(|a| a.id != account.id);
+    list.push(account.clone());
+    save_cloud_accounts_inner(base_dir, &list)?;
+    Ok(account)
+}
+pub fn remove_cloud_account(base_dir: &Path, id: &str) -> anyhow::Result<Option<CloudAccount>> {
+    let _guard = ACCOUNTS_LOCK.lock().unwrap();
+    let mut list = load_cloud_accounts_inner(base_dir)?;
+    let account = list.iter().find(|a| a.id == id).cloned();
+    list.retain(|a| a.id != id);
+    save_cloud_accounts_inner(base_dir, &list)?;
+    Ok(account)
 }
 
-pub fn save_cloud_accounts(base_dir: &Path, accounts: &[CloudAccount]) -> anyhow::Result<()> {
+fn load_cloud_accounts_inner(base_dir: &Path) -> anyhow::Result<Vec<CloudAccount>> {
+    let p = base_dir.join("accounts.json");
+    let bytes = match std::fs::read(&p) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut list: Vec<CloudAccount> = serde_json::from_slice(&bytes)?;
+    let mut migrated = false;
+    for account in &mut list {
+        if let Some(secret) = account.secret_key.as_mut() {
+            if !secret.is_empty() && !secret.starts_with("keyring:") {
+                crate::credential::protect(secret, &format!("account:{}:app_secret", account.id))?;
+                migrated = true;
+            }
+        }
+    }
+    if migrated {
+        save_cloud_accounts_inner(base_dir, &list)?;
+    }
+    Ok(list)
+}
+
+fn save_cloud_accounts_inner(base_dir: &Path, accounts: &[CloudAccount]) -> anyhow::Result<()> {
     let p = base_dir.join("accounts.json");
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_vec_pretty(accounts)?;
-    std::fs::write(&p, data)?;
+    let mut protected = accounts.to_vec();
+    for account in &mut protected {
+        if let Some(secret) = account.secret_key.as_mut() {
+            crate::credential::protect(secret, &format!("account:{}:app_secret", account.id))?;
+        }
+    }
+    let data = serde_json::to_vec_pretty(&protected)?;
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(tmp, p)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn migration_keeps_nested_business_temp_names() {
+        let root = std::env::temp_dir().join(format!("synccloud-copy-names-{}", Uuid::new_v4()));
+        let src = root.join("source");
+        let dst = root.join("copy");
+        let staged = src.join("data/task/git-stage");
+        std::fs::create_dir_all(staged.join("temp")).unwrap();
+        std::fs::write(staged.join("temp/report.txt"), b"pending upload").unwrap();
+        std::fs::write(staged.join("storage_location.txt"), b"business file").unwrap();
+        std::fs::create_dir_all(src.join("temp")).unwrap();
+        std::fs::write(src.join("temp/discard"), b"application temp").unwrap();
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(
+            std::fs::read(dst.join("data/task/git-stage/temp/report.txt")).unwrap(),
+            b"pending upload"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("data/task/git-stage/storage_location.txt")).unwrap(),
+            b"business file"
+        );
+        assert!(!dst.join("temp").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_copies_live_sqlite_with_wal_and_propagates_copy_errors() {
+        let root = std::env::temp_dir().join(format!("synccloud-migration-{}", Uuid::new_v4()));
+        let src = root.join("source");
+        let dst = root.join("copy");
+        std::fs::create_dir_all(&src).unwrap();
+        let db = rusqlite::Connection::open(src.join("history.db")).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL;CREATE TABLE proof(value TEXT);INSERT INTO proof VALUES('committed WAL');").unwrap();
+        copy_dir_recursive(&src, &dst).unwrap();
+        let copy = rusqlite::Connection::open(dst.join("history.db")).unwrap();
+        let value: String = copy
+            .query_row("SELECT value FROM proof", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "committed WAL");
+        let blocked_source = root.join("blocked-source");
+        let blocked_target = root.join("blocked-target");
+        std::fs::create_dir_all(&blocked_source).unwrap();
+        std::fs::write(blocked_source.join("blocked"), b"original").unwrap();
+        std::fs::create_dir_all(blocked_target.join("blocked")).unwrap();
+        assert!(copy_dir_recursive(&blocked_source, &blocked_target).is_err());
+        assert_eq!(
+            std::fs::read(blocked_source.join("blocked")).unwrap(),
+            b"original"
+        );
+        drop(copy);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plaintext_credentials_migrate_only_after_verified_vault_write() {
+        let root = std::env::temp_dir().join(format!("synccloud-credentials-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut cfg = AppConfig {
+            device_name: "fixture".into(),
+            device_id: Uuid::new_v4().to_string(),
+            folders: Vec::new(),
+            settings: GlobalSettings::default(),
+        };
+        cfg.settings.baidu_secret_key = "fixture-secret-unique".into();
+        std::fs::write(root.join("config.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let protected = AppConfig::load_or_create(&root).unwrap();
+        let reference = &protected.settings.baidu_secret_key;
+        assert!(reference.starts_with("keyring:"));
+        assert_eq!(
+            crate::credential::resolve(reference).unwrap(),
+            "fixture-secret-unique"
+        );
+        assert!(!std::fs::read_to_string(root.join("config.json"))
+            .unwrap()
+            .contains("fixture-secret-unique"));
+        let blocked = root.join("blocked");
+        std::fs::create_dir_all(blocked.join("config.json")).unwrap();
+        assert!(protected.save(&blocked).is_err());
+        assert_eq!(
+            crate::credential::resolve(reference).unwrap(),
+            "fixture-secret-unique"
+        );
+        crate::credential::delete_secret(reference.strip_prefix("keyring:").unwrap()).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// 前端 IPC 发送的是 camelCase 字段（types.ts），此处固定该契约，
     /// 防止再次出现 `missing field 'remote_url'` 一类的反序列化错位。
@@ -454,7 +819,9 @@ mod tests {
     fn backend_config_deserializes_frontend_camel_case() {
         let s3: BackendConfig =
             serde_json::from_str(r#"{"type":"s3","endpoint":"http://e","region":"r","bucket":"b","accessKeyId":"ak","secretAccessKey":"sk","pathStyle":true,"rootPrefix":"p"}"#).unwrap();
-        assert!(matches!(&s3, BackendConfig::S3 { access_key_id, path_style, root_prefix, .. } if access_key_id=="ak" && *path_style && root_prefix=="p"));
+        assert!(
+            matches!(&s3, BackendConfig::S3 { access_key_id, path_style, root_prefix, .. } if access_key_id=="ak" && *path_style && root_prefix=="p")
+        );
 
         let dav: BackendConfig = serde_json::from_str(
             r#"{"type":"webdav","url":"https://d","username":"u","password":"p","rootPath":"/x"}"#,
@@ -466,11 +833,17 @@ mod tests {
             r#"{"type":"git","remoteUrl":"https://gitee.com/a/b.git","username":"u","password":"t"}"#,
         )
         .unwrap();
-        assert!(matches!(&git, BackendConfig::Git { remote_url, branch, .. } if remote_url=="https://gitee.com/a/b.git" && branch=="synccloud"));
+        assert!(
+            matches!(&git, BackendConfig::Git { remote_url, branch, .. } if remote_url=="https://gitee.com/a/b.git" && branch=="synccloud")
+        );
 
-        let baidu: BackendConfig =
-            serde_json::from_str(r#"{"type":"baidu","appKey":"k","secretKey":"s","remoteDir":"/apps/synccloud"}"#).unwrap();
-        assert!(matches!(&baidu, BackendConfig::BaiduPan { app_key, remote_dir, .. } if app_key=="k" && remote_dir=="/apps/synccloud"));
+        let baidu: BackendConfig = serde_json::from_str(
+            r#"{"type":"baidu","appKey":"k","secretKey":"s","remoteDir":"/apps/synccloud"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&baidu, BackendConfig::BaiduPan { app_key, remote_dir, .. } if app_key=="k" && remote_dir=="/apps/synccloud")
+        );
 
         let aliyun: BackendConfig =
             serde_json::from_str(r#"{"type":"aliyun","appId":"i","appSecret":"s"}"#).unwrap();
@@ -487,7 +860,10 @@ mod tests {
             password: "p".into(),
         };
         let raw = serde_json::to_string(&cfg).unwrap();
-        assert!(raw.contains(r#""remoteUrl":"https://example.com/r.git""#), "raw = {raw}");
+        assert!(
+            raw.contains(r#""remoteUrl":"https://example.com/r.git""#),
+            "raw = {raw}"
+        );
         let back: BackendConfig = serde_json::from_str(&raw).unwrap();
         assert_eq!(cfg.display(), back.display());
     }

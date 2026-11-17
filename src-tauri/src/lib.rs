@@ -1,14 +1,14 @@
 //! SyncCloud 应用装配。
 
+pub mod autostart;
+pub mod commands;
 pub mod config;
 pub mod credential;
 pub mod crypto;
 pub mod logging;
+pub mod shell_menu;
 pub mod storage;
 pub mod sync;
-pub mod commands;
-pub mod autostart;
-pub mod shell_menu;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -33,7 +33,8 @@ pub struct AppState {
 /// 保存设置时即时更新。
 pub(crate) static CLOSE_TO_TRAY: AtomicBool = AtomicBool::new(true);
 
-static AUTOSTART_ITEM: std::sync::Mutex<Option<CheckMenuItem<tauri::Wry>>> = std::sync::Mutex::new(None);
+static AUTOSTART_ITEM: std::sync::Mutex<Option<CheckMenuItem<tauri::Wry>>> =
+    std::sync::Mutex::new(None);
 
 pub fn update_autostart_menu(checked: bool) {
     if let Ok(guard) = AUTOSTART_ITEM.lock() {
@@ -87,12 +88,18 @@ pub fn run() {
             } else if let Some(path) = keep_target {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    crate::sync::storage_mode::handle_shell_command(&handle, "--keep-offline", &path).await;
+                    crate::sync::storage_mode::handle_shell_command(
+                        &handle,
+                        "--keep-offline",
+                        &path,
+                    )
+                    .await;
                 });
             } else if let Some(path) = free_target {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    crate::sync::storage_mode::handle_shell_command(&handle, "--free-space", &path).await;
+                    crate::sync::storage_mode::handle_shell_command(&handle, "--free-space", &path)
+                        .await;
                 });
             } else {
                 show_main_window(app);
@@ -111,7 +118,8 @@ pub fn run() {
             );
 
             // 传输历史：根据自定义保留周期自动清理过期记录
-            let _ = crate::sync::history::clean_expired_history(cfg.settings.activity_retention_days);
+            let _ =
+                crate::sync::history::clean_expired_history(cfg.settings.activity_retention_days);
 
             let state = AppState::new();
             // 先订阅再移交所有权
@@ -126,17 +134,23 @@ pub fn run() {
                         Ok(ev) => {
                             let _ = handle.emit("synccloud://event", &ev);
                             if let Some(state) = handle.try_state::<AppState>() {
+                                let data_write = crate::sync::data_write_guard().await.ok();
                                 let (fid, fname, fpath) = {
                                     let guard = state.config.lock().await;
                                     let fid_str = ev.folder_id().to_string();
-                                    let f = guard.folders.iter().find(|folder| folder.id.to_string() == fid_str);
+                                    let f = guard
+                                        .folders
+                                        .iter()
+                                        .find(|folder| folder.id.to_string() == fid_str);
                                     (
                                         fid_str,
-                                        f.map(|folder| folder.name.clone()).unwrap_or_else(|| "未知任务".into()),
-                                        f.map(|folder| folder.local_path.clone()).unwrap_or_default(),
+                                        f.map(|folder| folder.name.clone())
+                                            .unwrap_or_else(|| "未知任务".into()),
+                                        f.map(|folder| folder.local_path.clone())
+                                            .unwrap_or_default(),
                                     )
                                 };
-                                if !fid.is_empty() {
+                                if !fid.is_empty() && data_write.is_some() {
                                     crate::sync::history::record_event(&fid, &fname, &fpath, &ev);
                                 }
                                 let mut buf = state.recent_events.lock().await;
@@ -167,8 +181,10 @@ pub fn run() {
 
             // 系统托盘：显示主界面 / 立即同步全部 / 开机启动 / 退出
             let show_item = MenuItem::with_id(app, "tray-show", "显示主界面", true, None::<&str>)?;
-            let sync_item = MenuItem::with_id(app, "tray-sync", "立即同步全部", true, None::<&str>)?;
-            let data_dir_item = MenuItem::with_id(app, "tray-data-dir", "打开数据目录", true, None::<&str>)?;
+            let sync_item =
+                MenuItem::with_id(app, "tray-sync", "立即同步全部", true, None::<&str>)?;
+            let data_dir_item =
+                MenuItem::with_id(app, "tray-data-dir", "打开数据目录", true, None::<&str>)?;
             let autostart_enabled = crate::autostart::is_autostart_enabled();
             let autostart_item = CheckMenuItem::with_id(
                 app,
@@ -181,12 +197,21 @@ pub fn run() {
             if let Ok(mut guard) = AUTOSTART_ITEM.lock() {
                 *guard = Some(autostart_item.clone());
             }
-            let quit_item = MenuItem::with_id(app, "tray-quit", "退出 SyncCloud", true, None::<&str>)?;
+            let quit_item =
+                MenuItem::with_id(app, "tray-quit", "退出 SyncCloud", true, None::<&str>)?;
             let sep1 = PredefinedMenuItem::separator(app)?;
             let sep2 = PredefinedMenuItem::separator(app)?;
             let menu = Menu::with_items(
                 app,
-                &[&show_item, &sync_item, &data_dir_item, &sep1, &autostart_item, &sep2, &quit_item],
+                &[
+                    &show_item,
+                    &sync_item,
+                    &data_dir_item,
+                    &sep1,
+                    &autostart_item,
+                    &sep2,
+                    &quit_item,
+                ],
             )?;
             let icon = app
                 .default_window_icon()
@@ -277,12 +302,18 @@ pub fn run() {
             } else if let Some(path) = cold_keep {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    crate::sync::storage_mode::handle_shell_command(&handle, "--keep-offline", &path).await;
+                    crate::sync::storage_mode::handle_shell_command(
+                        &handle,
+                        "--keep-offline",
+                        &path,
+                    )
+                    .await;
                 });
             } else if let Some(path) = cold_free {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    crate::sync::storage_mode::handle_shell_command(&handle, "--free-space", &path).await;
+                    crate::sync::storage_mode::handle_shell_command(&handle, "--free-space", &path)
+                        .await;
                 });
             }
 

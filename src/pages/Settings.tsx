@@ -35,11 +35,21 @@ const LOG_LEVELS: Array<{ value: string; label: string }> = [
 export default function Settings() {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [deviceName, setDeviceName] = useState("");
-  const [gs, setGs] = useState<GlobalSettings>(DEFAULT_SETTINGS);
+  const [gs, setGsState] = useState<GlobalSettings>(DEFAULT_SETTINGS);
+  const gsRef=useRef(gs);
+  function setGs(value:GlobalSettings) {gsRef.current=value;setGsState(value);}
   const [autostart, setAutostart] = useState(false);
   const [shellMenu, setShellMenu] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [loaded,setLoaded]=useState(false);
   const timer = useRef<number | null>(null);
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const [saveError, setSaveError] = useState("");
+  function enqueueSave(settings: GlobalSettings) {
+    const result=saveQueue.current.catch(() => {}).then(() => api.saveSettings(deviceName, settings));
+    saveQueue.current=result;
+    return result.then(() => setSaveError("")).catch(e => {setSaveError(`保存失败：${e}`);throw e;});
+  }
 
   // 数据目录自定义状态
   const [showDataDirModal, setShowDataDirModal] = useState(false);
@@ -50,41 +60,43 @@ export default function Settings() {
   const [needRestart, setNeedRestart] = useState(false);
 
   useEffect(() => {
-    loadAppInfo();
-    api.getSettings().then(setGs).catch(() => {});
+    Promise.all([api.getAppInfo(),api.getSettings()]).then(([app,settings])=>{
+      setInfo(app);setDeviceName(app.deviceName);setGs(settings);setLoaded(true);
+    }).catch(e=>setSaveError(`读取设置失败：${e}`));
     api.isAutostart().then(setAutostart).catch(() => {});
     api.isShellMenuEnabled().then(setShellMenu).catch(() => {});
+    return ()=>{if(timer.current)window.clearTimeout(timer.current);};
   }, []);
 
   function loadAppInfo() {
     api.getAppInfo().then((i) => {
       setInfo(i);
       setDeviceName(i.deviceName);
-    });
+    }).catch(e => setSaveError(`读取程序信息失败：${e}`));
   }
 
   function patch(p: Partial<GlobalSettings>) {
-    setGs((prev) => ({ ...prev, ...p }));
+    setGs({ ...gsRef.current, ...p });
   }
 
   /** 打补丁并立即持久化（日志等级/开关等需要即时生效的设置） */
   function patchAndPersist(p: Partial<GlobalSettings>) {
-    const next = { ...gs, ...p };
+    const next = { ...gsRef.current, ...p };
     setGs(next);
-    api.saveSettings(deviceName, next).catch(() => {});
+    enqueueSave(next).catch(() => {});
   }
 
   function persist(next?: GlobalSettings) {
-    const settings = next ?? gs;
-    api.saveSettings(deviceName, settings).catch(() => {});
+    const settings = next ?? gsRef.current;
+    enqueueSave(settings).catch(() => {});
   }
 
   function save() {
-    api.saveSettings(deviceName, gs).then(() => {
+    enqueueSave(gs).then(() => {
       setSaved(true);
       if (timer.current) window.clearTimeout(timer.current);
       timer.current = window.setTimeout(() => setSaved(false), 2000);
-    });
+    }).catch(() => {});
   }
 
   async function toggleAutostart(enabled: boolean) {
@@ -152,10 +164,12 @@ export default function Settings() {
 
   const largeFileMb = Math.round(gs.largeFileThreshold / 1024 / 1024);
 
+  if(!loaded)return <div className="page"><h1>设置</h1>{saveError ? <p role="alert">{saveError}</p> : <p>正在读取设置…</p>}</div>;
   return (
     <div className="page">
       <div className="page-header">
         <h1>设置</h1>
+        {saveError && <span role="alert">{saveError}</span>}
         {saved && <span className="test-ok">✓ 已保存</span>}
       </div>
 
@@ -304,7 +318,7 @@ export default function Settings() {
           </label>
           <label className="field">
             <span>失败重试次数</span>
-            <input type="number" min={0} max={20} value={gs.maxRetries} onChange={(e) => patch({ maxRetries: Number(e.target.value) || 5 })} />
+            <input type="number" min={0} max={20} value={gs.maxRetries} onChange={(e) => patch({ maxRetries: Number(e.target.value) || 0 })} />
           </label>
           <label className="field">
             <span>兜底全量对比间隔（分钟）</span>
@@ -313,7 +327,7 @@ export default function Settings() {
         </div>
         <label className="field">
           <span>大文件确认阈值（MB）</span>
-          <input type="number" min={0} value={largeFileMb} onChange={(e) => patch({ largeFileThreshold: (Number(e.target.value) || 512) * 1024 * 1024 })} />
+          <input type="number" min={0} value={largeFileMb} onChange={(e) => patch({ largeFileThreshold: (Number(e.target.value) || 0) * 1024 * 1024 })} />
         </label>
         <div style={{ marginTop: "14px", padding: "12px", background: "#f8fafc", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
           <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", fontWeight: 500 }}>

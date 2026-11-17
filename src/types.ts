@@ -61,6 +61,7 @@ export interface CycleReport {
   conflicts: number;
   conflictsResolvedContentIdentical: number;
   failed: number;
+  pending?: number;
   skipped: number;
   bytesUploaded: number;
   bytesDownloaded: number;
@@ -69,7 +70,7 @@ export interface CycleReport {
 
 export interface FolderStatus {
   folderId: string;
-  state: "idle" | "syncing" | "paused" | "error";
+  state: "idle" | "queued" | "syncing" | "pending" | "blocked" | "paused" | "error";
   lastSyncAt: string | null;
   lastError: string | null;
   lastReport: CycleReport | null;
@@ -270,3 +271,5 @@ export interface FolderFileItem {
   ext: string;
 }
 
+
+export interface SyncReceipt { folderId: string; disposition: "queued" | "already_queued" | "rejected"; error?: string | null; }

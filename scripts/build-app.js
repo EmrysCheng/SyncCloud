@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { runRust } from './rust.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,7 +17,7 @@ console.log('=== [1/3] Building Frontend Assets ===');
 execSync('npm run build', { cwd: rootDir, stdio: 'inherit', env });
 
 console.log('\n=== [2/3] Building Tauri Core Application ===');
-execSync('cargo build --release --features custom-protocol', { cwd: path.join(rootDir, 'src-tauri'), stdio: 'inherit', env });
+runRust(['build', '--locked', '--release', '--features', 'custom-protocol']);
 
 console.log('\n=== [3/3] Building Portable Single-File Launcher ===');
 execSync('cargo build --release', { cwd: path.join(rootDir, 'launcher'), stdio: 'inherit', env });
@@ -29,6 +30,7 @@ const targetExe = path.join(distAppDir, 'synccloud.exe');
 const srcDll = path.join(rootDir, 'src-tauri', 'target', 'release', 'WebView2Loader.dll');
 const targetDll = path.join(distAppDir, 'WebView2Loader.dll');
 
+if (fs.existsSync(targetExe)) fs.copyFileSync(targetExe, path.join(distAppDir, `synccloud.rollback-${Date.now()}.exe`));
 fs.copyFileSync(launcherExe, targetExe);
 if (fs.existsSync(srcDll)) {
   fs.copyFileSync(srcDll, targetDll);

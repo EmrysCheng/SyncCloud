@@ -74,7 +74,9 @@ export default function Activity({
   }, [folders]);
 
   // 从后端持久化历史数据库加载（带分页与条数）
+  const historyRequest = useRef(0);
   const loadDbHistory = (pageNo: number, currentSize = pageSize) => {
+    const request = ++historyRequest.current;
     api
       .getActivityHistory(
         selectedFolder === "all" ? undefined : selectedFolder,
@@ -84,6 +86,7 @@ export default function Activity({
         (pageNo - 1) * currentSize,
       )
       .then((res) => {
+        if (request !== historyRequest.current) return;
         setDbHistory(res.items);
         setTotal(res.total);
         // 当前页越界（清理/筛选后总数变小）时自动回到最后一页
@@ -118,7 +121,7 @@ export default function Activity({
       return () => clearTimeout(timer);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [events.length]);
+  }, [events]);
 
   function handleSizeSelectChange(val: string) {
     if (val === "custom") {

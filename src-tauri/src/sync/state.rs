@@ -2,13 +2,14 @@
 //! + 远端变更日志（崩溃恢复）。
 //! 引擎任务独占持有；Connection 包 Mutex 使 StateDb 为 Sync（引擎 future 需跨 await）。
 
-use std::path::Path;
-use rusqlite::{params, Connection};
-use serde::Serialize;
 use crate::sync::types::{FileMeta, FileTree};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
+use std::path::Path;
 
+#[derive(Clone)]
 pub struct StateDb {
-    conn: std::sync::Mutex<Connection>,
+    conn: std::sync::Arc<std::sync::Mutex<Connection>>,
 }
 
 /// 远端变更日志条目：动作已成功写入远端存储，但 manifest 提交可能尚未完成。
@@ -52,7 +53,8 @@ impl StateDb {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             CREATE TABLE IF NOT EXISTS baseline (
@@ -99,8 +101,11 @@ impl StateDb {
                 hash       TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
-        ")?;
-        Ok(Self { conn: std::sync::Mutex::new(conn) })
+        ",
+        )?;
+        Ok(Self {
+            conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+        })
     }
 
     // ---- 远端变更日志（崩溃恢复） ----
@@ -108,8 +113,7 @@ impl StateDb {
     /// 读取未提交的远端变更。
     pub fn journal_load(&self) -> anyhow::Result<Vec<JournalOp>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT path, op, meta FROM journal ORDER BY id")?;
+        let mut stmt = conn.prepare("SELECT path, op, meta FROM journal ORDER BY id")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -122,34 +126,39 @@ impl StateDb {
             let (path, op, meta) = r?;
             match op.as_str() {
                 "put" => {
-                    if let Some(m) = meta.and_then(|s| serde_json::from_str(&s).ok()) {
-                        out.push(JournalOp::Put(path, m));
-                    }
+                    let raw = meta.ok_or_else(|| anyhow::anyhow!("恢复日志缺少元数据: {path}"))?;
+                    out.push(JournalOp::Put(path, serde_json::from_str(&raw)?));
                 }
                 "remove" => out.push(JournalOp::Remove(path)),
-                _ => {}
+                _ => anyhow::bail!("未知恢复日志动作: {op}"),
             }
         }
         Ok(out)
     }
 
-    pub fn journal_put(&self, path: &str, meta: &FileMeta) {
-        let _ = self.conn.lock().unwrap().execute(
+    pub fn journal_put(&self, path: &str, meta: &FileMeta) -> anyhow::Result<()> {
+        self.conn.lock().unwrap().execute(
             "INSERT INTO journal (path, op, meta) VALUES (?1, 'put', ?2)",
-            params![path, serde_json::to_string(meta).unwrap_or_default()],
-        );
+            params![path, serde_json::to_string(meta)?],
+        )?;
+        Ok(())
     }
 
-    pub fn journal_remove(&self, path: &str) {
-        let _ = self.conn.lock().unwrap().execute(
+    pub fn journal_remove(&self, path: &str) -> anyhow::Result<()> {
+        self.conn.lock().unwrap().execute(
             "INSERT INTO journal (path, op, meta) VALUES (?1, 'remove', NULL)",
             params![path],
-        );
+        )?;
+        Ok(())
     }
 
     /// manifest 成功提交后清空日志。
-    pub fn journal_clear(&self) {
-        let _ = self.conn.lock().unwrap().execute("DELETE FROM journal", []);
+    pub fn journal_clear(&self) -> anyhow::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM journal", [])?;
+        Ok(())
     }
 
     // ---- 基线 ----
@@ -186,8 +195,9 @@ impl StateDb {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM baseline", [])?;
         {
-            let mut stmt = tx
-                .prepare("INSERT INTO baseline (path, hash, size, mtime_ms) VALUES (?1, ?2, ?3, ?4)")?;
+            let mut stmt = tx.prepare(
+                "INSERT INTO baseline (path, hash, size, mtime_ms) VALUES (?1, ?2, ?3, ?4)",
+            )?;
             for (path, meta) in tree {
                 stmt.execute(params![path, meta.hash, meta.size as i64, meta.mtime_ms])?;
             }
@@ -299,8 +309,14 @@ impl StateDb {
 
     // ---- 待替换队列（文件占用兜底） ----
 
-    pub fn pending_add(&self, path: &str, tmp_path: &str, size: u64, hash: &str) {
-        let _ = self.conn.lock().unwrap().execute(
+    pub fn pending_add(
+        &self,
+        path: &str,
+        tmp_path: &str,
+        size: u64,
+        hash: &str,
+    ) -> anyhow::Result<()> {
+        self.conn.lock().unwrap().execute(
             "INSERT OR REPLACE INTO pending_replace (path, tmp_path, size, hash, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -310,7 +326,8 @@ impl StateDb {
                 hash,
                 chrono::Local::now().to_rfc3339()
             ],
-        );
+        )?;
+        Ok(())
     }
 
     pub fn pending_list(&self) -> anyhow::Result<Vec<PendingReplace>> {
@@ -331,12 +348,12 @@ impl StateDb {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub fn pending_remove(&self, id: i64) {
-        let _ = self
-            .conn
+    pub fn pending_remove(&self, id: i64) -> anyhow::Result<()> {
+        self.conn
             .lock()
             .unwrap()
-            .execute("DELETE FROM pending_replace WHERE id = ?1", params![id]);
+            .execute("DELETE FROM pending_replace WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     /// 按路径查待替换记录（下载前先尝试应用，可省一次重复下载）。
@@ -380,8 +397,14 @@ impl StateDb {
 
     // ---- 脱机占位符（不占用电脑空间 / 坚果云同款云桥按需存储） ----
 
-    pub fn add_placeholder(&self, path: &str, size: u64, mtime_ms: i64, hash: &str) {
-        let _ = self.conn.lock().unwrap().execute(
+    pub fn add_placeholder(
+        &self,
+        path: &str,
+        size: u64,
+        mtime_ms: i64,
+        hash: &str,
+    ) -> anyhow::Result<()> {
+        self.conn.lock().unwrap().execute(
             "INSERT OR REPLACE INTO placeholders (path, size, mtime_ms, hash, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -391,18 +414,21 @@ impl StateDb {
                 hash,
                 chrono::Local::now().to_rfc3339()
             ],
-        );
+        )?;
+        Ok(())
     }
 
-    pub fn remove_placeholder(&self, path: &str) {
-        let _ = self.conn.lock().unwrap().execute(
-            "DELETE FROM placeholders WHERE path = ?1",
-            params![path],
-        );
-    }
-
-    pub fn get_placeholder(&self, path: &str) -> Option<FileMeta> {
+    pub fn remove_placeholder(&self, path: &str) -> anyhow::Result<()> {
         self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM placeholders WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    pub fn get_placeholder(&self, path: &str) -> anyhow::Result<Option<FileMeta>> {
+        Ok(self
+            .conn
             .lock()
             .unwrap()
             .query_row(
@@ -416,11 +442,12 @@ impl StateDb {
                     })
                 },
             )
-            .ok()
+            .optional()?)
     }
 
-    pub fn is_placeholder(&self, path: &str) -> bool {
-        self.conn
+    pub fn is_placeholder(&self, path: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .conn
             .lock()
             .unwrap()
             .query_row(
@@ -428,14 +455,17 @@ impl StateDb {
                 params![path],
                 |_| Ok(()),
             )
-            .is_ok()
+            .optional()?
+            .is_some())
     }
 
     pub fn count_placeholders(&self) -> usize {
         self.conn
             .lock()
             .unwrap()
-            .query_row("SELECT count(*) FROM placeholders", [], |r| r.get::<_, i64>(0))
+            .query_row("SELECT count(*) FROM placeholders", [], |r| {
+                r.get::<_, i64>(0)
+            })
             .map(|n| n.max(0) as usize)
             .unwrap_or(0)
     }
@@ -453,20 +483,20 @@ mod tests {
         let db = StateDb::open(&dir.join("state.db")).unwrap();
 
         assert_eq!(db.count_placeholders(), 0);
-        assert!(!db.is_placeholder("doc.txt"));
+        assert!(!db.is_placeholder("doc.txt").unwrap());
 
-        db.add_placeholder("doc.txt", 1024, 200, "hash123");
+        db.add_placeholder("doc.txt", 1024, 200, "hash123").unwrap();
         assert_eq!(db.count_placeholders(), 1);
-        assert!(db.is_placeholder("doc.txt"));
+        assert!(db.is_placeholder("doc.txt").unwrap());
 
-        let meta = db.get_placeholder("doc.txt").unwrap();
+        let meta = db.get_placeholder("doc.txt").unwrap().unwrap();
         assert_eq!(meta.size, 1024);
         assert_eq!(meta.mtime_ms, 200);
         assert_eq!(meta.hash, "hash123");
 
-        db.remove_placeholder("doc.txt");
+        db.remove_placeholder("doc.txt").unwrap();
         assert_eq!(db.count_placeholders(), 0);
-        assert!(!db.is_placeholder("doc.txt"));
-        assert!(db.get_placeholder("doc.txt").is_none());
+        assert!(!db.is_placeholder("doc.txt").unwrap());
+        assert!(db.get_placeholder("doc.txt").unwrap().is_none());
     }
 }

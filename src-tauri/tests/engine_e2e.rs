@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use synccloud_lib::config::{BackendConfig, FolderConfig};
-use synccloud_lib::storage::{RemoteEntry, RemoteStore, RawIo};
+use synccloud_lib::storage::{RawIo, RemoteEntry, RemoteStore};
 use synccloud_lib::sync::engine::{EventSink, SyncEngine};
 use synccloud_lib::sync::state::StateDb;
 use synccloud_lib::sync::types::{ConflictPolicy, Direction, Manifest, SyncMode};
@@ -16,14 +16,21 @@ use synccloud_lib::sync::types::{ConflictPolicy, Direction, Manifest, SyncMode};
 /// 本地文件系统模拟的远端存储（镜像布局 + 同步目录外的元数据区）。
 struct LocalFsStore {
     root: PathBuf,
+    inject_local: Option<PathBuf>,
+    change_uploaded_source: bool,
     /// 元数据区：同步目录的兄弟目录（模拟新版布局）
     meta: PathBuf,
 }
 
 impl LocalFsStore {
     fn new(root: &Path) -> Self {
-        let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("remote");
+        let name = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("remote");
         Self {
+            inject_local: None,
+            change_uploaded_source: false,
             meta: root.with_file_name(format!("{name}.synccloud-meta")),
             root: root.to_path_buf(),
         }
@@ -84,9 +91,20 @@ impl RemoteStore for LocalFsStore {
         let dest = self.path_of(path);
         tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
         tokio::fs::copy(src, &dest).await?;
+        if self.change_uploaded_source && path == "upload.txt" {
+            // The engine passes its immutable snapshot; mutate the actual editor file.
+            tokio::fs::write(
+                self.inject_local.as_ref().unwrap().join("upload.txt"),
+                b"edited after snapshot",
+            )
+            .await?;
+        }
         Ok(())
     }
     async fn get_file(&self, path: &str, dest: &Path) -> anyhow::Result<()> {
+        if let Some(local) = &self.inject_local {
+            tokio::fs::write(local.join("late.txt"), b"unsynced new document").await?;
+        }
         let src = self.path_of(path);
         tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
         tokio::fs::copy(&src, dest).await?;
@@ -111,7 +129,10 @@ impl RemoteStore for LocalFsStore {
                 } else if let Ok(rel) = p.strip_prefix(&self.root) {
                     let key = rel.to_string_lossy().replace('\\', "/");
                     if !key.starts_with(".synccloud/") {
-                        out.push(RemoteEntry { key, size: entry.metadata().await?.len() });
+                        out.push(RemoteEntry {
+                            key,
+                            size: entry.metadata().await?.len(),
+                        });
                     }
                 }
             }
@@ -197,6 +218,110 @@ async fn settle() {
     tokio::time::sleep(Duration::from_millis(25)).await;
 }
 
+#[tokio::test]
+async fn realtime_uploads_new_and_modified_files_in_a_busy_directory() {
+    use synccloud_lib::sync::watcher;
+    let root = std::env::temp_dir().join(format!("synccloud-realtime-{}", Uuid::new_v4()));
+    let local = root.join("local");
+    let remote = root.join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    synccloud_lib::config::set_app_data_dir_in_memory(root.join("app-data"));
+    let store = LocalFsStore::new(&remote);
+    let mut device = make_device(&local, &root.join("state.db"), "realtime");
+    device.engine.folder.sync_mode = SyncMode::Realtime;
+    tokio::fs::write(local.join("existing.txt"), b"before save")
+        .await
+        .unwrap();
+    assert_eq!(device.engine.run_cycle(&store).await.uploaded, 1);
+    settle().await;
+
+    let mut handle = watcher::watch(local.clone()).unwrap();
+    tokio::fs::write(local.join("existing.txt"), b"after saving existing file")
+        .await
+        .unwrap();
+    tokio::fs::write(local.join("created.txt"), b"new document")
+        .await
+        .unwrap();
+    let noisy_file = local.join("editor-background.tmp");
+    let writer = tokio::spawn(async move {
+        for n in 0..100 {
+            tokio::fs::write(&noisy_file, n.to_string()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let signal = tokio::time::timeout(Duration::from_secs(3), handle.trigger.recv()).await;
+    // This is the same watcher-triggered engine entry used by FolderManager;
+    // no manual request or periodic tick is supplied by this regression.
+    let report = if matches!(signal, Ok(Some(()))) {
+        Some(device.engine.run_cycle(&store).await)
+    } else {
+        None
+    };
+    writer.abort();
+    let _ = writer.await;
+    drop(handle);
+    let uploaded = report.as_ref().map(|r| r.uploaded);
+    let new_contents = tokio::fs::read(remote.join("created.txt")).await.ok();
+    let edited_contents = tokio::fs::read(remote.join("existing.txt")).await.unwrap();
+    drop(device);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(
+        uploaded,
+        Some(2),
+        "busy directory prevented automatic uploads"
+    );
+    assert_eq!(new_contents.as_deref(), Some(b"new document".as_slice()));
+    assert_eq!(edited_contents, b"after saving existing file");
+}
+
+#[tokio::test]
+async fn realtime_uploads_create_and_atomic_save_without_periodic_scan() {
+    use synccloud_lib::sync::watcher;
+    let root = std::env::temp_dir().join(format!("synccloud-realtime-save-{}", Uuid::new_v4()));
+    let local = root.join("local");
+    let remote = root.join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    synccloud_lib::config::set_app_data_dir_in_memory(root.join("app-data"));
+    let store = LocalFsStore::new(&remote);
+    let mut device = make_device(&local, &root.join("state.db"), "realtime-save");
+    device.engine.folder.sync_mode = SyncMode::Realtime;
+    let mut handle = watcher::watch(local.clone()).unwrap();
+    tokio::fs::write(local.join("document.txt"), b"new document")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), handle.trigger.recv())
+        .await
+        .expect("creation did not trigger realtime sync")
+        .unwrap();
+    assert_eq!(device.engine.run_cycle(&store).await.uploaded, 1);
+    assert_eq!(
+        tokio::fs::read(remote.join("document.txt")).await.unwrap(),
+        b"new document"
+    );
+
+    // Editors commonly save by renaming a temporary file over the original.
+    tokio::fs::write(local.join("editor-save.tmp"), b"atomic editor save")
+        .await
+        .unwrap();
+    tokio::fs::rename(local.join("editor-save.tmp"), local.join("document.txt"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), handle.trigger.recv())
+        .await
+        .expect("atomic save did not trigger realtime sync")
+        .unwrap();
+    assert_eq!(device.engine.run_cycle(&store).await.uploaded, 1);
+    assert_eq!(
+        tokio::fs::read(remote.join("document.txt")).await.unwrap(),
+        b"atomic editor save"
+    );
+    drop(handle);
+    drop(device);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// 断言目录内没有任何引擎产物（.synccloud* 目录/文件、*.synccloud-part 临时文件）。
 async fn assert_dir_clean(dir: &Path) {
     let mut stack = vec![dir.to_path_buf()];
@@ -236,17 +361,25 @@ async fn full_bidirectional_sync_with_conflict() {
     let mut dev_b = make_device(&dir_b, &tmp.join("b.db"), "B");
 
     // ---- 1. 设备 A 新增文件 → 上传远端 ----
-    tokio::fs::write(dir_a.join("hello.txt"), b"hello v1").await.unwrap();
+    tokio::fs::write(dir_a.join("hello.txt"), b"hello v1")
+        .await
+        .unwrap();
     let r = dev_a.engine.run_cycle(&store).await;
     assert_eq!(r.uploaded, 1);
-    assert!(remote_dir.join("hello.txt").exists(), "远端应已有 hello.txt");
+    assert!(
+        remote_dir.join("hello.txt").exists(),
+        "远端应已有 hello.txt"
+    );
     let manifest = store.read_manifest().await.unwrap().unwrap();
     assert!(manifest.files.contains_key("hello.txt"));
 
     // ---- 2. 设备 B 首次同步 → 下载 ----
     let r = dev_b.engine.run_cycle(&store).await;
     assert_eq!(r.downloaded, 1);
-    assert_eq!(tokio::fs::read(dir_b.join("hello.txt")).await.unwrap(), b"hello v1");
+    assert_eq!(
+        tokio::fs::read(dir_b.join("hello.txt")).await.unwrap(),
+        b"hello v1"
+    );
     // 同步目录内不得出现任何引擎文件（本地下载临时件、远端元数据目录）
     assert_dir_clean(&remote_dir).await;
     assert_dir_clean(&dir_a).await;
@@ -254,7 +387,9 @@ async fn full_bidirectional_sync_with_conflict() {
 
     // ---- 3. 设备 A 修改 → B 跟随更新 ----
     settle().await;
-    tokio::fs::write(dir_a.join("hello.txt"), b"hello v2 - modified by A").await.unwrap();
+    tokio::fs::write(dir_a.join("hello.txt"), b"hello v2 - modified by A")
+        .await
+        .unwrap();
     dev_a.engine.run_cycle(&store).await;
     dev_b.engine.run_cycle(&store).await;
     assert_eq!(
@@ -265,14 +400,21 @@ async fn full_bidirectional_sync_with_conflict() {
 
     // ---- 4. 冲突：双方同时修改同一文件 ----
     settle().await;
-    tokio::fs::write(dir_a.join("hello.txt"), "A 的最终修改".as_bytes()).await.unwrap();
+    tokio::fs::write(dir_a.join("hello.txt"), "A 的最终修改".as_bytes())
+        .await
+        .unwrap();
     settle().await;
-    tokio::fs::write(dir_b.join("hello.txt"), "B 的最终修改".as_bytes()).await.unwrap();
+    tokio::fs::write(dir_b.join("hello.txt"), "B 的最终修改".as_bytes())
+        .await
+        .unwrap();
     dev_a.engine.run_cycle(&store).await; // A 推送自己的修改
     let r = dev_b.engine.run_cycle(&store).await; // B 检测到冲突
     assert_eq!(r.conflicts, 1, "B 应产生一个冲突");
     // Dropbox 语义：正式文件 = 远端（A 的）版本；B 的修改保留为冲突副本
-    assert_eq!(tokio::fs::read(dir_b.join("hello.txt")).await.unwrap(), "A 的最终修改".as_bytes());
+    assert_eq!(
+        tokio::fs::read(dir_b.join("hello.txt")).await.unwrap(),
+        "A 的最终修改".as_bytes()
+    );
     let mut entries = tokio::fs::read_dir(&dir_b).await.unwrap();
     let mut conflict_copy: Option<String> = None;
     while let Some(e) = entries.next_entry().await.unwrap() {
@@ -292,7 +434,11 @@ async fn full_bidirectional_sync_with_conflict() {
     let conflicts = dev_b.engine.db.list_conflicts(false).unwrap();
     assert_eq!(conflicts.len(), 1);
     assert_eq!(conflicts[0].path, "hello.txt");
-    assert!(conflicts[0].conflict_copy.as_deref().unwrap().contains("冲突副本"));
+    assert!(conflicts[0]
+        .conflict_copy
+        .as_deref()
+        .unwrap()
+        .contains("冲突副本"));
 
     // ---- 5. 冲突副本同步给 A（新文件传播）----
     let r = dev_a.engine.run_cycle(&store).await;
@@ -300,7 +446,9 @@ async fn full_bidirectional_sync_with_conflict() {
     assert!(tokio::fs::read(dir_a.join(&copy_name)).await.is_ok());
 
     // ---- 6. 删除传播：A 删除 → 远端删 → B 跟随删 ----
-    tokio::fs::remove_file(dir_a.join("hello.txt")).await.unwrap();
+    tokio::fs::remove_file(dir_a.join("hello.txt"))
+        .await
+        .unwrap();
     dev_a.engine.run_cycle(&store).await;
     let r = dev_b.engine.run_cycle(&store).await;
     assert_eq!(r.deleted_local, 1);
@@ -310,11 +458,11 @@ async fn full_bidirectional_sync_with_conflict() {
 
     // ---- 7. 远端删除 vs 本地修改 → 本地胜出（重新上传）----
     settle().await;
-    tokio::fs::write(dir_b.join(&copy_name), "B 继续编辑冲突副本".as_bytes()).await.unwrap();
+    tokio::fs::write(dir_b.join(&copy_name), "B 继续编辑冲突副本".as_bytes())
+        .await
+        .unwrap();
     // 模拟另一设备删除远端该文件
-    store.delete_file(
-        &copy_name,
-    ).await.unwrap();
+    store.delete_file(&copy_name).await.unwrap();
     // 远端 manifest 也要移除（模拟另一设备的完整删除流程）
     let mut m = store.read_manifest().await.unwrap().unwrap();
     m.files.remove(&copy_name);
@@ -339,7 +487,9 @@ async fn upload_only_and_download_only() {
     // A 仅上传
     let mut folder = make_device(&dir_a, &tmp.join("a.db"), "U").engine;
     folder.folder.direction = Direction::UploadOnly;
-    tokio::fs::write(dir_a.join("up.txt"), b"from upstream").await.unwrap();
+    tokio::fs::write(dir_a.join("up.txt"), b"from upstream")
+        .await
+        .unwrap();
     let r = folder.run_cycle(&store).await;
     assert_eq!(r.uploaded, 1);
 
@@ -350,7 +500,9 @@ async fn upload_only_and_download_only() {
     assert_eq!(r.downloaded, 1);
     assert!(dir_b.join("up.txt").exists());
     settle().await;
-    tokio::fs::write(dir_b.join("up.txt"), b"local edit won't upload").await.unwrap();
+    tokio::fs::write(dir_b.join("up.txt"), b"local edit won't upload")
+        .await
+        .unwrap();
     let r = folder_b.run_cycle(&store).await;
     assert_eq!(r.uploaded, 0, "仅下载模式不得上传");
 
@@ -371,7 +523,9 @@ async fn legacy_in_dir_meta_migrates_out_safely() {
     let mut dev_a = make_device(&dir_a, &tmp.join("a.db"), "A");
 
     // 1. 正常同步一次 → 新版元数据落位（同步目录外）
-    tokio::fs::write(dir_a.join("hello.txt"), b"v1").await.unwrap();
+    tokio::fs::write(dir_a.join("hello.txt"), b"v1")
+        .await
+        .unwrap();
     let r = dev_a.engine.run_cycle(&store).await;
     assert_eq!(r.uploaded, 1);
     assert!(store.meta_path_of("manifest.json").exists());
@@ -381,7 +535,11 @@ async fn legacy_in_dir_meta_migrates_out_safely() {
     let m = store.read_manifest().await.unwrap().unwrap();
     let legacy = remote_dir.join(".synccloud");
     std::fs::create_dir_all(&legacy).unwrap();
-    std::fs::write(legacy.join("manifest.json"), serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    std::fs::write(
+        legacy.join("manifest.json"),
+        serde_json::to_vec_pretty(&m).unwrap(),
+    )
+    .unwrap();
     std::fs::remove_dir_all(&store.meta).unwrap();
 
     // 3. 再同步：应自动迁移元数据，且不得误删本地文件
@@ -391,7 +549,10 @@ async fn legacy_in_dir_meta_migrates_out_safely() {
     assert!(dir_a.join("hello.txt").exists());
     assert!(remote_dir.join("hello.txt").exists());
     assert!(!legacy.exists(), "同步目录内的旧 .synccloud 应被清理");
-    assert!(store.meta_path_of("manifest.json").exists(), "manifest 应迁移到目录外元数据区");
+    assert!(
+        store.meta_path_of("manifest.json").exists(),
+        "manifest 应迁移到目录外元数据区"
+    );
     assert_dir_clean(&remote_dir).await;
 
     // 4. 新设备仍可正常接入（读取外置 manifest）
@@ -412,6 +573,8 @@ async fn legacy_in_dir_meta_migrates_out_safely() {
 struct FlakyManifestStore {
     inner: LocalFsStore,
     fail_manifest_write: std::sync::atomic::AtomicBool,
+    fail_upload: std::sync::atomic::AtomicBool,
+    fail_stamp_once: std::sync::atomic::AtomicBool,
 }
 
 impl FlakyManifestStore {
@@ -419,6 +582,8 @@ impl FlakyManifestStore {
         Self {
             inner: LocalFsStore::new(root),
             fail_manifest_write: std::sync::atomic::AtomicBool::new(false),
+            fail_upload: std::sync::atomic::AtomicBool::new(false),
+            fail_stamp_once: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -437,13 +602,28 @@ impl RemoteStore for FlakyManifestStore {
     async fn read_manifest(&self) -> anyhow::Result<Option<Manifest>> {
         self.inner.read_manifest().await
     }
+    async fn manifest_stamp(&self) -> anyhow::Result<Option<String>> {
+        if self
+            .fail_stamp_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected stamp read failure");
+        }
+        self.inner.manifest_stamp().await
+    }
     async fn write_manifest(&self, manifest: &Manifest) -> anyhow::Result<()> {
-        if self.fail_manifest_write.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .fail_manifest_write
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             anyhow::bail!("注入的 manifest 写入失败（模拟崩溃/断网）");
         }
         self.inner.write_manifest(manifest).await
     }
     async fn put_file(&self, path: &str, src: &Path) -> anyhow::Result<()> {
+        if self.fail_upload.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("injected upload failure");
+        }
         self.inner.put_file(path, src).await
     }
     async fn get_file(&self, path: &str, dest: &Path) -> anyhow::Result<()> {
@@ -455,6 +635,36 @@ impl RemoteStore for FlakyManifestStore {
     async fn list_objects(&self) -> anyhow::Result<Vec<RemoteEntry>> {
         self.inner.list_objects().await
     }
+}
+
+#[tokio::test]
+async fn failed_upload_does_not_become_remote_deletion() {
+    use std::sync::atomic::Ordering;
+    let tmp = std::env::temp_dir().join(format!("synccloud-upload-failure-{}", Uuid::new_v4()));
+    let store = FlakyManifestStore::new(&tmp.join("remote"));
+    let local = tmp.join("local");
+    let mut dev = make_device(&local, &tmp.join("state.db"), "failure");
+    dev.engine.settings.max_retries = 0;
+    std::fs::write(local.join("important.txt"), b"keep me").unwrap();
+    store.fail_upload.store(true, Ordering::Relaxed);
+    assert_eq!(dev.engine.run_cycle_forced(&store).await.failed, 1);
+    assert!(
+        !dev.engine
+            .db
+            .load_baseline()
+            .unwrap()
+            .contains_key("important.txt"),
+        "failed upload must not advance baseline"
+    );
+    store.fail_upload.store(false, Ordering::Relaxed);
+    let result = dev.engine.run_cycle_forced(&store).await;
+    assert_eq!(result.uploaded, 1);
+    assert_eq!(
+        std::fs::read(local.join("important.txt")).unwrap(),
+        b"keep me"
+    );
+    drop(dev);
+    std::fs::remove_dir_all(tmp).unwrap();
 }
 
 /// 1) 无变化轮次走增量快路径（skipped，不取锁不下载 manifest）；
@@ -485,29 +695,230 @@ async fn fast_path_skip_and_crash_recovery_journal() {
 
     // 3. 新文件上传成功，但 manifest 写入失败（模拟崩溃）
     settle().await;
-    tokio::fs::write(dir_a.join("b.txt"), b"b-content").await.unwrap();
-    store.fail_manifest_write.store(true, std::sync::atomic::Ordering::Relaxed);
+    tokio::fs::write(dir_a.join("b.txt"), b"b-content")
+        .await
+        .unwrap();
+    store
+        .fail_manifest_write
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let r = dev.engine.run_cycle(&store).await;
     assert_eq!(r.uploaded, 1, "文件本体应已写入远端存储");
     assert_eq!(r.failed, 1, "manifest 写入失败应计为失败");
     assert!(remote_dir.join("b.txt").exists(), "远端存储已有 b.txt");
     assert!(
-        !store.inner.read_manifest().await.unwrap().unwrap().files.contains_key("b.txt"),
+        !store
+            .inner
+            .read_manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .files
+            .contains_key("b.txt"),
         "manifest 尚未包含 b.txt（写入失败）"
     );
 
     // 4. 恢复后下一轮：重放日志 → 不重传、manifest 收敛、文件保留
-    store.fail_manifest_write.store(false, std::sync::atomic::Ordering::Relaxed);
+    store
+        .fail_manifest_write
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let r = dev.engine.run_cycle(&store).await;
     assert_eq!(r.uploaded, 0, "崩溃恢复轮不得重传已上传文件");
     assert_eq!(r.failed, 0);
     assert!(dir_a.join("b.txt").exists(), "本地文件不得被误删");
     let m = store.inner.read_manifest().await.unwrap().unwrap();
-    assert!(m.files.contains_key("b.txt"), "日志重放后 manifest 应包含 b.txt");
+    assert!(
+        m.files.contains_key("b.txt"),
+        "日志重放后 manifest 应包含 b.txt"
+    );
 
     // 5. 再次无变化 → 快路径
     let r = dev.engine.run_cycle(&store).await;
     assert_eq!(r.skipped, 1);
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn stamp_read_failure_is_not_a_cache_hit() {
+    let tmp = std::env::temp_dir().join(format!("synccloud-stamp-failure-{}", Uuid::new_v4()));
+    let store = FlakyManifestStore::new(&tmp.join("remote"));
+    let mut device = make_device(&tmp.join("local"), &tmp.join("state.db"), "stamp");
+    let source = tmp.join("source");
+    std::fs::write(&source, b"remote content").unwrap();
+    store.put_file("a.txt", &source).await.unwrap();
+    let mut manifest = Manifest::new("fixture");
+    manifest.files.insert(
+        "a.txt".into(),
+        synccloud_lib::sync::types::FileMeta {
+            size: 14,
+            mtime_ms: 1,
+            hash: synccloud_lib::sync::scanner::hash_file(&source).unwrap(),
+        },
+    );
+    store.write_manifest(&manifest).await.unwrap();
+    store
+        .fail_stamp_once
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let report = device.engine.run_cycle(&store).await;
+    assert_eq!(
+        report.downloaded, 1,
+        "unknown stamp must trigger a full check"
+    );
+    assert_eq!(
+        std::fs::read(tmp.join("local/a.txt")).unwrap(),
+        b"remote content"
+    );
+    drop(device);
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[tokio::test]
+async fn editor_change_after_upload_snapshot_remains_a_local_change() {
+    let root =
+        std::env::temp_dir().join(format!("synccloud-edited-during-cycle-{}", Uuid::new_v4()));
+    synccloud_lib::config::set_app_data_dir_in_memory(root.join("app-data"));
+    let mut store = LocalFsStore::new(&root.join("remote"));
+    let mut source = make_device(&root.join("source"), &root.join("source.db"), "source");
+    std::fs::write(root.join("source/remote.txt"), b"remote initial").unwrap();
+    assert_eq!(source.engine.run_cycle_forced(&store).await.failed, 0);
+    let mut target = make_device(&root.join("local"), &root.join("target.db"), "target");
+    std::fs::write(root.join("local/upload.txt"), b"initial snapshot").unwrap();
+    store.inject_local = Some(root.join("local"));
+    store.change_uploaded_source = true;
+    let report = target.engine.run_cycle_forced(&store).await;
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.uploaded, 1);
+    assert_eq!(report.downloaded, 1);
+    let baseline = target.engine.db.load_baseline().unwrap();
+    assert_ne!(
+        baseline["upload.txt"].hash,
+        synccloud_lib::sync::scanner::hash_file(&root.join("local/upload.txt")).unwrap()
+    );
+    store.inject_local = None;
+    store.change_uploaded_source = false;
+    let report = target.engine.run_cycle_forced(&store).await;
+    assert_eq!(report.failed, 0);
+    assert_eq!(
+        std::fs::read(root.join("remote/upload.txt")).unwrap(),
+        b"edited after snapshot"
+    );
+    assert!(root.join("local/late.txt").exists());
+    drop(source);
+    drop(target);
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[tokio::test]
+async fn new_file_created_during_download_must_not_be_baselined_or_deleted() {
+    let root = std::env::temp_dir().join(format!("baseline-repro-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    synccloud_lib::config::set_app_data_dir_in_memory(root.join("app-data"));
+    let mut store = LocalFsStore::new(&root.join("remote"));
+    let mut source = make_device(&root.join("source"), &root.join("source.db"), "source");
+    std::fs::write(root.join("source/remote.txt"), b"remote initial").unwrap();
+    assert_eq!(source.engine.run_cycle_forced(&store).await.failed, 0);
+    let mut target = make_device(&root.join("local"), &root.join("target.db"), "target");
+    store.inject_local = Some(root.join("local"));
+    let report = target.engine.run_cycle_forced(&store).await;
+    assert_eq!(report.failed, 0);
+    let incorrect_baseline = target
+        .engine
+        .db
+        .load_baseline()
+        .unwrap()
+        .contains_key("late.txt");
+    store.inject_local = None;
+    let report = target.engine.run_cycle_forced(&store).await;
+    let deleted = !root.join("local/late.txt").exists();
+    println!("unsynced file entered baseline={incorrect_baseline}; next cycle deleted it={deleted}; deleted_local={}",report.deleted_local);
+    assert!(
+        !incorrect_baseline && !deleted,
+        "unuploaded local file was treated as remotely deleted"
+    );
+}
+#[tokio::test]
+async fn restoring_oldest_archive_at_capacity_must_not_prune_source() {
+    use synccloud_lib::sync::recycle::*;
+    let root = std::env::temp_dir().join(format!("recycle-repro-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    synccloud_lib::config::set_app_data_dir_in_memory(root.join("app-data"));
+    let id = Uuid::new_v4();
+    let bin = recycle_dir(&id);
+    std::fs::create_dir_all(&bin).unwrap();
+    let items = (0..200)
+        .map(|i| RecycleItem {
+            id: format!("id-{i}"),
+            file_name: format!("bak-{i}"),
+            original_path: "doc.txt".into(),
+            size: 3,
+            action: "overwritten".into(),
+            archived_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .collect::<Vec<_>>();
+    for item in &items {
+        std::fs::write(bin.join(&item.file_name), b"old").unwrap();
+    }
+    std::fs::write(
+        bin.join("recycle_meta.json"),
+        serde_json::to_vec(&items).unwrap(),
+    )
+    .unwrap();
+    let local = root.join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(local.join("doc.txt"), b"current").unwrap();
+    let result = restore_item(&id, "id-199", &local).await;
+    println!(
+        "restore result={result:?}; requested archive survives={}",
+        bin.join("bak-199").exists()
+    );
+    assert!(
+        result.is_ok() && std::fs::read(local.join("doc.txt")).unwrap() == b"old",
+        "restore pruned its own source archive"
+    );
+}
+#[tokio::test]
+async fn copied_pending_state_must_resolve_inside_new_data_directory() {
+    let root = std::env::temp_dir().join(format!("migration-repro-{}", Uuid::new_v4()));
+    let old = root.join("old-data");
+    let new = root.join("new-data");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::create_dir_all(&new).unwrap();
+    synccloud_lib::config::set_app_data_dir_in_memory(old.clone());
+    let device = make_device(&root.join("local"), &old.join("state.db"), "migrating");
+    let folder = device.engine.folder.clone();
+    let pending = synccloud_lib::config::folder_data_dir(&folder.id).join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    let part = pending.join("download.part");
+    std::fs::write(&part, b"remote").unwrap();
+    let hash = synccloud_lib::sync::scanner::hash_file(&part).unwrap();
+    device
+        .engine
+        .db
+        .pending_add("doc.txt", &part.to_string_lossy(), 6, &hash)
+        .unwrap();
+    drop(device);
+    let new_folder = new.join("data").join(folder.id.to_string());
+    std::fs::create_dir_all(new_folder.join("pending")).unwrap();
+    std::fs::copy(old.join("state.db"), new_folder.join("state.db")).unwrap();
+    std::fs::copy(&part, new_folder.join("pending/download.part")).unwrap();
+    synccloud_lib::config::set_app_data_dir_in_memory(new);
+    let (events, mut rx) = EventSink::new();
+    let mut engine = SyncEngine {
+        folder,
+        device_id: "migrating".into(),
+        device_name: "migrating".into(),
+        settings: Default::default(),
+        db: StateDb::open(&new_folder.join("state.db")).unwrap(),
+        events,
+        paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let report = engine
+        .run_cycle_forced(&LocalFsStore::new(&root.join("remote")))
+        .await;
+    while let Ok(event) = rx.try_recv() {
+        println!("migration event: {event:?}");
+    }
+    assert_eq!(
+        report.failed, 0,
+        "byte-consistent database backup retained obsolete absolute pending paths"
+    );
 }

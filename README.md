@@ -92,9 +92,8 @@ npm run build:app    # 生产构建：编译前端 + 编译 Tauri 核心 + 打�
 运行测试：
 
 ```bash
-cd src-tauri
-cargo test           # 单元 + 端到端（内存 Mock 存储上传流 / 占用文件待替换队列 /
-                     # 双设备冲突模拟 / 崩溃恢复日志 / 增量快路径 / POSIX 替换与共享读）
+npm test             # 前端按钮、状态与设置回归
+npm run test:rust    # Rust 全目标测试（包含 HTTP 模拟后端和本地 Git 仓库）
 ```
 
 ### GNU 工具链备选方案（本仓库已适配）
@@ -108,25 +107,22 @@ cargo test           # 单元 + 端到端（内存 Mock 存储上传流 / 占用
 4. 编译与测试：
 
 ```bash
-export PATH=~/.cargo/mingw64/bin:~/.cargo/bin:$PATH
-cargo test
+npm run test:rust
+npm run build:app
 ```
 
-若链接报 `could not find native static library WebView2LoaderStatic`（GNU ld
-找不到 MSVC 命名的静态库），把 webview2-com-sys 构建输出里的
-`WebView2LoaderStatic.lib` 复制为同目录 `libWebView2LoaderStatic.a` 即可
-（GNU ld 可直接链接 COFF 归档）：
-
-```bash
-for d in target/*/build/webview2-com-sys-*/out/x64; do
-  [ -f "$d/WebView2LoaderStatic.lib" ] && cp -n "$d/WebView2LoaderStatic.lib" "$d/libWebView2LoaderStatic.a"
-done
-```
+`scripts/rust.js` 自动准备 GNU 链接所需的 WebView2 **DLL 导入库**和运行时 DLL，
+并检查工作区迁移前的绝对路径缓存。不要把 MSVC 的 `WebView2LoaderStatic.lib`
+直接当成 GNU 静态库使用。测试和便携版构建共用这套准备流程。
 
 `src-tauri/build.rs` 已内置 GNU 目标的 common-controls v6 manifest 嵌入
-（`manifest/manifest.o`，由 `manifest/app.rc` 经 windres 编译；测试二进制
+（输出至 Cargo `OUT_DIR`，由 `manifest/app.rc` 经 windres 编译；测试二进制
 不经过 tauri-build 的 bin 链接参数，没有它会因 comctl32 v5 缺
 `TaskDialogIndirect` 而启动崩溃）。
+
+可靠性修复与验收说明见 [2026-11-17 修复记录](docs/reliability-2026-11-17.md)。
+构建脚本会保留原 `dist-app/synccloud.exe` 为 `synccloud.rollback-*.exe`。
+旧程序运行期间不会自动替换当前程序；退出旧版后再运行新便携版生效。
 
 ## 使用
 

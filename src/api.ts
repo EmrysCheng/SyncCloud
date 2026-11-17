@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
+  SyncReceipt,
   ActivityPage,
   AliyunQrInfo,
   BaiduLoginInfo,
@@ -28,8 +29,8 @@ export const api = {
   addFolder: (folder: FolderConfig) => invoke<string>("add_folder", { folder }),
   updateFolder: (folder: FolderConfig) => invoke<void>("update_folder", { folder }),
   removeFolder: (folderId: string) => invoke<void>("remove_folder", { folderId }),
-  syncNow: (folderId: string) => invoke<boolean>("sync_now", { folderId }),
-  forcePushFolder: (folderId: string) => invoke<boolean>("force_push_folder", { folderId }),
+  syncNow: (folderId: string) => invoke<SyncReceipt>("sync_now", { folderId }),
+  forcePushFolder: (folderId: string) => invoke<SyncReceipt>("force_push_folder", { folderId }),
   pauseFolder: (folderId: string) => invoke<void>("pause_folder", { folderId }),
   resumeFolder: (folderId: string) => invoke<void>("resume_folder", { folderId }),
   testBackend: (backend: BackendConfig) => invoke<string>("test_backend", { backend }),
@@ -66,10 +67,6 @@ export const api = {
   setShellMenuEnabled: (enabled: boolean) => invoke<void>("set_shell_menu_enabled", { enabled }),
   setFileStorageMode: (folderId: string, path: string, mode: "keep_offline" | "free_space") =>
     invoke<number>("set_file_storage_mode", { folderId, path, mode }),
-  listFolderFiles: (folderId: string, subPath?: string) =>
-    invoke<FolderFileItem[]>("list_folder_files", { folderId, subPath }),
-  openHydrateFile: (targetPath: string) =>
-    invoke<void>("open_hydrate_file", { targetPath }),
   listCloudAccounts: (provider?: string) =>
     invoke<CloudAccount[]>("list_cloud_accounts", { provider }),
   deleteCloudAccount: (id: string) => invoke<void>("delete_cloud_account", { id }),
@@ -80,7 +77,7 @@ export const api = {
   openInExplorer: (path: string, select?: boolean) =>
     invoke<void>("open_path_in_explorer", { path, select: !!select }),
   openDataDir: () => invoke<void>("open_data_dir"),
-  syncAllFolders: () => invoke<void>("sync_all_folders"),
+  syncAllFolders: () => invoke<SyncReceipt[]>("sync_all_folders"),
   pauseAllFolders: () => invoke<void>("pause_all_folders"),
   resumeAllFolders: () => invoke<void>("resume_all_folders"),
   analyzeFolder: (folderId: string) =>

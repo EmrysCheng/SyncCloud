@@ -71,7 +71,10 @@ export default function Folders({
     Record<string, { status: "checking" | "ok" | "err"; msg?: string }>
   >({});
 
-  const refresh = () => api.listFolders().then(setFolders).catch(() => {});
+  const [loadError, setLoadError] = useState("");
+  const [feedback, setFeedback] = useState("");
+  const [loading, setLoading] = useState(true);
+  const refresh = () => api.listFolders().then(f => {setFolders(f);setLoadError("");}).catch(e => setLoadError(String(e))).finally(() => setLoading(false));
 
   useEffect(() => {
     refresh();
@@ -82,14 +85,20 @@ export default function Folders({
   // 事件到达时也刷新状态
   useEffect(() => {
     if (events.length) refresh();
-  }, [events.length]);
+  }, [events]);
 
   async function act(fn: () => Promise<unknown>, id?: string) {
     if (id) setBusy(id);
     try {
-      await fn();
+      const result = await fn();
+      if (result === false) throw new Error("同步请求未被受理");
+      if (Array.isArray(result)) {
+        const failures=result.filter(r=>r.disposition==="rejected");
+        setFeedback(failures.length ? `已受理 ${result.length-failures.length} 项；${failures.map(r=>r.error).join("；")}` : `已受理 ${result.length} 项同步请求`);
+      }
+      if (result && typeof result === "object" && "disposition" in result) setFeedback(result.disposition === "already_queued" ? "同步请求已在队列中" : "同步请求已受理");
     } catch (e) {
-      alert(String(e));
+      setFeedback(String(e));
     } finally {
       if (id) setBusy(null);
       refresh();
@@ -136,6 +145,8 @@ export default function Folders({
     }
   }
 
+  if (loading) return <div role="status">正在加载同步任务…</div>;
+  if (loadError && !folders.length) return <div role="alert">加载同步任务失败：{loadError}</div>;
   if (folders.length === 0) {
     return (
       <div className="empty-state">
@@ -158,6 +169,8 @@ export default function Folders({
 
   return (
     <div className="page">
+      {feedback && <div role="status">{feedback}</div>}
+      {loadError && <div role="alert">{loadError}</div>}
       <div className="page-header">
         <div>
           <h1>同步文件夹</h1>
@@ -272,6 +285,9 @@ export default function Folders({
 function StateDot({ state }: { state: string }) {
   const map: Record<string, [string, string]> = {
     idle: ["#22c55e", "已同步"],
+    queued: ["#3b82f6", "已排队"],
+    pending: ["#f59e0b", "等待文件释放"],
+    blocked: ["#f59e0b", "安全拦截"],
     syncing: ["#3b82f6", "同步中"],
     paused: ["#f59e0b", "已暂停"],
     error: ["#ef4444", "错误"],
@@ -484,6 +500,7 @@ function FolderCard({
                 ↑{r.uploaded} · ↓{r.downloaded}
                 {r.conflicts > 0 && ` · ⚠冲突 ${r.conflicts}`}
                 {r.failed > 0 && ` · ✗失败 ${r.failed}`}
+                {(r.pending ?? 0) > 0 && ` · 等待释放 ${r.pending}`}
                 {r.uploaded + r.downloaded + r.failed > 0 &&
                   ` · ${fmtBytes(r.bytesUploaded + r.bytesDownloaded)}`}
                 {` · ${(r.tookMs / 1000).toFixed(1)}s`}
@@ -504,7 +521,7 @@ function FolderCard({
         </button>
         <button
           className="btn btn-sm"
-          disabled={busy || analyzing || syncing}
+          disabled={busy || analyzing || syncing || st?.state === "queued"}
           onClick={onSync}
           title="强制拉取远端元数据执行完整三方对比与同步"
         >

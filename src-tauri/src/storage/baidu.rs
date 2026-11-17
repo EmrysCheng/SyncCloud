@@ -7,10 +7,10 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use md5::{Digest, Md5};
+use serde::{Deserialize, Serialize};
 
-use super::{RemoteEntry, RemoteStore, sibling_meta};
+use super::{sibling_meta, RemoteEntry, RemoteStore};
 use crate::sync::types::Manifest;
 
 const OPENAPI: &str = "https://openapi.baidu.com";
@@ -25,11 +25,16 @@ pub struct BaiduStore {
     /// 元数据区（manifest/锁），严格位于用户指定的同步目录内部（{remote_dir}/.synccloud）
     meta_dir: String,
     http: reqwest::Client,
+    api_base: String,
+    oauth_base: String,
+    upload_base: String,
     token: tokio::sync::Mutex<Option<TokenState>>,
     /// 目录列表缓存（dir → 子项）。百度同样没有按路径直达的 API，
     /// 逐级 list 是每轮同步的最大开销；任何写操作后整体清空保证一致。
-    list_cache: tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<BaiduFile>>>>,
+    list_cache:
+        tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<BaiduFile>>>>,
     created_dirs: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    mkdir_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,17 +96,34 @@ struct TokenResp {
 async fn parse_token_resp(resp: reqwest::Response) -> anyhow::Result<TokenResp> {
     let status = resp.status();
     let body = resp.text().await?;
-    let v: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|_| anyhow::anyhow!("百度令牌接口响应异常(HTTP {status}): {}", truncate(&body, 200)))?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+        anyhow::anyhow!("百度令牌接口响应异常(HTTP {status}): {}", "响应字段不完整")
+    })?;
     if !status.is_success() && v.get("error").is_none() {
-        anyhow::bail!("百度令牌接口返回 HTTP {status}: {}", truncate(&body, 200));
+        anyhow::bail!("百度令牌接口返回 HTTP {status}: {}", "响应字段不完整");
     }
     Ok(TokenResp {
-        access_token: v.get("access_token").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        refresh_token: v.get("refresh_token").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        access_token: v
+            .get("access_token")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        refresh_token: v
+            .get("refresh_token")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         expires_in: v.get("expires_in").and_then(|x| x.as_i64()).unwrap_or(0),
-        error: v.get("error").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        error_description: v.get("error_description").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        error: v
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        error_description: v
+            .get("error_description")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
     })
 }
 
@@ -110,7 +132,6 @@ async fn parse_token_resp(resp: reqwest::Response) -> anyhow::Result<TokenResp> 
 struct ListResp {
     #[serde(default)]
     list: Vec<BaiduFile>,
-    #[serde(default)]
     errno: i64,
 }
 
@@ -131,7 +152,6 @@ pub struct BaiduFile {
 struct FileMetasResp {
     #[serde(default)]
     list: Vec<DlinkItem>,
-    #[serde(default)]
     errno: i64,
 }
 
@@ -151,7 +171,6 @@ struct PrecreateResp {
     uploadid: String,
     #[serde(default)]
     return_type: i64,
-    #[serde(default)]
     errno: i64,
 }
 
@@ -160,7 +179,6 @@ struct PrecreateResp {
 struct CreateResp {
     #[serde(default)]
     fs_id: u64,
-    #[serde(default)]
     errno: i64,
 }
 
@@ -180,15 +198,33 @@ impl BaiduStore {
                 .user_agent("pan.baidu.com")
                 .build()
                 .expect("reqwest client"),
+            api_base: PAN.into(),
+            oauth_base: OPENAPI.into(),
+            upload_base: PCS.into(),
             token: tokio::sync::Mutex::new(None),
             list_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             created_dirs: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            mkdir_lock: Default::default(),
         }
+    }
+
+    /// Only the explicit live acceptance example can use this guarded cleanup.
+    #[doc(hidden)]
+    pub async fn cleanup_acceptance_root(&self) -> anyhow::Result<()> {
+        let suffix = self
+            .remote_dir
+            .strip_prefix("/SyncCloud-acceptance-")
+            .ok_or_else(|| anyhow::anyhow!("拒绝清理非验收目录"))?;
+        uuid::Uuid::parse_str(suffix)?;
+        self.delete_abs(&self.remote_dir).await
     }
 
     /// 是否已完成设备码授权（keyring 中存在令牌）。
     pub fn authorized(auth_id: &str, app_key: &str) -> bool {
-        crate::credential::load_secret(&keyring_account(auth_id, app_key)).ok().flatten().is_some()
+        crate::credential::load_secret(&keyring_account(auth_id, app_key))
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// 写操作后清空目录列表缓存。
@@ -206,23 +242,30 @@ impl BaiduStore {
 
     /// 元数据区内文件的绝对云端路径。
     fn meta_path(&self, rel: &str) -> String {
-        format!("{}/{}", self.meta_dir.trim_end_matches('/'), rel.trim_start_matches('/'))
+        format!(
+            "{}/{}",
+            self.meta_dir.trim_end_matches('/'),
+            rel.trim_start_matches('/')
+        )
     }
 
     async fn load_token(&self) -> Option<TokenState> {
         if let Some(t) = self.token.lock().await.as_ref() {
             return Some(t.clone());
         }
-        let raw = crate::credential::load_secret(&keyring_account(&self.auth_id, &self.app_key)).ok().flatten()?;
+        let raw = crate::credential::load_secret(&keyring_account(&self.auth_id, &self.app_key))
+            .ok()
+            .flatten()?;
         let t: TokenState = serde_json::from_str(&raw).ok()?;
         *self.token.lock().await = Some(t.clone());
         Some(t)
     }
 
-    async fn save_token(&self, t: &TokenState) {
+    async fn save_token(&self, t: &TokenState) -> anyhow::Result<()> {
+        let raw = serde_json::to_string(t)?;
+        crate::credential::save_secret(&keyring_account(&self.auth_id, &self.app_key), &raw)?;
         *self.token.lock().await = Some(t.clone());
-        let raw = serde_json::to_string(t).unwrap_or_default();
-        let _ = crate::credential::save_secret(&keyring_account(&self.auth_id, &self.app_key), &raw);
+        Ok(())
     }
 
     /// 启动设备码授权，返回给 UI 展示的验证信息。
@@ -230,24 +273,30 @@ impl BaiduStore {
     pub async fn start_device_login(&self) -> anyhow::Result<DeviceCodeResp> {
         let resp = self
             .http
-            .get(format!("{OPENAPI}/oauth/2.0/device/code"))
+            .get(format!("{}/oauth/2.0/device/code", self.oauth_base))
+            .timeout(Duration::from_secs(15))
             .query(&[
                 ("response_type", "device_code"),
                 ("client_id", self.app_key.as_str()),
                 ("scope", "basic,netdisk"),
             ])
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
         let status = resp.status();
         let body = resp.text().await?;
-        let v: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|_| anyhow::anyhow!("百度授权接口响应异常(HTTP {status}): {}", truncate(&body, 200)))?;
+        let v: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+            anyhow::anyhow!("百度授权接口响应异常(HTTP {status}): {}", "响应字段不完整")
+        })?;
         if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
-            let desc = v.get("error_description").and_then(|d| d.as_str()).unwrap_or("");
+            let desc = v
+                .get("error_description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
             anyhow::bail!("百度授权发起失败: {desc} ({err})，请检查 AppKey/SecretKey");
         }
         if !status.is_success() {
-            anyhow::bail!("百度授权接口返回 HTTP {status}: {}", truncate(&body, 200));
+            anyhow::bail!("百度授权接口返回 HTTP {status}: {}", "响应字段不完整");
         }
         Ok(serde_json::from_value(v)?)
     }
@@ -255,9 +304,18 @@ impl BaiduStore {
     /// 轮询设备码授权结果（用户在 verification_url 输入 user_code 后完成）。
     /// null 容错：等待授权时响应只含 error 字段，其余字段可能缺失或为 null。
     pub async fn poll_device_login(&self, device_code: &str) -> anyhow::Result<bool> {
+        let lock = crate::credential::account_lock(&keyring_account(&self.auth_id, &self.app_key));
+        let _account = lock.lock().await;
+        self.poll_device_login_unlocked(device_code).await
+    }
+    pub(crate) async fn poll_device_login_unlocked(
+        &self,
+        device_code: &str,
+    ) -> anyhow::Result<bool> {
         let resp = self
             .http
-            .get(format!("{OPENAPI}/oauth/2.0/token"))
+            .get(format!("{}/oauth/2.0/token", self.oauth_base))
+            .timeout(Duration::from_secs(15))
             .query(&[
                 ("grant_type", "device_token"),
                 ("code", device_code),
@@ -265,7 +323,8 @@ impl BaiduStore {
                 ("client_secret", self.secret_key.as_str()),
             ])
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
         let t = parse_token_resp(resp).await?;
         if t.error.is_empty() && !t.access_token.is_empty() {
             let nt = TokenState {
@@ -273,7 +332,7 @@ impl BaiduStore {
                 refresh_token: t.refresh_token,
                 expires_at: now_ts() + t.expires_in - 60,
             };
-            self.save_token(&nt).await;
+            self.save_token(&nt).await?;
             Ok(true)
         } else if t.error == "authorization_pending" || t.error == "slow_down" {
             Ok(false)
@@ -285,17 +344,24 @@ impl BaiduStore {
     }
 
     async fn access_token(&self) -> anyhow::Result<String> {
+        self.refresh_access_token(None).await
+    }
+    async fn refresh_access_token(&self, rejected: Option<&str>) -> anyhow::Result<String> {
+        let lock = crate::credential::account_lock(&keyring_account(&self.auth_id, &self.app_key));
+        let _guard = lock.lock().await;
+        *self.token.lock().await = None;
         let t = self
             .load_token()
             .await
             .ok_or_else(|| anyhow::anyhow!("百度网盘未授权：请先在设置中完成设备登录"))?;
-        if now_ts() < t.expires_at {
+        if now_ts() < t.expires_at && rejected != Some(t.access_token.as_str()) {
             return Ok(t.access_token);
         }
         // 刷新（null 容错解析）
         let resp = self
             .http
-            .get(format!("{OPENAPI}/oauth/2.0/token"))
+            .get(format!("{}/oauth/2.0/token", self.oauth_base))
+            .timeout(Duration::from_secs(15))
             .query(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", t.refresh_token.as_str()),
@@ -303,7 +369,8 @@ impl BaiduStore {
                 ("client_secret", self.secret_key.as_str()),
             ])
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
         let resp = parse_token_resp(resp).await?;
         if resp.error.is_empty() && !resp.access_token.is_empty() {
             let nt = TokenState {
@@ -311,11 +378,69 @@ impl BaiduStore {
                 refresh_token: resp.refresh_token,
                 expires_at: now_ts() + resp.expires_in - 60,
             };
-            self.save_token(&nt).await;
+            self.save_token(&nt).await?;
             Ok(nt.access_token)
         } else {
             anyhow::bail!("百度令牌刷新失败，请重新授权: {}", resp.error_description)
         }
+    }
+
+    async fn control_json<T: serde::de::DeserializeOwned>(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> anyhow::Result<T> {
+        let mut request = builder.timeout(Duration::from_secs(30)).build()?;
+        for attempt in 0..2 {
+            let retry = request
+                .try_clone()
+                .ok_or_else(|| anyhow::anyhow!("控制请求不可重试"))?;
+            let response = self
+                .http
+                .execute(retry)
+                .await
+                .map_err(|e| e.without_url())?;
+            let status = response.status();
+            let value: serde_json::Value = response.json().await.map_err(|e| e.without_url())?;
+            let code = value
+                .get("errno")
+                .or_else(|| value.get("error_code"))
+                .and_then(|v| v.as_i64());
+            if attempt == 0
+                && (status == reqwest::StatusCode::UNAUTHORIZED
+                    || matches!(code, Some(110 | 111 | -6)))
+            {
+                let previous = request
+                    .url()
+                    .query_pairs()
+                    .find(|(k, _)| k == "access_token")
+                    .map(|(_, v)| v.into_owned())
+                    .unwrap_or_default();
+                let token = self.refresh_access_token(Some(&previous)).await?;
+                let pairs: Vec<(String, String)> = request
+                    .url()
+                    .query_pairs()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                request
+                    .url_mut()
+                    .query_pairs_mut()
+                    .clear()
+                    .extend_pairs(pairs.iter().map(|(k, v)| {
+                        (
+                            k.as_str(),
+                            if k == "access_token" {
+                                token.as_str()
+                            } else {
+                                v.as_str()
+                            },
+                        )
+                    }));
+                continue;
+            }
+            anyhow::ensure!(status.is_success(), "百度控制请求失败 HTTP {status}");
+            return Ok(serde_json::from_value(value)?);
+        }
+        anyhow::bail!("百度认证失效，请重新授权")
     }
 
     /// 列目录（分页聚合，带缓存）。
@@ -328,23 +453,27 @@ impl BaiduStore {
         let mut start = 0u32;
         loop {
             let resp: ListResp = self
-                .http
-                .get(format!("{PAN}/xpan/file"))
-                .query(&[
-                    ("method", "list"),
-                    ("access_token", token.as_str()),
-                    ("dir", dir),
-                    ("start", &start.to_string()),
-                    ("limit", "1000"),
-                    ("web", "1"),
-                ])
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
+                .control_json(
+                    self.http
+                        .get(format!("{}/xpan/file", self.api_base))
+                        .query(&[
+                            ("method", "list"),
+                            ("access_token", token.as_str()),
+                            ("dir", dir),
+                            ("start", &start.to_string()),
+                            ("limit", "1000"),
+                            ("web", "1"),
+                        ]),
+                )
                 .await?;
+            if resp.errno == -9 {
+                return Ok(Vec::new());
+            }
             if resp.errno != 0 {
-                anyhow::bail!("百度网盘列目录失败 errno={}（目录不存在或令牌无效）", resp.errno);
+                anyhow::bail!(
+                    "百度网盘列目录失败 errno={}（目录不存在或令牌无效）",
+                    resp.errno
+                );
             }
             let n = resp.list.len() as u32;
             out.extend(resp.list);
@@ -379,7 +508,11 @@ impl BaiduStore {
             cur.push_str(seg);
             let items = self.list_dir(&parent_of(&cur)).await?;
             match items.into_iter().find(|f| {
-                let full = format!("{}/{}", parent_of(&cur).trim_end_matches('/'), f.server_filename);
+                let full = format!(
+                    "{}/{}",
+                    parent_of(&cur).trim_end_matches('/'),
+                    f.server_filename
+                );
                 full.trim_start_matches('/') == cur.trim_start_matches('/')
             }) {
                 Some(f) => fs_id = Some(f.fs_id),
@@ -396,6 +529,7 @@ impl BaiduStore {
 
     /// 按绝对云端路径创建目录（带内存缓存加速，避免重复请求触发网盘限流）。
     async fn mkdir_p_abs(&self, abs: &str) -> anyhow::Result<()> {
+        let _mkdir = self.mkdir_lock.lock().await;
         let abs = abs.trim_end_matches('/');
         if abs.is_empty() || abs == "/" {
             return Ok(());
@@ -408,18 +542,12 @@ impl BaiduStore {
         }
         let token = self.access_token().await?;
         let resp: CreateResp = self
-            .http
-            .post(format!("{PAN}/xpan/file"))
-            .query(&[("method", "create"), ("access_token", token.as_str())])
-            .form(&[
-                ("path", abs),
-                ("isdir", "1"),
-                ("size", "0"),
-                ("rtype", "0"),
-            ])
-            .send()
-            .await?
-            .json()
+            .control_json(
+                self.http
+                    .post(format!("{}/xpan/file", self.api_base))
+                    .query(&[("method", "create"), ("access_token", token.as_str())])
+                    .form(&[("path", abs), ("isdir", "1"), ("size", "0"), ("rtype", "0")]),
+            )
             .await?;
         if resp.errno == 0 || resp.errno == -8 {
             let mut guard = self.created_dirs.lock().await;
@@ -437,17 +565,16 @@ impl BaiduStore {
             Some(fs_id) => {
                 let token = self.access_token().await?;
                 let metas: FileMetasResp = self
-                    .http
-                    .get(format!("{PAN}/xpan/multimedia"))
-                    .query(&[
-                        ("method", "filemetas"),
-                        ("access_token", token.as_str()),
-                        ("fsids", format!("[{fs_id}]").as_str()),
-                        ("dlink", "1"),
-                    ])
-                    .send()
-                    .await?
-                    .json()
+                    .control_json(
+                        self.http
+                            .get(format!("{}/xpan/multimedia", self.api_base))
+                            .query(&[
+                                ("method", "filemetas"),
+                                ("access_token", token.as_str()),
+                                ("fsids", format!("[{fs_id}]").as_str()),
+                                ("dlink", "1"),
+                            ]),
+                    )
                     .await?;
                 let dlink = metas
                     .list
@@ -460,8 +587,10 @@ impl BaiduStore {
                     .get(format!("{dlink}&access_token={token}"))
                     .header("User-Agent", "pan.baidu.com")
                     .send()
-                    .await?
-                    .error_for_status()?
+                    .await
+                    .map_err(|e| e.without_url())?
+                    .error_for_status()
+                    .map_err(|e| e.without_url())?
                     .bytes()
                     .await?;
                 Ok(Some(serde_json::from_slice(&bytes)?))
@@ -494,6 +623,11 @@ fn parent_of(path: &str) -> String {
 
 #[async_trait]
 impl RemoteStore for BaiduStore {
+    async fn begin_cycle(&self) -> anyhow::Result<()> {
+        self.invalidate_list_cache().await;
+        self.created_dirs.lock().await.clear();
+        Ok(())
+    }
     fn kind(&self) -> &'static str {
         "baidu"
     }
@@ -505,31 +639,23 @@ impl RemoteStore for BaiduStore {
     async fn test(&self) -> anyhow::Result<()> {
         self.access_token().await?;
         self.mkdir_p("").await?;
-        Ok(())
+        super::probe_text_io(self).await
     }
 
     async fn read_manifest(&self) -> anyhow::Result<Option<Manifest>> {
-        let internal_path = self.meta_path("manifest.json");
-        if let Some(m) = self.manifest_at(&internal_path).await? {
-            return Ok(Some(m));
-        }
-        // 兼容迁移：若指定同步目录内尚无 manifest，但历史外部兄弟目录存在，读取并迁入内部，同时清理外部旧文件
-        let legacy_sibling = format!("/{}", sibling_meta(&self.remote_dir));
-        let legacy_manifest = format!("{legacy_sibling}/manifest.json");
-        if let Some(legacy) = self.manifest_at(&legacy_manifest).await? {
-            let _ = self.write_manifest(&legacy).await;
-            let _ = self.delete_abs(&legacy_manifest).await;
-            let _ = self.delete_abs(&legacy_sibling).await;
-            return Ok(Some(legacy));
-        }
-        Ok(None)
+        self.manifest_at(&self.meta_path("manifest.json")).await
     }
 
     async fn write_manifest(&self, manifest: &Manifest) -> anyhow::Result<()> {
-        let tmp = std::env::temp_dir().join(format!("synccloud-baidu-manifest-{}.json", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!(
+            "synccloud-baidu-manifest-{}.json",
+            uuid::Uuid::new_v4()
+        ));
         tokio::fs::write(&tmp, serde_json::to_vec_pretty(manifest)?).await?;
         self.mkdir_p_abs(&self.meta_dir).await?;
-        let r = self.put_file_abs(&self.meta_path("manifest.json"), &tmp).await;
+        let r = self
+            .put_file_abs(&self.meta_path("manifest.json"), &tmp)
+            .await;
         let _ = tokio::fs::remove_file(&tmp).await;
         r
     }
@@ -542,52 +668,57 @@ impl RemoteStore for BaiduStore {
             Some(id) => id,
         };
         let token = self.access_token().await?;
-        let body = self
-            .http
-            .get(format!("{PAN}/xpan/multimedia"))
-            .query(&[
-                ("method", "filemetas"),
-                ("access_token", token.as_str()),
-                ("fsids", format!("[{fs_id}]").as_str()),
-                ("dlink", "0"),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
+        let v: serde_json::Value = self
+            .control_json(
+                self.http
+                    .get(format!("{}/xpan/multimedia", self.api_base))
+                    .query(&[
+                        ("method", "filemetas"),
+                        ("access_token", token.as_str()),
+                        ("fsids", format!("[{fs_id}]").as_str()),
+                        ("dlink", "0"),
+                    ]),
+            )
             .await?;
-        // null 容错解析
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-        let item = v.get("list").and_then(|l| l.get(0));
-        let lm = item.and_then(|i| i.get("server_mtime")).and_then(|x| x.as_i64()).unwrap_or(0);
-        let len = item.and_then(|i| i.get("size")).and_then(|x| x.as_u64()).unwrap_or(0);
-        Ok(Some(format!("fs{fs_id}|lm{lm}|len{len}")))
+        anyhow::ensure!(
+            v.get("errno").and_then(|v| v.as_i64()) == Some(0),
+            "百度清单元数据请求失败"
+        );
+        let item = v
+            .get("list")
+            .and_then(|l| l.get(0))
+            .ok_or_else(|| anyhow::anyhow!("百度清单元数据缺失"))?;
+        if let Some(md5) = item
+            .get("md5")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+        {
+            return Ok(Some(format!("fs{fs_id}|md5{md5}")));
+        }
+        Ok(self
+            .read_manifest()
+            .await?
+            .as_ref()
+            .map(super::manifest_stamp_of))
     }
 
     async fn read_legacy_manifest(&self) -> anyhow::Result<Option<Manifest>> {
-        self.manifest_at(&self.abs_path(".synccloud/manifest.json")).await
+        let legacy = format!("/{}/manifest.json", sibling_meta(&self.remote_dir));
+        if legacy == self.meta_path("manifest.json") {
+            return Ok(None);
+        }
+        self.manifest_at(&legacy).await
     }
-
     async fn cleanup_legacy_meta(&self) -> anyhow::Result<()> {
-        let legacy = self.abs_path(".synccloud");
-        if legacy == self.meta_dir {
-            return Ok(()); // 根级退化：元数据区与旧位置同位
+        let legacy = format!("/{}/manifest.json", sibling_meta(&self.remote_dir));
+        if legacy != self.meta_path("manifest.json") {
+            self.delete_abs(&legacy).await?;
         }
-        // 逐个删除已知元数据文件，目录删除尽力而为（filemanager 支持目录递归删）
-        let _ = self.delete_abs(&format!("{legacy}/manifest.json")).await;
-        if let Ok(items) = self.list_dir(&format!("{legacy}/locks")).await {
-            for f in items {
-                if f.isdir == 0 {
-                    let _ = self.delete_abs(&format!("{legacy}/locks/{}", f.server_filename)).await;
-                }
-            }
-        }
-        let _ = self.delete_abs(&format!("{legacy}/locks")).await;
-        let _ = self.delete_abs(&legacy).await;
         Ok(())
     }
 
     async fn put_file(&self, path: &str, src: &Path) -> anyhow::Result<()> {
+        super::validate_key(path)?;
         if let Some(parent) = Path::new(path).parent() {
             let p = parent.to_string_lossy().replace('\\', "/");
             let p = p.trim_start_matches('/').to_string();
@@ -599,10 +730,12 @@ impl RemoteStore for BaiduStore {
     }
 
     async fn get_file(&self, path: &str, dest: &Path) -> anyhow::Result<()> {
+        super::validate_key(path)?;
         self.get_file_abs(&self.abs_path(path), dest).await
     }
 
     async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
+        super::validate_key(path)?;
         self.delete_abs(&self.abs_path(path)).await
     }
 
@@ -612,7 +745,9 @@ impl RemoteStore for BaiduStore {
         let mut queue = vec![self.remote_dir.clone()];
         while let Some(dir) = queue.pop() {
             for item in self.list_dir(&dir).await? {
-                if item.server_filename.starts_with(".synccloud") || item.server_filename.ends_with(".synccloud-part") {
+                if item.server_filename.starts_with(".synccloud")
+                    || item.server_filename.ends_with(".synccloud-part")
+                {
                     continue;
                 }
                 let full = format!("{}/{}", dir.trim_end_matches('/'), item.server_filename);
@@ -637,40 +772,39 @@ impl BaiduStore {
     /// 上传到绝对云端路径（precreate → 分片 → 合并；可越出同步目录）。
     async fn put_file_abs(&self, abs: &str, src: &Path) -> anyhow::Result<()> {
         self.invalidate_list_cache().await;
-        // 共享模式读取：文件被占用时也能上传
-        let data = crate::sync::fslock::read_shared(src).await?;
-        let size = data.len();
-        // 分块 md5（4MB 一块）
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut file = crate::sync::fslock::open_read_shared_async(src).await?;
+        let size = file.metadata().await?.len() as usize;
         const BLOCK: usize = 4 * 1024 * 1024;
         let mut block_list = Vec::new();
-        if size == 0 {
-            block_list.push(md5_hex(b""));
-        } else {
-            for chunk in data.chunks(BLOCK) {
-                block_list.push(md5_hex(chunk));
-            }
+        let mut buffer = vec![0; BLOCK];
+        let parts = ((size + BLOCK - 1) / BLOCK).max(1);
+        for i in 0..parts {
+            let len = size.saturating_sub(i * BLOCK).min(BLOCK);
+            file.read_exact(&mut buffer[..len]).await?;
+            block_list.push(md5_hex(&buffer[..len]));
         }
+        file.seek(std::io::SeekFrom::Start(0)).await?;
         let block_json = serde_json::to_string(&block_list)?;
         let token = self.access_token().await?;
 
         // 1. precreate
         let rid = chrono::Utc::now().timestamp_millis().to_string();
         let pre: PrecreateResp = self
-            .http
-            .post(format!("{PAN}/xpan/file"))
-            .query(&[("method", "precreate"), ("access_token", token.as_str())])
-            .form(&[
-                ("path", abs),
-                ("size", &size.to_string()),
-                ("isdir", "0"),
-                ("autoinit", "1"),
-                ("rtype", "3"), // 覆盖同名
-                ("block_list", block_json.as_str()),
-                ("rid", rid.as_str()),
-            ])
-            .send()
-            .await?
-            .json()
+            .control_json(
+                self.http
+                    .post(format!("{}/xpan/file", self.api_base))
+                    .query(&[("method", "precreate"), ("access_token", token.as_str())])
+                    .form(&[
+                        ("path", abs),
+                        ("size", &size.to_string()),
+                        ("isdir", "0"),
+                        ("autoinit", "1"),
+                        ("rtype", "3"), // 覆盖同名
+                        ("block_list", block_json.as_str()),
+                        ("rid", rid.as_str()),
+                    ]),
+            )
             .await?;
         if pre.errno != 0 {
             anyhow::bail!("百度预创建失败 errno={}（检查路径与配额）", pre.errno);
@@ -680,15 +814,19 @@ impl BaiduStore {
             return Ok(());
         }
 
+        anyhow::ensure!(!pre.uploadid.is_empty(), "百度预创建响应缺少 uploadid");
         // 2. superfile2 分块上传（partseq 从 0 开始计数）
         let total_parts = block_list.len().max(1);
-        for (i, chunk) in (if size == 0 { vec![&data[..]] } else { data.chunks(BLOCK).collect::<Vec<_>>() })
-            .into_iter()
-            .enumerate()
-        {
+        for i in 0..total_parts {
+            let len = size.saturating_sub(i * BLOCK).min(BLOCK);
+            file.read_exact(&mut buffer[..len]).await?;
+            let chunk = &buffer[..len];
+            crate::sync::transfer::upload_limiter()
+                .consume(chunk.len())
+                .await;
             let resp = self
                 .http
-                .put(PCS)
+                .put(&self.upload_base)
                 .query(&[
                     ("method", "upload"),
                     ("access_token", token.as_str()),
@@ -700,32 +838,52 @@ impl BaiduStore {
                 .header("Content-Type", "application/octet-stream")
                 .body(chunk.to_vec())
                 .send()
-                .await?;
+                .await
+                .map_err(|e| e.without_url())?;
             if !resp.status().is_success() {
                 let code = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("百度分片 {} 上传失败: HTTP {code} {}", i, truncate(&body, 120));
+                anyhow::bail!(
+                    "百度分片 {} 上传失败: HTTP {code} {}",
+                    i,
+                    truncate(&body, 120)
+                );
             }
+            let part: serde_json::Value = resp.json().await.map_err(|e| e.without_url())?;
+            anyhow::ensure!(
+                part.get("error_code").and_then(|v| v.as_i64()).unwrap_or(0) == 0
+                    && part.get("errno").and_then(|v| v.as_i64()).unwrap_or(0) == 0,
+                "百度分片 {i} 上传被拒绝"
+            );
+            anyhow::ensure!(
+                part.get("md5")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| v.eq_ignore_ascii_case(&block_list[i])),
+                "百度分片 {i} 响应缺少或不匹配内容 MD5"
+            );
         }
         let _ = total_parts;
 
         // 3. create 合并
         let done: CreateResp = self
-            .http
-            .post(format!("{PAN}/xpan/file"))
-            .query(&[("method", "create"), ("access_token", token.as_str())])
-            .form(&[
-                ("path", abs),
-                ("size", &size.to_string()),
-                ("isdir", "0"),
-                ("rtype", "3"),
-                ("block_list", block_json.as_str()),
-                ("uploadid", pre.uploadid.as_str()),
-            ])
-            .send()
-            .await?
-            .json()
+            .control_json(
+                self.http
+                    .post(format!("{}/xpan/file", self.api_base))
+                    .query(&[("method", "create"), ("access_token", token.as_str())])
+                    .form(&[
+                        ("path", abs),
+                        ("size", &size.to_string()),
+                        ("isdir", "0"),
+                        ("rtype", "3"),
+                        ("block_list", block_json.as_str()),
+                        ("uploadid", pre.uploadid.as_str()),
+                    ]),
+            )
             .await?;
+        anyhow::ensure!(
+            done.fs_id > 0 || done.errno != 0,
+            "百度创建响应缺少文件编号"
+        );
         if done.errno != 0 {
             anyhow::bail!("百度创建文件失败 errno={}", done.errno);
         }
@@ -740,17 +898,16 @@ impl BaiduStore {
             .ok_or_else(|| anyhow::anyhow!("百度网盘文件不存在: {abs}"))?;
         let token = self.access_token().await?;
         let metas: FileMetasResp = self
-            .http
-            .get(format!("{PAN}/xpan/multimedia"))
-            .query(&[
-                ("method", "filemetas"),
-                ("access_token", token.as_str()),
-                ("fsids", format!("[{fs_id}]").as_str()),
-                ("dlink", "1"),
-            ])
-            .send()
-            .await?
-            .json()
+            .control_json(
+                self.http
+                    .get(format!("{}/xpan/multimedia", self.api_base))
+                    .query(&[
+                        ("method", "filemetas"),
+                        ("access_token", token.as_str()),
+                        ("fsids", format!("[{fs_id}]").as_str()),
+                        ("dlink", "1"),
+                    ]),
+            )
             .await?;
         let item = metas
             .list
@@ -780,14 +937,14 @@ impl BaiduStore {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    last_err = Some(e.into());
+                    last_err = Some(e.without_url().into());
                     continue;
                 }
             };
             let resp = match resp.error_for_status() {
                 Ok(r) => r,
                 Err(e) => {
-                    last_err = Some(e.into());
+                    last_err = Some(e.without_url().into());
                     continue;
                 }
             };
@@ -803,6 +960,9 @@ impl BaiduStore {
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(c) => {
+                        crate::sync::transfer::download_limiter()
+                            .consume(c.len())
+                            .await;
                         got += c.len() as u64;
                         if let Err(e) = file.write_all(&c).await {
                             stream_err = Some(e.into());
@@ -810,7 +970,7 @@ impl BaiduStore {
                         }
                     }
                     Err(e) => {
-                        stream_err = Some(e.into());
+                        stream_err = Some(e.without_url().into());
                         break;
                     }
                 }
@@ -842,18 +1002,16 @@ impl BaiduStore {
         // 旧版 filemanager 接口实测可用（2026-10）。
         let resp = self
             .http
-            .post(format!("{PAN}/xpan/file"))
+            .post(format!("{}/xpan/file", self.api_base))
             .query(&[
                 ("method", "filemanager"),
                 ("opera", "delete"),
                 ("access_token", token.as_str()),
             ])
-            .form(&[
-                ("async", "0"),
-                ("filelist", filelist.as_str()),
-            ])
+            .form(&[("async", "0"), ("filelist", filelist.as_str())])
             .send()
-            .await?;
+            .await
+            .map_err(|e| e.without_url())?;
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
@@ -861,13 +1019,15 @@ impl BaiduStore {
         }
         let v: serde_json::Value = match serde_json::from_str(&body) {
             Ok(v) => v,
-            // 2xx 但非 JSON（空体等）视为成功
-            Err(_) => return Ok(()),
+            Err(e) => return Err(anyhow::anyhow!("百度删除响应不是有效 JSON: {e}")),
         };
-        let errno = v.get("errno").and_then(|x| x.as_i64()).unwrap_or(0);
+        let errno = v
+            .get("errno")
+            .and_then(|x| x.as_i64())
+            .ok_or_else(|| anyhow::anyhow!("百度删除响应缺少 errno"))?;
         if errno != 0 {
             // 文件不存在视为成功（幂等）
-            if errno == 12 || errno == -6 || errno == -9 {
+            if errno == -9 {
                 return Ok(());
             }
             anyhow::bail!("百度删除文件失败 errno={errno}");
@@ -880,7 +1040,9 @@ impl BaiduStore {
 #[async_trait]
 impl super::RawIo for BaiduStore {
     async fn put_text(&self, key: &str, content: &str) -> anyhow::Result<()> {
-        let tmp = std::env::temp_dir().join(format!("synccloud-baidu-lock-{}.txt", uuid::Uuid::new_v4()));
+        super::validate_key(key)?;
+        let tmp =
+            std::env::temp_dir().join(format!("synccloud-baidu-lock-{}.txt", uuid::Uuid::new_v4()));
         tokio::fs::write(&tmp, content).await?;
         let p = self.meta_path(key);
         self.mkdir_p_abs(&parent_of(&p)).await?;
@@ -890,27 +1052,35 @@ impl super::RawIo for BaiduStore {
     }
 
     async fn read_text(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let tmp = std::env::temp_dir().join(format!("synccloud-baidu-read-{}.txt", uuid::Uuid::new_v4()));
-        match self.get_file_abs(&self.meta_path(key), &tmp).await {
-            Ok(()) => {
-                let s = tokio::fs::read_to_string(&tmp).await.ok();
-                let _ = tokio::fs::remove_file(&tmp).await;
-                Ok(s)
-            }
-            Err(_) => Ok(None),
+        super::validate_key(key)?;
+        let abs = self.meta_path(key);
+        if self.lookup_abs(&abs).await?.is_none() {
+            return Ok(None);
         }
+        let tmp =
+            std::env::temp_dir().join(format!("synccloud-baidu-read-{}", uuid::Uuid::new_v4()));
+        self.get_file_abs(&abs, &tmp).await?;
+        let text = tokio::fs::read_to_string(&tmp).await;
+        let _ = tokio::fs::remove_file(tmp).await;
+        Ok(Some(text?))
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        super::validate_key(key)?;
         self.delete_abs(&self.meta_path(key)).await
     }
 
     async fn list_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        super::validate_key(prefix.trim_end_matches('/'))?;
         let dir = self.meta_path(prefix.trim_end_matches('/'));
         let mut out = Vec::new();
         for item in self.list_dir(&dir).await? {
             if item.isdir == 0 {
-                out.push(format!("{}/{}", prefix.trim_end_matches('/'), item.server_filename));
+                out.push(format!(
+                    "{}/{}",
+                    prefix.trim_end_matches('/'),
+                    item.server_filename
+                ));
             }
         }
         Ok(out)
@@ -921,4 +1091,130 @@ fn md5_hex(data: &[u8]) -> String {
     let mut h = Md5::new();
     h.update(data);
     hex::encode(h.finalize())
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::*;
+    #[tokio::test]
+    async fn failed_part_response_never_merges_file() {
+        use crate::storage::test_http::{serve, Response};
+        let merged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = merged.clone();
+        let server = serve(move |request| {
+            if request.path.starts_with("/upload") {
+                return Response::json(
+                    serde_json::json!({"error_code":31066,"error_msg":"denied"}),
+                );
+            }
+            if request.path.contains("method=precreate") {
+                return Response::json(
+                    serde_json::json!({"errno":0,"uploadid":"upload","return_type":1}),
+                );
+            }
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Response::json(serde_json::json!({"errno":0,"fs_id":1}))
+        })
+        .await;
+        let id = format!("test-{}", uuid::Uuid::new_v4());
+        let mut store = BaiduStore::new(
+            id.clone(),
+            "fixture".into(),
+            "fixture".into(),
+            "/sandbox".into(),
+        );
+        store.api_base = server.url.clone();
+        store.upload_base = format!("{}/upload", server.url);
+        store.created_dirs.lock().await.insert("/sandbox".into());
+        store
+            .save_token(&TokenState {
+                access_token: "fixture".into(),
+                refresh_token: "unused".into(),
+                expires_at: now_ts() + 3600,
+            })
+            .await
+            .unwrap();
+        let tmp = std::env::temp_dir().join(format!("synccloud-part-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, b"new").unwrap();
+        let result = store.put_file_abs("/sandbox/file", &tmp).await;
+        std::fs::remove_file(tmp).unwrap();
+        crate::credential::delete_secret(&keyring_account(&id, "fixture")).unwrap();
+        assert!(
+            result.is_err(),
+            "HTTP 200 business error must fail the upload"
+        );
+        assert!(
+            !merged.load(std::sync::atomic::Ordering::SeqCst),
+            "must not merge failed parts"
+        );
+    }
+    #[tokio::test]
+    async fn concurrent_auth_rejections_share_one_refresh() {
+        use crate::storage::test_http::{serve, Response};
+        let refreshes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = refreshes.clone();
+        let server=serve(move|request|{
+            if request.path.starts_with("/oauth/") {count.fetch_add(1,std::sync::atomic::Ordering::SeqCst);return Response::json(serde_json::json!({"access_token":"new","refresh_token":"rotated","expires_in":3600}));}
+            if request.path.contains("access_token=new"){Response::json(serde_json::json!({"errno":0,"list":[]}))}
+            else{Response::json(serde_json::json!({"errno":111}))}
+        }).await;
+        let id = format!("test-{}", uuid::Uuid::new_v4());
+        let mut store = BaiduStore::new(
+            id.clone(),
+            "fixture".into(),
+            "fixture".into(),
+            "/sandbox".into(),
+        );
+        store.oauth_base = server.url.clone();
+        store
+            .save_token(&TokenState {
+                access_token: "old".into(),
+                refresh_token: "fixture".into(),
+                expires_at: now_ts() + 3600,
+            })
+            .await
+            .unwrap();
+        let request = || {
+            store
+                .http
+                .get(format!("{}/xpan/file?access_token=old", server.url))
+        };
+        let (a, b) = tokio::join!(
+            store.control_json::<ListResp>(request()),
+            store.control_json::<ListResp>(request())
+        );
+        assert_eq!(a.unwrap().errno, 0);
+        assert_eq!(b.unwrap().errno, 0);
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        crate::credential::delete_secret(&keyring_account(&id, "fixture")).unwrap();
+    }
+    #[tokio::test]
+    async fn missing_directory_is_empty_but_permission_error_is_not() {
+        use crate::storage::test_http::{serve, Response};
+        let server = serve(move |request| {
+            Response::json(
+                serde_json::json!({"errno":if request.path.contains("denied"){31066}else{-9}}),
+            )
+        })
+        .await;
+        let id = format!("test-{}", uuid::Uuid::new_v4());
+        let mut store = BaiduStore::new(
+            id.clone(),
+            "fixture".into(),
+            "fixture".into(),
+            "/sandbox".into(),
+        );
+        store.api_base = server.url.clone();
+        store
+            .save_token(&TokenState {
+                access_token: "fixture".into(),
+                refresh_token: "fixture".into(),
+                expires_at: now_ts() + 3600,
+            })
+            .await
+            .unwrap();
+        assert!(store.list_dir("/missing").await.unwrap().is_empty());
+        assert!(store.list_dir("/denied").await.is_err());
+        crate::credential::delete_secret(&keyring_account(&id, "fixture")).unwrap();
+    }
 }

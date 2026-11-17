@@ -2,26 +2,26 @@
 
 use std::path::Path;
 
+use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-use async_trait::async_trait;
 #[allow(unused_imports)]
 use futures::StreamExt;
 
-use super::{RemoteEntry, RemoteStore, sibling_meta};
+use super::{sibling_meta, RemoteEntry, RemoteStore};
 use crate::sync::types::Manifest;
 
 pub const META_DIR: &str = ".synccloud";
 
 pub struct S3Store {
     client: Client,
+    control: Client,
     bucket: String,
     prefix: String,
-    /// 元数据键前缀：同步前缀的兄弟（`synccloud/docs` → `synccloud/.synccloud/docs`；
-    /// 根前缀同步整桶时退化为桶根 `.synccloud`，靠列举过滤排除）
+    /// 元数据键前缀：同步根内部的 .synccloud。
     meta_prefix: String,
 }
 
@@ -59,8 +59,26 @@ impl S3Store {
         } else {
             format!("{prefix}/.synccloud")
         };
+        let transfer = builder
+            .clone()
+            .timeout_config(
+                aws_smithy_types::timeout::TimeoutConfig::builder()
+                    .operation_timeout(std::time::Duration::from_secs(600))
+                    .operation_attempt_timeout(std::time::Duration::from_secs(600))
+                    .build(),
+            )
+            .build();
+        let control = builder
+            .timeout_config(
+                aws_smithy_types::timeout::TimeoutConfig::builder()
+                    .operation_timeout(std::time::Duration::from_secs(30))
+                    .operation_attempt_timeout(std::time::Duration::from_secs(15))
+                    .build(),
+            )
+            .build();
         Self {
-            client: Client::from_conf(builder.build()),
+            client: Client::from_conf(transfer),
+            control: Client::from_conf(control),
             bucket,
             prefix,
             meta_prefix,
@@ -76,7 +94,7 @@ impl S3Store {
         }
     }
 
-    /// 元数据区内对象的完整键（位于同步前缀之外）。
+    /// 元数据区内对象的完整键。
     fn meta_key(&self, rel: &str) -> String {
         format!("{}/{}", self.meta_prefix, rel.trim_start_matches('/'))
     }
@@ -90,13 +108,18 @@ async fn write_object_to_file(obj: GetObjectOutput, dest: &Path) -> anyhow::Resu
     let mut stream = obj.body;
     while let Some(chunk) = stream.next().await {
         let bytes = chunk?;
+        crate::sync::transfer::download_limiter()
+            .consume(bytes.len())
+            .await;
         tokio::io::AsyncWriteExt::write_all(&mut file, &bytes[..]).await?;
     }
     tokio::io::AsyncWriteExt::flush(&mut file).await?;
     Ok(())
 }
 
-fn is_not_found(e: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>) -> bool {
+fn is_not_found(
+    e: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
+) -> bool {
     let s = e.to_string();
     s.contains("NoSuchKey") || s.contains("404") || s.contains("NotFound")
 }
@@ -113,35 +136,25 @@ impl RemoteStore for S3Store {
 
     async fn test(&self) -> anyhow::Result<()> {
         // 读探针：HeadBucket
-        self.client
+        self.control
             .head_bucket()
             .bucket(&self.bucket)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("S3 连接失败: {e}"))?;
-        // 写探针：写删一个小对象（验证写权限，探针位于元数据区）
-        let probe = self.meta_key(".probe");
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&probe)
-            .body(ByteStream::from_static(b"probe"))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("S3 写入权限测试失败: {e}"))?;
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&probe)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("S3 删除权限测试失败: {e}"))?;
-        Ok(())
+        super::probe_text_io(self).await
     }
 
     async fn read_manifest(&self) -> anyhow::Result<Option<Manifest>> {
         let key = self.meta_key("manifest.json");
-        match self.client.get_object().bucket(&self.bucket).key(&key).send().await {
+        match self
+            .control
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
             Ok(obj) => {
                 let tmp = std::env::temp_dir()
                     .join(format!("synccloud-manifest-{}.json", uuid::Uuid::new_v4()));
@@ -150,24 +163,7 @@ impl RemoteStore for S3Store {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 Ok(Some(serde_json::from_str(&raw)?))
             }
-            Err(e) if is_not_found(&e) => {
-                // 兼容迁移：若指定同步目录内尚无 manifest，但历史外部兄弟前缀存在，读取并迁入内部，同时清理外部旧对象
-                let legacy_prefix = sibling_meta(&self.prefix);
-                let legacy_key = format!("{legacy_prefix}/manifest.json");
-                if let Ok(obj) = self.client.get_object().bucket(&self.bucket).key(&legacy_key).send().await {
-                    let tmp = std::env::temp_dir()
-                        .join(format!("synccloud-manifest-{}.json", uuid::Uuid::new_v4()));
-                    write_object_to_file(obj, &tmp).await?;
-                    let raw = tokio::fs::read_to_string(&tmp).await?;
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    if let Ok(m) = serde_json::from_str::<Manifest>(&raw) {
-                        let _ = self.write_manifest(&m).await;
-                        let _ = self.client.delete_object().bucket(&self.bucket).key(&legacy_key).send().await;
-                        return Ok(Some(m));
-                    }
-                }
-                Ok(None)
-            }
+            Err(e) if is_not_found(&e) => Ok(None),
             Err(e) => Err(anyhow::anyhow!("读取 manifest 失败: {e}")),
         }
     }
@@ -175,7 +171,19 @@ impl RemoteStore for S3Store {
     /// HEAD 一次 manifest 对象取 etag/last-modified，作为增量快路径的廉价变更戳。
     async fn manifest_stamp(&self) -> anyhow::Result<Option<String>> {
         let key = self.meta_key("manifest.json");
-        match self.client.head_object().bucket(&self.bucket).key(&key).send().await {
+        match self
+            .control
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(out) if out.e_tag().is_none_or(str::is_empty) => Ok(self
+                .read_manifest()
+                .await?
+                .as_ref()
+                .map(super::manifest_stamp_of)),
             Ok(out) => Ok(Some(format!(
                 "etag{}|lm{}|len{}",
                 out.e_tag().unwrap_or(""),
@@ -196,7 +204,7 @@ impl RemoteStore for S3Store {
     async fn write_manifest(&self, manifest: &Manifest) -> anyhow::Result<()> {
         let key = self.meta_key("manifest.json");
         let raw = serde_json::to_vec_pretty(manifest)?;
-        self.client
+        self.control
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
@@ -209,22 +217,32 @@ impl RemoteStore for S3Store {
     }
 
     async fn put_file(&self, path: &str, src: &Path) -> anyhow::Result<()> {
+        super::validate_key(path)?;
         let key = self.key(path);
         // 共享模式打开：文件被编辑器/杀毒等占用时仍可读取上传
-        let file = crate::sync::fslock::open_read_shared_async(src).await
+        let file = crate::sync::fslock::open_read_shared_async(src)
+            .await
             .map_err(|e| anyhow::anyhow!("打开本地文件失败 {}: {e}", src.display()))?;
         let len = file.metadata().await?.len();
-        let stream = ByteStream::read_from()
-            .file(file)
-            .length(aws_smithy_types::byte_stream::Length::Exact(len))
-            .build()
-            .await
-            .map_err(|e| anyhow::anyhow!("构造上传流失败 {}: {e}", src.display()))?;
+        let chunks = tokio_util::io::ReaderStream::new(file).then(|chunk| async move {
+            match chunk {
+                Ok(bytes) => {
+                    crate::sync::transfer::upload_limiter()
+                        .consume(bytes.len())
+                        .await;
+                    Ok(http_body::Frame::data(bytes))
+                }
+                Err(e) => Err(e),
+            }
+        });
+        let body = http_body_util::StreamBody::new(chunks);
+        let stream = ByteStream::new(aws_smithy_types::body::SdkBody::from_body_1_x(body));
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
             .body(stream)
+            .content_length(len as i64)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("上传失败 s3://{}/{}: {e}", self.bucket, key))?;
@@ -232,6 +250,7 @@ impl RemoteStore for S3Store {
     }
 
     async fn get_file(&self, path: &str, dest: &Path) -> anyhow::Result<()> {
+        super::validate_key(path)?;
         let key = self.key(path);
         let obj = self
             .client
@@ -246,8 +265,9 @@ impl RemoteStore for S3Store {
     }
 
     async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
+        super::validate_key(path)?;
         let key = self.key(path);
-        self.client
+        self.control
             .delete_object()
             .bucket(&self.bucket)
             .key(&key)
@@ -258,6 +278,8 @@ impl RemoteStore for S3Store {
     }
 
     async fn move_file(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        super::validate_key(from)?;
+        super::validate_key(to)?;
         let src_key = self.key(from);
         let dest_key = self.key(to);
         let copy_source = format!("{}/{}", self.bucket, src_key);
@@ -280,8 +302,15 @@ impl RemoteStore for S3Store {
     }
 
     async fn read_legacy_manifest(&self) -> anyhow::Result<Option<Manifest>> {
-        let key = self.key(".synccloud/manifest.json");
-        match self.client.get_object().bucket(&self.bucket).key(&key).send().await {
+        let key = format!("{}/manifest.json", sibling_meta(&self.prefix));
+        match self
+            .control
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
             Ok(obj) => {
                 let tmp = std::env::temp_dir()
                     .join(format!("synccloud-manifest-{}.json", uuid::Uuid::new_v4()));
@@ -296,42 +325,14 @@ impl RemoteStore for S3Store {
     }
 
     async fn cleanup_legacy_meta(&self) -> anyhow::Result<()> {
-        // 根前缀同步整桶时元数据区与旧位置同位，不能清理
-        if self.meta_prefix == META_DIR {
-            return Ok(());
-        }
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(self.key(".synccloud/manifest.json"))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("清理旧版 manifest 失败: {e}"))?;
-        let legacy_locks = self.key(".synccloud/locks/");
-        let mut resp = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&legacy_locks)
-            .into_paginator()
-            .send();
-        let mut keys = Vec::new();
-        while let Some(page) = resp.next().await {
-            let page = page.map_err(|e| anyhow::anyhow!("列举旧版锁失败: {e}"))?;
-            for obj in page.contents() {
-                if let Some(k) = obj.key() {
-                    keys.push(k.to_string());
-                }
-            }
-        }
-        for k in keys {
-            let _ = self
-                .client
+        let key = format!("{}/manifest.json", sibling_meta(&self.prefix));
+        if key != self.meta_key("manifest.json") {
+            self.control
                 .delete_object()
                 .bucket(&self.bucket)
-                .key(&k)
+                .key(key)
                 .send()
-                .await;
+                .await?;
         }
         Ok(())
     }
@@ -343,7 +344,7 @@ impl RemoteStore for S3Store {
             format!("{}/", self.prefix)
         };
         let mut resp = self
-            .client
+            .control
             .list_objects_v2()
             .bucket(&self.bucket)
             .prefix(&prefix)
@@ -371,7 +372,8 @@ impl RemoteStore for S3Store {
 #[async_trait]
 impl super::RawIo for S3Store {
     async fn put_text(&self, key: &str, content: &str) -> anyhow::Result<()> {
-        self.client
+        super::validate_key(key)?;
+        self.control
             .put_object()
             .bucket(&self.bucket)
             .key(self.meta_key(key))
@@ -382,8 +384,9 @@ impl super::RawIo for S3Store {
     }
 
     async fn read_text(&self, key: &str) -> anyhow::Result<Option<String>> {
+        super::validate_key(key)?;
         match self
-            .client
+            .control
             .get_object()
             .bucket(&self.bucket)
             .key(self.meta_key(key))
@@ -404,7 +407,8 @@ impl super::RawIo for S3Store {
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        self.client
+        super::validate_key(key)?;
+        self.control
             .delete_object()
             .bucket(&self.bucket)
             .key(self.meta_key(key))
@@ -414,10 +418,11 @@ impl super::RawIo for S3Store {
     }
 
     async fn list_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        super::validate_key(prefix.trim_end_matches('/'))?;
         let full = self.meta_key(prefix);
         let strip = format!("{}/", self.meta_prefix);
         let mut resp = self
-            .client
+            .control
             .list_objects_v2()
             .bucket(&self.bucket)
             .prefix(&full)
