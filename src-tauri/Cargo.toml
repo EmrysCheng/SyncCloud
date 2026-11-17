@@ -1,6 +1,6 @@
 [package]
 name = "synccloud"
-version = "0.1.0"
+version = "0.1.1"
 description = "SyncCloud - 多后端文件同步桌面应用"
 authors = ["SyncCloud"]
 edition = "2021"

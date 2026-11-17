@@ -478,7 +478,7 @@ export default function Settings() {
                 <div className="gic-desc">多后端多云盘桌面文件同步工具 · 基于 Tauri 2 + Rust 构建</div>
               </div>
             </div>
-            <span className="badge badge-plain">v{info?.version || "0.1.0"}</span>
+            <span className="badge badge-plain">v{info?.version || "0.1.1"}</span>
           </div>
 
           <div className="gic-links">
